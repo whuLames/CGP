@@ -6,7 +6,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <limits>
+#include <stdexcept>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -29,6 +31,9 @@ struct query_result_t {
 };
 
 enum class traversal_mode_t { push, pull, hybrid };
+enum class push_strategy_t { edge_balanced, shared_node };
+
+using query_mask_t = std::uint32_t;
 
 inline const char* traversal_mode_name(traversal_mode_t mode) {
   switch (mode) {
@@ -42,8 +47,19 @@ inline const char* traversal_mode_name(traversal_mode_t mode) {
   return "unknown";
 }
 
+inline const char* push_strategy_name(push_strategy_t strategy) {
+  switch (strategy) {
+    case push_strategy_t::edge_balanced:
+      return "edge_balanced";
+    case push_strategy_t::shared_node:
+      return "shared_node";
+  }
+  return "unknown";
+}
+
 struct options_t {
   traversal_mode_t traversal_mode = traversal_mode_t::hybrid;
+  push_strategy_t push_strategy = push_strategy_t::edge_balanced;
   double pull_frontier_ratio = 0.15;
   double pull_edge_ratio = 0.20;
   bool profile_levels = false;
@@ -59,10 +75,14 @@ struct level_profile_t {
   float level_wall_ms = 0.0f;
   float degree_scan_ms = 0.0f;
   float push_kernel_ms = 0.0f;
+  float shared_push_kernel_ms = 0.0f;
   float bitmap_build_ms = 0.0f;
   float pull_kernel_ms = 0.0f;
   float compact_ms = 0.0f;
   float count_sync_ms = 0.0f;
+  std::size_t unique_frontier_size = 0;
+  unsigned long long actual_edge_count = 0;
+  unsigned long long virtual_edge_count = 0;
 };
 
 template <typename vertex_t>
@@ -70,13 +90,17 @@ struct result_t {
   thrust::device_vector<vertex_t> distances;
   std::vector<query_result_t<vertex_t>> queries;
   std::vector<std::size_t> frontier_sizes;
+  std::vector<std::size_t> unique_frontier_sizes;
   std::vector<unsigned long long> level_edge_counts;
+  std::vector<unsigned long long> actual_level_edge_counts;
+  std::vector<unsigned long long> virtual_level_edge_counts;
   std::vector<std::string> level_modes;
   std::vector<float> level_wall_times_ms;
   std::vector<level_profile_t> level_profiles;
   options_t options;
   float gpu_time_ms = 0;
   float wall_time_ms = 0;
+  float shared_push_kernel_ms = 0;
   int iterations = 0;
 };
 
@@ -113,6 +137,49 @@ __global__ void reset_counter_kernel(unsigned long long* counter) {
 }
 
 template <typename vertex_t>
+__global__ void fill_distances_kernel(vertex_t* distances,
+                                      std::size_t total_pairs) {
+  std::size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+  std::size_t stride = blockDim.x * gridDim.x;
+  vertex_t infinity = std::numeric_limits<vertex_t>::max();
+
+  for (std::size_t i = tid; i < total_pairs; i += stride) {
+    distances[i] = infinity;
+  }
+}
+
+template <typename graph_t, typename vertex_t>
+__global__ void init_shared_node_sources_kernel(
+    graph_t G,
+    const vertex_t* sources,
+    int num_queries,
+    vertex_t* distances,
+    query_mask_t* visited_mask,
+    query_mask_t* frontier_mask,
+    vertex_t* frontier_vertices,
+    unsigned long long* unique_count) {
+  std::size_t n_vertices = G.get_number_of_vertices();
+  std::size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+  std::size_t stride = blockDim.x * gridDim.x;
+
+  for (std::size_t q = tid; q < static_cast<std::size_t>(num_queries);
+       q += stride) {
+    auto source = sources[q];
+    query_mask_t bit = static_cast<query_mask_t>(1u) << q;
+    distances[q * n_vertices + static_cast<std::size_t>(source)] = 0;
+    atomicOr(reinterpret_cast<unsigned int*>(visited_mask + source),
+             static_cast<unsigned int>(bit));
+    query_mask_t old = static_cast<query_mask_t>(atomicOr(
+        reinterpret_cast<unsigned int*>(frontier_mask + source),
+        static_cast<unsigned int>(bit)));
+    if (old == 0) {
+      unsigned long long position = atomicAdd(unique_count, 1ULL);
+      frontier_vertices[position] = source;
+    }
+  }
+}
+
+template <typename vertex_t>
 __global__ void list_to_bitmap_kernel(const frontier_item_t<vertex_t>* frontier,
                                       std::size_t count,
                                       int num_queries,
@@ -124,6 +191,30 @@ __global__ void list_to_bitmap_kernel(const frontier_item_t<vertex_t>* frontier,
     auto item = frontier[i];
     bitmap[static_cast<std::size_t>(item.vertex) * num_queries +
            static_cast<std::size_t>(item.query_id)] = 1;
+  }
+}
+
+template <typename vertex_t>
+__global__ void shared_to_bitmap_kernel(const vertex_t* frontier_vertices,
+                                        const query_mask_t* frontier_mask,
+                                        std::size_t unique_count,
+                                        int num_queries,
+                                        unsigned char* bitmap) {
+  std::size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+  std::size_t stride = blockDim.x * gridDim.x;
+
+  for (std::size_t i = tid; i < unique_count; i += stride) {
+    vertex_t vertex = frontier_vertices[i];
+    query_mask_t mask = frontier_mask[vertex];
+    while (mask != 0) {
+      int query_id = __ffs(static_cast<unsigned int>(mask)) - 1;
+      if (query_id < num_queries) {
+        bitmap[static_cast<std::size_t>(vertex) *
+                   static_cast<std::size_t>(num_queries) +
+               static_cast<std::size_t>(query_id)] = 1;
+      }
+      mask &= (mask - 1);
+    }
   }
 }
 
@@ -144,6 +235,33 @@ __global__ void bitmap_to_list_kernel(const unsigned char* bitmap,
     frontier[position] = {
         static_cast<vertex_t>(i % static_cast<std::size_t>(num_queries)),
         static_cast<vertex_t>(i / static_cast<std::size_t>(num_queries))};
+  }
+}
+
+template <typename vertex_t>
+__global__ void bitmap_to_shared_frontier_kernel(
+    const unsigned char* bitmap,
+    std::size_t n_vertices,
+    int num_queries,
+    query_mask_t* frontier_mask,
+    vertex_t* frontier_vertices,
+    unsigned long long* unique_count) {
+  std::size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+  std::size_t stride = blockDim.x * gridDim.x;
+
+  for (std::size_t vertex = tid; vertex < n_vertices; vertex += stride) {
+    query_mask_t mask = 0;
+    for (int q = 0; q < num_queries; ++q) {
+      if (bitmap[vertex * static_cast<std::size_t>(num_queries) +
+                 static_cast<std::size_t>(q)] != 0) {
+        mask |= static_cast<query_mask_t>(1u) << q;
+      }
+    }
+    if (mask != 0) {
+      frontier_mask[vertex] = mask;
+      unsigned long long position = atomicAdd(unique_count, 1ULL);
+      frontier_vertices[position] = static_cast<vertex_t>(vertex);
+    }
   }
 }
 
@@ -181,6 +299,29 @@ __global__ void compute_bitmap_degrees_kernel(graph_t G,
     auto degree = static_cast<unsigned long long>(
         G.get_starting_edge(vertex + 1) - G.get_starting_edge(vertex));
     atomicAdd(edge_count, degree);
+  }
+}
+
+template <typename graph_t, typename vertex_t>
+__global__ void compute_shared_node_degrees_kernel(
+    graph_t G,
+    const vertex_t* frontier_vertices,
+    const query_mask_t* frontier_mask,
+    std::size_t unique_count,
+    unsigned long long* actual_degrees,
+    unsigned long long* virtual_degrees) {
+  std::size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+  std::size_t stride = blockDim.x * gridDim.x;
+
+  for (std::size_t i = tid; i < unique_count; i += stride) {
+    vertex_t vertex = frontier_vertices[i];
+    query_mask_t mask = frontier_mask[vertex];
+    auto degree = static_cast<unsigned long long>(
+        G.get_starting_edge(vertex + 1) - G.get_starting_edge(vertex));
+    actual_degrees[i] = degree;
+    virtual_degrees[i] =
+        degree * static_cast<unsigned long long>(
+                     __popc(static_cast<unsigned int>(mask)));
   }
 }
 
@@ -268,12 +409,86 @@ __global__ void expand_edge_balanced_kernel(
   }
 }
 
+template <typename vertex_t>
+__global__ void clear_shared_frontier_mask_kernel(
+    const vertex_t* frontier_vertices,
+    std::size_t unique_count,
+    query_mask_t* frontier_mask) {
+  std::size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+  std::size_t stride = blockDim.x * gridDim.x;
+
+  for (std::size_t i = tid; i < unique_count; i += stride) {
+    frontier_mask[frontier_vertices[i]] = 0;
+  }
+}
+
+template <typename graph_t, typename vertex_t>
+__global__ void expand_shared_node_kernel(
+    graph_t G,
+    const vertex_t* frontier_vertices,
+    const query_mask_t* frontier_mask,
+    std::size_t unique_count,
+    query_mask_t* visited_mask,
+    query_mask_t* next_frontier_mask,
+    vertex_t* next_frontier_vertices,
+    unsigned long long* next_unique_count,
+    unsigned long long* next_pair_count,
+    vertex_t* distances,
+    int num_queries,
+    vertex_t level) {
+  std::size_t n_vertices = G.get_number_of_vertices();
+
+  for (std::size_t i = blockIdx.x; i < unique_count; i += gridDim.x) {
+    vertex_t source = frontier_vertices[i];
+    query_mask_t active_mask = frontier_mask[source];
+    auto begin = G.get_starting_edge(source);
+    auto end = G.get_starting_edge(source + 1);
+
+    for (auto edge = begin + threadIdx.x; edge < end; edge += blockDim.x) {
+      vertex_t neighbor = G.get_destination_vertex(edge);
+      query_mask_t old_visited = static_cast<query_mask_t>(atomicOr(
+          reinterpret_cast<unsigned int*>(visited_mask + neighbor),
+          static_cast<unsigned int>(active_mask)));
+      query_mask_t newly = active_mask & ~old_visited;
+      if (newly == 0) {
+        continue;
+      }
+
+      query_mask_t bits = newly;
+      while (bits != 0) {
+        int query_id = __ffs(static_cast<unsigned int>(bits)) - 1;
+        if (query_id < num_queries) {
+          distances[static_cast<std::size_t>(query_id) * n_vertices +
+                    static_cast<std::size_t>(neighbor)] = level + 1;
+        }
+        bits &= (bits - 1);
+      }
+
+      atomicAdd(next_pair_count,
+                static_cast<unsigned long long>(
+                    __popc(static_cast<unsigned int>(newly))));
+      query_mask_t old_next = static_cast<query_mask_t>(atomicOr(
+          reinterpret_cast<unsigned int*>(next_frontier_mask + neighbor),
+          static_cast<unsigned int>(newly)));
+      if (old_next == 0) {
+        unsigned long long position = atomicAdd(next_unique_count, 1ULL);
+        next_frontier_vertices[position] = neighbor;
+      }
+    }
+  }
+}
+
 template <typename graph_t, typename vertex_t>
 __global__ void pull_expand_kernel(graph_t G,
                                    int num_queries,
                                    const unsigned char* frontier_bitmap,
                                    unsigned char* next_frontier_bitmap,
                                    unsigned long long* out_count,
+                                   query_mask_t* visited_mask,
+                                   query_mask_t* next_frontier_mask,
+                                   vertex_t* next_frontier_vertices,
+                                   unsigned long long* next_unique_count,
+                                   bool update_visited_mask,
                                    vertex_t* distances,
                                    vertex_t level) {
   constexpr unsigned int warp_size = 32;
@@ -314,6 +529,19 @@ __global__ void pull_expand_kernel(graph_t G,
       next_frontier_bitmap[static_cast<std::size_t>(vertex) *
                                static_cast<std::size_t>(num_queries) +
                            static_cast<std::size_t>(query_id)] = 1;
+      if (update_visited_mask) {
+        query_mask_t bit = static_cast<query_mask_t>(1u)
+                           << static_cast<std::size_t>(query_id);
+        atomicOr(reinterpret_cast<unsigned int*>(visited_mask + vertex),
+                 static_cast<unsigned int>(bit));
+        query_mask_t old_next = static_cast<query_mask_t>(atomicOr(
+            reinterpret_cast<unsigned int*>(next_frontier_mask + vertex),
+            static_cast<unsigned int>(bit)));
+        if (old_next == 0) {
+          unsigned long long position = atomicAdd(next_unique_count, 1ULL);
+          next_frontier_vertices[position] = vertex;
+        }
+      }
       atomicAdd(out_count, 1ULL);
     }
   }
@@ -378,6 +606,11 @@ result_t<typename graph_t::vertex_type> run(
   if (num_queries == 0) {
     return result;
   }
+  if (options.push_strategy == push_strategy_t::shared_node &&
+      num_queries > 32) {
+    throw std::invalid_argument(
+        "shared_node push strategy supports at most 32 queries");
+  }
 
   auto single_context = context->get_context(0);
   auto stream = single_context->stream();
@@ -390,10 +623,27 @@ result_t<typename graph_t::vertex_type> run(
   thrust::device_vector<unsigned char> frontier_bitmap(frontier_capacity);
   thrust::device_vector<unsigned char> next_frontier_bitmap(frontier_capacity);
   thrust::device_vector<unsigned long long> d_out_count(1);
+  thrust::device_vector<unsigned long long> d_shared_pair_count(1);
   thrust::device_vector<unsigned long long> d_frontier_degrees(
       frontier_capacity);
   thrust::device_vector<unsigned long long> d_edge_offsets(frontier_capacity);
   thrust::device_vector<unsigned long long> d_edge_ends(frontier_capacity);
+  thrust::device_vector<query_mask_t> visited_mask;
+  thrust::device_vector<query_mask_t> frontier_mask;
+  thrust::device_vector<query_mask_t> next_frontier_mask;
+  thrust::device_vector<vertex_t> shared_frontier_a;
+  thrust::device_vector<vertex_t> shared_frontier_b;
+  thrust::device_vector<unsigned long long> d_shared_actual_degrees;
+  thrust::device_vector<unsigned long long> d_shared_virtual_degrees;
+  if (options.push_strategy == push_strategy_t::shared_node) {
+    visited_mask.resize(n_vertices);
+    frontier_mask.resize(n_vertices);
+    next_frontier_mask.resize(n_vertices);
+    shared_frontier_a.resize(n_vertices);
+    shared_frontier_b.resize(n_vertices);
+    d_shared_actual_degrees.resize(n_vertices);
+    d_shared_virtual_degrees.resize(n_vertices);
+  }
 
   const int threads = 256;
   int init_blocks =
@@ -410,16 +660,57 @@ result_t<typename graph_t::vertex_type> run(
       thrust::raw_pointer_cast(frontier_a.data()));
 
   std::size_t current_count = sources.size();
+  std::size_t current_unique_count = sources.size();
+  if (options.push_strategy == push_strategy_t::shared_node) {
+    detail::fill_distances_kernel<vertex_t>
+        <<<init_blocks, threads, 0, stream>>>(
+            thrust::raw_pointer_cast(result.distances.data()),
+            frontier_capacity);
+    hipMemset(thrust::raw_pointer_cast(visited_mask.data()), 0,
+              n_vertices * sizeof(query_mask_t));
+    hipMemset(thrust::raw_pointer_cast(frontier_mask.data()), 0,
+              n_vertices * sizeof(query_mask_t));
+    hipMemset(thrust::raw_pointer_cast(next_frontier_mask.data()), 0,
+              n_vertices * sizeof(query_mask_t));
+    detail::reset_counter_kernel<<<1, 1, 0, stream>>>(
+        thrust::raw_pointer_cast(d_out_count.data()));
+    int source_blocks =
+        static_cast<int>((sources.size() + threads - 1) / threads);
+    source_blocks = std::max(1, std::min(source_blocks, 65535));
+    detail::init_shared_node_sources_kernel<graph_t, vertex_t>
+        <<<source_blocks, threads, 0, stream>>>(
+            G, thrust::raw_pointer_cast(d_sources.data()), num_queries,
+            thrust::raw_pointer_cast(result.distances.data()),
+            thrust::raw_pointer_cast(visited_mask.data()),
+            thrust::raw_pointer_cast(frontier_mask.data()),
+            thrust::raw_pointer_cast(shared_frontier_a.data()),
+            thrust::raw_pointer_cast(d_out_count.data()));
+    unsigned long long unique_count = 0;
+    hipMemcpyAsync(&unique_count, thrust::raw_pointer_cast(d_out_count.data()),
+                   sizeof(unsigned long long), hipMemcpyDeviceToHost, stream);
+    hipStreamSynchronize(stream);
+    current_unique_count = static_cast<std::size_t>(unique_count);
+  }
   vertex_t level = 0;
   bool current_is_bitmap = false;
   result.frontier_sizes.push_back(current_count);
+  result.unique_frontier_sizes.push_back(
+      options.push_strategy == push_strategy_t::shared_node
+          ? current_unique_count
+          : current_count);
 
   while (current_count > 0) {
     unsigned long long total_edges = 0;
+    unsigned long long actual_edges = 0;
+    unsigned long long virtual_edges = 0;
     bool edge_count_ready = false;
     level_profile_t profile;
     profile.level = static_cast<int>(level);
     profile.frontier_size = current_count;
+    profile.unique_frontier_size =
+        options.push_strategy == push_strategy_t::shared_node
+            ? current_unique_count
+            : current_count;
     profile.pull_frontier_threshold = pull_frontier_threshold;
     profile.pull_edge_threshold = pull_edge_threshold;
     auto level_start = std::chrono::high_resolution_clock::now();
@@ -447,6 +738,35 @@ result_t<typename graph_t::vertex_type> run(
                      sizeof(unsigned long long), hipMemcpyDeviceToHost, stream);
       hipStreamSynchronize(stream);
       current_count = static_cast<std::size_t>(compact_count);
+      current_is_bitmap = false;
+    };
+
+    auto compact_bitmap_to_shared = [&]() {
+      hipMemset(thrust::raw_pointer_cast(frontier_mask.data()), 0,
+                n_vertices * sizeof(query_mask_t));
+      profile.compact_ms +=
+          detail::timed_gpu(stream, options.profile_levels, [&]() {
+            detail::reset_counter_kernel<<<1, 1, 0, stream>>>(
+                thrust::raw_pointer_cast(d_out_count.data()));
+            int compact_blocks = static_cast<int>(
+                (n_vertices + static_cast<std::size_t>(threads) - 1) /
+                static_cast<std::size_t>(threads));
+            compact_blocks = std::max(1, std::min(compact_blocks, 65535));
+            detail::bitmap_to_shared_frontier_kernel<vertex_t>
+                <<<compact_blocks, threads, 0, stream>>>(
+                    thrust::raw_pointer_cast(frontier_bitmap.data()),
+                    n_vertices, num_queries,
+                    thrust::raw_pointer_cast(frontier_mask.data()),
+                    thrust::raw_pointer_cast(shared_frontier_a.data()),
+                    thrust::raw_pointer_cast(d_out_count.data()));
+          });
+
+      unsigned long long compact_unique_count = 0;
+      hipMemcpyAsync(&compact_unique_count,
+                     thrust::raw_pointer_cast(d_out_count.data()),
+                     sizeof(unsigned long long), hipMemcpyDeviceToHost, stream);
+      hipStreamSynchronize(stream);
+      current_unique_count = static_cast<std::size_t>(compact_unique_count);
       current_is_bitmap = false;
     };
 
@@ -481,16 +801,70 @@ result_t<typename graph_t::vertex_type> run(
       edge_count_ready = true;
     };
 
+    auto compute_shared_push_edge_count = [&]() {
+      int vertex_blocks =
+          static_cast<int>((current_unique_count + threads - 1) / threads);
+      vertex_blocks = std::max(1, std::min(vertex_blocks, 65535));
+
+      profile.degree_scan_ms +=
+          detail::timed_gpu(stream, options.profile_levels, [&]() {
+            detail::compute_shared_node_degrees_kernel<graph_t, vertex_t>
+                <<<vertex_blocks, threads, 0, stream>>>(
+                    G, thrust::raw_pointer_cast(shared_frontier_a.data()),
+                    thrust::raw_pointer_cast(frontier_mask.data()),
+                    current_unique_count,
+                    thrust::raw_pointer_cast(d_shared_actual_degrees.data()),
+                    thrust::raw_pointer_cast(d_shared_virtual_degrees.data()));
+
+            thrust::inclusive_scan(
+                policy, d_shared_actual_degrees.begin(),
+                d_shared_actual_degrees.begin() + current_unique_count,
+                d_shared_actual_degrees.begin());
+            thrust::inclusive_scan(
+                policy, d_shared_virtual_degrees.begin(),
+                d_shared_virtual_degrees.begin() + current_unique_count,
+                d_shared_virtual_degrees.begin());
+          });
+
+      auto count_sync_start = std::chrono::high_resolution_clock::now();
+      hipMemcpyAsync(
+          &actual_edges,
+          thrust::raw_pointer_cast(d_shared_actual_degrees.data()) +
+              current_unique_count - 1,
+          sizeof(unsigned long long), hipMemcpyDeviceToHost, stream);
+      hipMemcpyAsync(
+          &virtual_edges,
+          thrust::raw_pointer_cast(d_shared_virtual_degrees.data()) +
+              current_unique_count - 1,
+          sizeof(unsigned long long), hipMemcpyDeviceToHost, stream);
+      hipStreamSynchronize(stream);
+      profile.count_sync_ms += detail::elapsed_ms(count_sync_start);
+      total_edges = virtual_edges;
+      edge_count_ready = true;
+    };
+
     if (current_is_bitmap && options.traversal_mode == traversal_mode_t::push) {
-      compact_bitmap_to_list();
+      if (options.push_strategy == push_strategy_t::shared_node) {
+        compact_bitmap_to_shared();
+      } else {
+        compact_bitmap_to_list();
+      }
     }
 
-    if (!current_is_bitmap) {
+    if (!current_is_bitmap &&
+        options.push_strategy == push_strategy_t::shared_node) {
+      compute_shared_push_edge_count();
+    } else if (!current_is_bitmap) {
       compute_push_edge_count();
     } else if (options.traversal_mode == traversal_mode_t::hybrid &&
                static_cast<double>(current_count) < pull_frontier_threshold) {
-      compact_bitmap_to_list();
-      compute_push_edge_count();
+      if (options.push_strategy == push_strategy_t::shared_node) {
+        compact_bitmap_to_shared();
+        compute_shared_push_edge_count();
+      } else {
+        compact_bitmap_to_list();
+        compute_push_edge_count();
+      }
     }
 
     bool use_pull = false;
@@ -506,16 +880,29 @@ result_t<typename graph_t::vertex_type> run(
     if (use_pull && !current_is_bitmap) {
       hipMemset(thrust::raw_pointer_cast(frontier_bitmap.data()), 0,
                 frontier_capacity * sizeof(unsigned char));
-      int bitmap_blocks =
-          static_cast<int>((current_count + threads - 1) / threads);
+      std::size_t bitmap_count =
+          options.push_strategy == push_strategy_t::shared_node
+              ? current_unique_count
+              : current_count;
+      int bitmap_blocks = static_cast<int>(
+          (bitmap_count + static_cast<std::size_t>(threads) - 1) / threads);
       bitmap_blocks = std::max(1, std::min(bitmap_blocks, 65535));
       profile.bitmap_build_ms +=
           detail::timed_gpu(stream, options.profile_levels, [&]() {
-            detail::list_to_bitmap_kernel<vertex_t>
-                <<<bitmap_blocks, threads, 0, stream>>>(
-                    thrust::raw_pointer_cast(frontier_a.data()), current_count,
-                    num_queries,
-                    thrust::raw_pointer_cast(frontier_bitmap.data()));
+            if (options.push_strategy == push_strategy_t::shared_node) {
+              detail::shared_to_bitmap_kernel<vertex_t>
+                  <<<bitmap_blocks, threads, 0, stream>>>(
+                      thrust::raw_pointer_cast(shared_frontier_a.data()),
+                      thrust::raw_pointer_cast(frontier_mask.data()),
+                      current_unique_count, num_queries,
+                      thrust::raw_pointer_cast(frontier_bitmap.data()));
+            } else {
+              detail::list_to_bitmap_kernel<vertex_t>
+                  <<<bitmap_blocks, threads, 0, stream>>>(
+                      thrust::raw_pointer_cast(frontier_a.data()),
+                      current_count, num_queries,
+                      thrust::raw_pointer_cast(frontier_bitmap.data()));
+            }
           });
       current_is_bitmap = true;
     }
@@ -544,10 +931,16 @@ result_t<typename graph_t::vertex_type> run(
 
     detail::reset_counter_kernel<<<1, 1, 0, stream>>>(
         thrust::raw_pointer_cast(d_out_count.data()));
+    detail::reset_counter_kernel<<<1, 1, 0, stream>>>(
+        thrust::raw_pointer_cast(d_shared_pair_count.data()));
 
     if (use_pull) {
       hipMemset(thrust::raw_pointer_cast(next_frontier_bitmap.data()), 0,
                 frontier_capacity * sizeof(unsigned char));
+      if (options.push_strategy == push_strategy_t::shared_node) {
+        hipMemset(thrust::raw_pointer_cast(next_frontier_mask.data()), 0,
+                  n_vertices * sizeof(query_mask_t));
+      }
       std::size_t warp_count = frontier_capacity;
       int pull_blocks =
           static_cast<int>(((warp_count * 32) + threads - 1) / threads);
@@ -560,8 +953,53 @@ result_t<typename graph_t::vertex_type> run(
                     thrust::raw_pointer_cast(frontier_bitmap.data()),
                     thrust::raw_pointer_cast(next_frontier_bitmap.data()),
                     thrust::raw_pointer_cast(d_out_count.data()),
+                    options.push_strategy == push_strategy_t::shared_node
+                        ? thrust::raw_pointer_cast(visited_mask.data())
+                        : nullptr,
+                    options.push_strategy == push_strategy_t::shared_node
+                        ? thrust::raw_pointer_cast(next_frontier_mask.data())
+                        : nullptr,
+                    options.push_strategy == push_strategy_t::shared_node
+                        ? thrust::raw_pointer_cast(shared_frontier_b.data())
+                        : nullptr,
+                    options.push_strategy == push_strategy_t::shared_node
+                        ? thrust::raw_pointer_cast(d_shared_pair_count.data())
+                        : nullptr,
+                    options.push_strategy == push_strategy_t::shared_node,
                     thrust::raw_pointer_cast(result.distances.data()), level);
           });
+    } else if (options.push_strategy == push_strategy_t::shared_node &&
+               actual_edges > 0) {
+      hipMemset(thrust::raw_pointer_cast(next_frontier_mask.data()), 0,
+                n_vertices * sizeof(query_mask_t));
+      int vertex_blocks = static_cast<int>(
+          std::min<std::size_t>(std::max<std::size_t>(current_unique_count, 1),
+                                65535));
+      profile.shared_push_kernel_ms +=
+          detail::timed_gpu(stream, options.profile_levels, [&]() {
+            detail::expand_shared_node_kernel<graph_t, vertex_t>
+                <<<vertex_blocks, threads, 0, stream>>>(
+                    G, thrust::raw_pointer_cast(shared_frontier_a.data()),
+                    thrust::raw_pointer_cast(frontier_mask.data()),
+                    current_unique_count,
+                    thrust::raw_pointer_cast(visited_mask.data()),
+                    thrust::raw_pointer_cast(next_frontier_mask.data()),
+                    thrust::raw_pointer_cast(shared_frontier_b.data()),
+                    thrust::raw_pointer_cast(d_out_count.data()),
+                    thrust::raw_pointer_cast(d_shared_pair_count.data()),
+                    thrust::raw_pointer_cast(result.distances.data()),
+                    num_queries, level);
+          });
+      profile.push_kernel_ms += profile.shared_push_kernel_ms;
+      result.shared_push_kernel_ms += profile.shared_push_kernel_ms;
+      int clear_blocks =
+          static_cast<int>((current_unique_count + threads - 1) / threads);
+      clear_blocks = std::max(1, std::min(clear_blocks, 65535));
+      detail::clear_shared_frontier_mask_kernel<vertex_t>
+          <<<clear_blocks, threads, 0, stream>>>(
+              thrust::raw_pointer_cast(shared_frontier_a.data()),
+              current_unique_count,
+              thrust::raw_pointer_cast(frontier_mask.data()));
     } else if (total_edges > 0) {
       unsigned long long edge_blocks_64 =
           (total_edges + static_cast<unsigned long long>(threads) - 1ULL) /
@@ -584,16 +1022,43 @@ result_t<typename graph_t::vertex_type> run(
     }
 
     unsigned long long next_count = 0;
+    unsigned long long next_unique_count = 0;
     auto count_sync_start = std::chrono::high_resolution_clock::now();
-    hipMemcpyAsync(&next_count, thrust::raw_pointer_cast(d_out_count.data()),
-                   sizeof(unsigned long long), hipMemcpyDeviceToHost, stream);
+    if (options.push_strategy == push_strategy_t::shared_node) {
+      hipMemcpyAsync(&next_unique_count,
+                     thrust::raw_pointer_cast(use_pull
+                                                  ? d_shared_pair_count.data()
+                                                  : d_out_count.data()),
+                     sizeof(unsigned long long), hipMemcpyDeviceToHost, stream);
+      hipMemcpyAsync(&next_count,
+                     thrust::raw_pointer_cast(use_pull
+                                                  ? d_out_count.data()
+                                                  : d_shared_pair_count.data()),
+                     sizeof(unsigned long long), hipMemcpyDeviceToHost, stream);
+    } else {
+      hipMemcpyAsync(&next_count, thrust::raw_pointer_cast(d_out_count.data()),
+                     sizeof(unsigned long long), hipMemcpyDeviceToHost, stream);
+    }
     hipStreamSynchronize(stream);
     profile.count_sync_ms += detail::elapsed_ms(count_sync_start);
+    if (options.push_strategy != push_strategy_t::shared_node) {
+      next_unique_count = next_count;
+    }
 
     profile.mode = use_pull ? "pull" : "push";
     profile.edge_count = total_edges;
+    profile.actual_edge_count =
+        options.push_strategy == push_strategy_t::shared_node && !use_pull
+            ? actual_edges
+            : total_edges;
+    profile.virtual_edge_count =
+        options.push_strategy == push_strategy_t::shared_node && !use_pull
+            ? virtual_edges
+            : total_edges;
     profile.level_wall_ms = detail::elapsed_ms(level_start);
     result.level_edge_counts.push_back(total_edges);
+    result.actual_level_edge_counts.push_back(profile.actual_edge_count);
+    result.virtual_level_edge_counts.push_back(profile.virtual_edge_count);
     result.level_modes.push_back(profile.mode);
     result.level_wall_times_ms.push_back(profile.level_wall_ms);
     result.level_profiles.push_back(profile);
@@ -604,10 +1069,27 @@ result_t<typename graph_t::vertex_type> run(
     if (use_pull) {
       frontier_bitmap.swap(next_frontier_bitmap);
       current_is_bitmap = true;
+      if (options.push_strategy == push_strategy_t::shared_node) {
+        shared_frontier_a.swap(shared_frontier_b);
+        frontier_mask.swap(next_frontier_mask);
+        current_unique_count = static_cast<std::size_t>(next_unique_count);
+      } else {
+        current_unique_count = current_count;
+      }
     } else {
-      frontier_a.swap(frontier_b);
+      if (options.push_strategy == push_strategy_t::shared_node) {
+        shared_frontier_a.swap(shared_frontier_b);
+        frontier_mask.swap(next_frontier_mask);
+        current_unique_count = static_cast<std::size_t>(next_unique_count);
+      } else {
+        frontier_a.swap(frontier_b);
+      }
       current_is_bitmap = false;
     }
+    result.unique_frontier_sizes.push_back(
+        options.push_strategy == push_strategy_t::shared_node
+            ? current_unique_count
+            : current_count);
   }
 
   result.gpu_time_ms = timer.end(stream);

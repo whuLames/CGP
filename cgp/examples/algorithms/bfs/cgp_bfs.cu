@@ -70,6 +70,7 @@ struct cgp_arguments_t {
   std::string json_dir = ".";
   std::string json_file;
   std::string traversal_mode = "hybrid";
+  std::string push_strategy = "edge_balanced";
   double pull_frontier_ratio = 0.15;
   double pull_edge_ratio = 0.20;
   int num_runs = 1;
@@ -100,6 +101,8 @@ cgp_arguments_t parse_arguments(int argc, char** argv) {
       "d,json_dir", "JSON output directory", cxxopts::value<std::string>())(
       "f,json_file", "JSON output file", cxxopts::value<std::string>())(
       "traversal_mode", "Traversal mode: push, pull, or hybrid",
+      cxxopts::value<std::string>())(
+      "push_strategy", "Push strategy: edge_balanced or shared_node",
       cxxopts::value<std::string>())(
       "pull_frontier_ratio",
       "Hybrid pull threshold as active (query,vertex) frontier ratio",
@@ -149,6 +152,15 @@ cgp_arguments_t parse_arguments(int argc, char** argv) {
     if (args.traversal_mode != "push" && args.traversal_mode != "pull" &&
         args.traversal_mode != "hybrid") {
       std::cerr << "Error: --traversal_mode must be push, pull, or hybrid\n";
+      std::exit(1);
+    }
+  }
+  if (parsed.count("push_strategy")) {
+    args.push_strategy = parsed["push_strategy"].as<std::string>();
+    if (args.push_strategy != "edge_balanced" &&
+        args.push_strategy != "shared_node") {
+      std::cerr
+          << "Error: --push_strategy must be edge_balanced or shared_node\n";
       std::exit(1);
     }
   }
@@ -329,6 +341,14 @@ gunrock::cgp_bfs::traversal_mode_t parse_traversal_mode(
   return gunrock::cgp_bfs::traversal_mode_t::hybrid;
 }
 
+gunrock::cgp_bfs::push_strategy_t parse_push_strategy(
+    const std::string& strategy) {
+  if (strategy == "shared_node") {
+    return gunrock::cgp_bfs::push_strategy_t::shared_node;
+  }
+  return gunrock::cgp_bfs::push_strategy_t::edge_balanced;
+}
+
 template <typename vertex_t, typename result_t>
 void export_json(const cgp_arguments_t& args,
                  int argc,
@@ -357,13 +377,18 @@ void export_json(const cgp_arguments_t& args,
   jsn["srcs"] = sources;
   jsn["query_results"] = query_results;
   jsn["frontier_sizes"] = result.frontier_sizes;
+  jsn["unique_frontier_sizes"] = result.unique_frontier_sizes;
   jsn["level_edge_counts"] = result.level_edge_counts;
+  jsn["actual_level_edge_counts"] = result.actual_level_edge_counts;
+  jsn["virtual_level_edge_counts"] = result.virtual_level_edge_counts;
   jsn["level_modes"] = result.level_modes;
   jsn["level_wall_times_ms"] = result.level_wall_times_ms;
   jsn["iterations"] = result.iterations;
   jsn["gpu_time_ms"] = result.gpu_time_ms;
   jsn["wall_time_ms"] = result.wall_time_ms;
+  jsn["shared_push_kernel_ms"] = result.shared_push_kernel_ms;
   jsn["traversal_mode"] = args.traversal_mode;
+  jsn["push_strategy"] = args.push_strategy;
   jsn["pull_frontier_ratio"] = args.pull_frontier_ratio;
   jsn["pull_edge_ratio"] = args.pull_edge_ratio;
   jsn["profile_levels"] = args.profile_levels;
@@ -380,11 +405,15 @@ void export_json(const cgp_arguments_t& args,
         {"mode", profile.mode},
         {"frontier_size", profile.frontier_size},
         {"edge_count", profile.edge_count},
+        {"unique_frontier_size", profile.unique_frontier_size},
+        {"actual_edge_count", profile.actual_edge_count},
+        {"virtual_edge_count", profile.virtual_edge_count},
         {"pull_frontier_threshold", profile.pull_frontier_threshold},
         {"pull_edge_threshold", profile.pull_edge_threshold},
         {"level_wall_ms", profile.level_wall_ms},
         {"degree_scan_ms", profile.degree_scan_ms},
         {"push_kernel_ms", profile.push_kernel_ms},
+        {"shared_push_kernel_ms", profile.shared_push_kernel_ms},
         {"bitmap_build_ms", profile.bitmap_build_ms},
         {"pull_kernel_ms", profile.pull_kernel_ms},
         {"compact_ms", profile.compact_ms},
@@ -394,7 +423,7 @@ void export_json(const cgp_arguments_t& args,
   jsn["level_profiles"] = level_profiles;
   jsn["optimization"] =
       "edge_balanced_expand, block_local_output_count, "
-      "deferred_query_completion, hybrid_push_pull";
+      "deferred_query_completion, hybrid_push_pull, shared_node_push";
   jsn["command_line"] = command_line(argc, argv);
   jsn["git_commit_sha"] = gunrock::io::git_commit_sha1();
   gunrock::util::stats::get_gpu_info(&jsn);
@@ -428,8 +457,14 @@ void run_loaded_graph(graph_t& G,
   auto context = std::make_shared<gcuda::multi_context_t>(0);
   auto n_vertices = static_cast<vertex_t>(G.get_number_of_vertices());
   auto sources = parse_sources<vertex_t>(args, n_vertices);
+  if (args.push_strategy == "shared_node" && sources.size() > 32) {
+    std::cerr
+        << "Error: --push_strategy=shared_node supports at most 32 queries\n";
+    std::exit(1);
+  }
   gunrock::cgp_bfs::options_t run_options;
   run_options.traversal_mode = parse_traversal_mode(args.traversal_mode);
+  run_options.push_strategy = parse_push_strategy(args.push_strategy);
   run_options.pull_frontier_ratio = args.pull_frontier_ratio;
   run_options.pull_edge_ratio = args.pull_edge_ratio;
   run_options.profile_levels = args.profile_levels;
@@ -444,10 +479,16 @@ void run_loaded_graph(graph_t& G,
   std::cout << "GPU Time : " << result.gpu_time_ms << " (ms)\n";
   std::cout << "Iterations : " << result.iterations << "\n";
   std::cout << "Traversal Mode : " << args.traversal_mode << "\n";
+  std::cout << "Push Strategy : " << args.push_strategy << "\n";
   std::cout << "Frontier Sizes : ";
   for (std::size_t i = 0; i < result.frontier_sizes.size(); ++i) {
     std::cout << result.frontier_sizes[i]
               << (i + 1 == result.frontier_sizes.size() ? "\n" : ",");
+  }
+  std::cout << "Unique Frontier Sizes : ";
+  for (std::size_t i = 0; i < result.unique_frontier_sizes.size(); ++i) {
+    std::cout << result.unique_frontier_sizes[i]
+              << (i + 1 == result.unique_frontier_sizes.size() ? "\n" : ",");
   }
   std::cout << "Level Modes : ";
   for (std::size_t i = 0; i < result.level_modes.size(); ++i) {
