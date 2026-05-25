@@ -69,9 +69,13 @@ struct cgp_arguments_t {
   std::string query_file;
   std::string json_dir = ".";
   std::string json_file;
+  std::string traversal_mode = "hybrid";
+  double pull_frontier_ratio = 0.15;
+  double pull_edge_ratio = 0.20;
   int num_runs = 1;
   bool validate = false;
   bool binary = false;
+  bool profile_levels = false;
 };
 
 std::string trim(std::string value) {
@@ -94,7 +98,15 @@ cgp_arguments_t parse_arguments(int argc, char** argv) {
       "n,num_runs", "Number of repeated runs when a single --src is passed",
       cxxopts::value<int>())("validate", "CPU validation for last query")(
       "d,json_dir", "JSON output directory", cxxopts::value<std::string>())(
-      "f,json_file", "JSON output file", cxxopts::value<std::string>());
+      "f,json_file", "JSON output file", cxxopts::value<std::string>())(
+      "traversal_mode", "Traversal mode: push, pull, or hybrid",
+      cxxopts::value<std::string>())(
+      "pull_frontier_ratio",
+      "Hybrid pull threshold as active (query,vertex) frontier ratio",
+      cxxopts::value<double>())(
+      "pull_edge_ratio", "Hybrid pull threshold as active frontier-edge ratio",
+      cxxopts::value<double>())("profile_levels",
+                                "Record per-level CUDA event timings");
 
   auto parsed = options.parse(argc, argv);
   if (parsed.count("help") || parsed.count("market") == 0) {
@@ -131,6 +143,23 @@ cgp_arguments_t parse_arguments(int argc, char** argv) {
   }
   if (parsed.count("json_file")) {
     args.json_file = parsed["json_file"].as<std::string>();
+  }
+  if (parsed.count("traversal_mode")) {
+    args.traversal_mode = parsed["traversal_mode"].as<std::string>();
+    if (args.traversal_mode != "push" && args.traversal_mode != "pull" &&
+        args.traversal_mode != "hybrid") {
+      std::cerr << "Error: --traversal_mode must be push, pull, or hybrid\n";
+      std::exit(1);
+    }
+  }
+  if (parsed.count("pull_frontier_ratio")) {
+    args.pull_frontier_ratio = parsed["pull_frontier_ratio"].as<double>();
+  }
+  if (parsed.count("pull_edge_ratio")) {
+    args.pull_edge_ratio = parsed["pull_edge_ratio"].as<double>();
+  }
+  if (parsed.count("profile_levels")) {
+    args.profile_levels = true;
   }
   return args;
 }
@@ -289,6 +318,17 @@ std::string command_line(int argc, char** argv) {
   return command;
 }
 
+gunrock::cgp_bfs::traversal_mode_t parse_traversal_mode(
+    const std::string& mode) {
+  if (mode == "push") {
+    return gunrock::cgp_bfs::traversal_mode_t::push;
+  }
+  if (mode == "pull") {
+    return gunrock::cgp_bfs::traversal_mode_t::pull;
+  }
+  return gunrock::cgp_bfs::traversal_mode_t::hybrid;
+}
+
 template <typename vertex_t, typename result_t>
 void export_json(const cgp_arguments_t& args,
                  int argc,
@@ -318,12 +358,43 @@ void export_json(const cgp_arguments_t& args,
   jsn["query_results"] = query_results;
   jsn["frontier_sizes"] = result.frontier_sizes;
   jsn["level_edge_counts"] = result.level_edge_counts;
+  jsn["level_modes"] = result.level_modes;
+  jsn["level_wall_times_ms"] = result.level_wall_times_ms;
   jsn["iterations"] = result.iterations;
   jsn["gpu_time_ms"] = result.gpu_time_ms;
   jsn["wall_time_ms"] = result.wall_time_ms;
+  jsn["traversal_mode"] = args.traversal_mode;
+  jsn["pull_frontier_ratio"] = args.pull_frontier_ratio;
+  jsn["pull_edge_ratio"] = args.pull_edge_ratio;
+  jsn["profile_levels"] = args.profile_levels;
+  jsn["pull_frontier_threshold"] = args.pull_frontier_ratio *
+                                   static_cast<double>(sources.size()) *
+                                   static_cast<double>(n_vertices);
+  jsn["pull_edge_threshold"] = args.pull_edge_ratio *
+                               static_cast<double>(sources.size()) *
+                               static_cast<double>(n_edges);
+  nlohmann::json level_profiles = nlohmann::json::array();
+  for (const auto& profile : result.level_profiles) {
+    level_profiles.push_back({
+        {"level", profile.level},
+        {"mode", profile.mode},
+        {"frontier_size", profile.frontier_size},
+        {"edge_count", profile.edge_count},
+        {"pull_frontier_threshold", profile.pull_frontier_threshold},
+        {"pull_edge_threshold", profile.pull_edge_threshold},
+        {"level_wall_ms", profile.level_wall_ms},
+        {"degree_scan_ms", profile.degree_scan_ms},
+        {"push_kernel_ms", profile.push_kernel_ms},
+        {"bitmap_build_ms", profile.bitmap_build_ms},
+        {"pull_kernel_ms", profile.pull_kernel_ms},
+        {"compact_ms", profile.compact_ms},
+        {"count_sync_ms", profile.count_sync_ms},
+    });
+  }
+  jsn["level_profiles"] = level_profiles;
   jsn["optimization"] =
       "edge_balanced_expand, block_local_output_count, "
-      "deferred_query_completion";
+      "deferred_query_completion, hybrid_push_pull";
   jsn["command_line"] = command_line(argc, argv);
   jsn["git_commit_sha"] = gunrock::io::git_commit_sha1();
   gunrock::util::stats::get_gpu_info(&jsn);
@@ -357,7 +428,12 @@ void run_loaded_graph(graph_t& G,
   auto context = std::make_shared<gcuda::multi_context_t>(0);
   auto n_vertices = static_cast<vertex_t>(G.get_number_of_vertices());
   auto sources = parse_sources<vertex_t>(args, n_vertices);
-  auto result = gunrock::cgp_bfs::run(G, sources, context);
+  gunrock::cgp_bfs::options_t run_options;
+  run_options.traversal_mode = parse_traversal_mode(args.traversal_mode);
+  run_options.pull_frontier_ratio = args.pull_frontier_ratio;
+  run_options.pull_edge_ratio = args.pull_edge_ratio;
+  run_options.profile_levels = args.profile_levels;
+  auto result = gunrock::cgp_bfs::run(G, sources, context, run_options);
 
   std::cout << "Primitive : cgp_bfs\n";
   std::cout << "Sources : ";
@@ -367,10 +443,16 @@ void run_loaded_graph(graph_t& G,
   std::cout << "Wall Time : " << result.wall_time_ms << " (ms)\n";
   std::cout << "GPU Time : " << result.gpu_time_ms << " (ms)\n";
   std::cout << "Iterations : " << result.iterations << "\n";
+  std::cout << "Traversal Mode : " << args.traversal_mode << "\n";
   std::cout << "Frontier Sizes : ";
   for (std::size_t i = 0; i < result.frontier_sizes.size(); ++i) {
     std::cout << result.frontier_sizes[i]
               << (i + 1 == result.frontier_sizes.size() ? "\n" : ",");
+  }
+  std::cout << "Level Modes : ";
+  for (std::size_t i = 0; i < result.level_modes.size(); ++i) {
+    std::cout << result.level_modes[i]
+              << (i + 1 == result.level_modes.size() ? "\n" : ",");
   }
 
   for (const auto& query : result.queries) {

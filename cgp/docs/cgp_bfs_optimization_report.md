@@ -172,3 +172,85 @@ overhead.
 
 Memory footprint is still proportional to `num_queries * |V|`. That remains the
 primary limiter for high query counts on large graphs.
+
+## Hybrid Push/Pull Update
+
+This round adds a heavy-frontier pull path to `cgp_bfs` while preserving the
+existing edge-balanced push path.
+
+New CLI options:
+
+```bash
+--traversal_mode=push|pull|hybrid
+--pull_frontier_ratio=<float>
+--pull_edge_ratio=<float>
+--profile_levels
+```
+
+The default traversal mode is `hybrid`. Hybrid switches to pull when either the
+active `(query, vertex)` frontier reaches `pull_frontier_ratio * queries * |V|`
+or the active frontier edge count reaches `pull_edge_ratio * queries * |E|`.
+Defaults are `0.15` and `0.20`.
+
+The pull implementation uses a dense vertex-major frontier bitmap:
+`frontier_bitmap[vertex * num_queries + query]`. The kernel maps one warp to one
+`(vertex, query)` candidate, skips already visited distances, scans the CSR row,
+and exits as soon as any lane finds a neighbor in the current frontier. It writes
+the existing query-major distance layout:
+`distances[query_id * |V| + vertex]`.
+
+State conversion is explicit:
+
+- push levels keep the combined `(query_id, vertex)` frontier list;
+- switching push to pull builds the dense bitmap from the list;
+- pull levels produce the next dense bitmap directly;
+- switching pull back to push compacts the bitmap into the list.
+
+JSON output now includes `traversal_mode`, threshold values, `level_modes`,
+`level_wall_times_ms`, and `level_profiles`. With `--profile_levels`, CUDA event
+timings are recorded for degree scans, bitmap build, push kernel, pull kernel,
+bitmap compaction, and count synchronization. Consecutive pull levels avoid
+list compaction solely for accounting; exact source-side edge counts for those
+bitmap-only levels are therefore computed only when `--profile_levels` is set.
+
+Smoke validation completed on `datasets/chesapeake/chesapeake.mtx` with
+`--src 0,1,2 --validate`:
+
+| traversal mode | wall_time_ms | gpu_time_ms | level modes | validation |
+| --- | ---: | ---: | --- | --- |
+| `push` | 0.633 | 0.609 | push,push,push,push | 0 errors |
+| `pull --profile_levels` | 0.793 | 0.770 | pull,pull,pull,pull | 0 errors |
+| `hybrid` | 0.480 | 0.461 | push,pull,pull,push | 0 errors |
+| `hybrid --pull_frontier_ratio=0.01 --pull_edge_ratio=0.01 --profile_levels` | 0.538 | 0.519 | pull,pull,pull,pull | 0 errors |
+| `hybrid --pull_frontier_ratio=0.3 --pull_edge_ratio=1.0 --profile_levels` | 1.335 | 1.317 | push,push,pull,push | 0 errors |
+
+Raw smoke JSON files are under `build/cgp_bfs_optimization_results/`:
+
+- `cgp_bfs_chesapeake_q3_push.json`
+- `cgp_bfs_chesapeake_q3_pull.json`
+- `cgp_bfs_chesapeake_q3_hybrid_default.json`
+- `cgp_bfs_chesapeake_q3_hybrid.json`
+- `cgp_bfs_chesapeake_q3_hybrid_transitions.json`
+
+Large-graph medians were collected on `CUDA_VISIBLE_DEVICES=2` with the
+GunrockV2.2 query files in
+`/home/zyl/Projects/ocgp/baselines/gunrockV2.2/`. Each row is the median of 3
+measured runs after 1 warmup. Raw JSON/logs are under
+`build/cgp_bfs_optimization_results/hybrid_compare/`.
+
+| graph | q | push ms | hybrid ms | speedup vs push | V2.2 total ms | speedup vs V2.2 total |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| soc-orkut | 2 | 89.436 | 8.741 | 10.232 | 116.763 | 13.358 |
+| soc-orkut | 4 | 227.390 | 36.046 | 6.308 | 217.115 | 6.023 |
+| soc-orkut | 8 | 526.094 | 95.199 | 5.526 | 407.534 | 4.281 |
+| soc-orkut | 16 | 1143.424 | 310.275 | 3.685 | 800.693 | 2.581 |
+| soc-twitter | 2 | 198.796 | 44.701 | 4.447 | 343.894 | 7.693 |
+| soc-twitter | 4 | 425.688 | 136.563 | 3.117 | 651.855 | 4.773 |
+| soc-twitter | 8 | 931.917 | 331.529 | 2.811 | 1287.616 | 3.884 |
+| soc-sinaweibo | 2 | 408.375 | 138.807 | 2.942 | 502.343 | 3.619 |
+| soc-sinaweibo | 4 | 877.559 | 254.874 | 3.443 | 957.799 | 3.758 |
+
+The hybrid path improves every tested large-graph case. The original regression
+target, `soc-orkut q8/q16`, improves from `526.094 -> 95.199 ms` and
+`1143.424 -> 310.275 ms`, and now beats the existing GunrockV2.2 multi-stream
+`total_wall_ms` baseline for both query counts.
