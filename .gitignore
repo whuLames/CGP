@@ -1,0 +1,73 @@
+# Build and generated directories
+build/
+build*/
+build_*/
+*_build/
+cmake-build-*/
+.cmake/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+
+# Downloaded/vendor dependency trees
+externals/
+**/externals/
+
+# Datasets and generated graph binaries
+datasets/
+**/datasets/
+data/
+*.gr
+*.ggr
+*.mtx
+*.smtx
+*.bin
+*.label
+*.labels
+
+# Logs, profiling, and benchmark outputs
+results/
+**/results/
+logs/
+**/logs/
+logs_detail/
+**/logs_detail/
+profile/
+**/profile/
+new_profile/
+**/new_profile/
+*.log
+*.csv
+*.json
+*.db
+*.stats.csv
+*.sysinfo.txt
+*.ncu-rep
+*.nsys-rep
+*.sqlite
+
+# Compiled artifacts
+*.o
+*.so
+*.a
+*.la
+*.lai
+*.lo
+*.slo
+*.dylib
+*.exe
+
+# Editor and Python cache
+*.vscode*
+.idea/
+*.swp
+*.swo
+*.un~
+*~
+__pycache__/
+*.pyc
+*.pyo
+
+# Local nested git metadata backups, if any are created while flattening.
+.nested-git-backup/

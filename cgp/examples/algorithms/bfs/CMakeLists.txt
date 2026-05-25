@@ -1,0 +1,3 @@
+add_essentials_example(bfs)
+add_essentials_example(cgp_bfs)
+add_essentials_example(cgp_bfs_multi_stream)

@@ -1,0 +1,2 @@
+add_essentials_example(bfs)
+add_essentials_example(bfs_concurrent)

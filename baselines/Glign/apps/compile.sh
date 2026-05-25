@@ -1,0 +1,9 @@
+#!/bin/bash -l
+
+make clean
+
+OPENMP=1 EDGELONG=1 LONG=1 make SSSP_Batch
+OPENMP=1 EDGELONG=1 LONG=1 make BFS_Batch
+OPENMP=1 EDGELONG=1 LONG=1 make SSWP_Batch
+OPENMP=1 EDGELONG=1 LONG=1 make Viterbi_Batch
+OPENMP=1 EDGELONG=1 LONG=1 make SSNP_Batch

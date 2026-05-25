@@ -1,0 +1,15 @@
+[submodule "pytorch-custom/pytorch_geometric"]
+	path = pytorch-custom/pytorch_geometric
+	url = git@github.com:pyg-team/pytorch_geometric.git
+[submodule "dgl-custom/dgl"]
+	path = dgl-custom/dgl
+	url = git@github.com:dmlc/dgl.git
+[submodule "gunrock-custom/gunrock"]
+	path = gunrock-custom/gunrock
+	url = git@github.com:gunrock/gunrock.git
+[submodule "merge-spmm"]
+	path = merge-spmm
+	url = git@github.com:owensgroup/merge-spmm.git
+[submodule "gunrock-test/gunrock"]
+	path = gunrock-test/gunrock
+	url = git@github.com:gunrock/gunrock.git
