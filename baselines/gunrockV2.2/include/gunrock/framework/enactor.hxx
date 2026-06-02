@@ -244,13 +244,13 @@ struct enactor_t {
     auto single_context = context->get_context(0);
     prepare_frontier(get_input_frontier(), *context);
     auto& timer = single_context->timer();
-    timer.begin();
+    timer.begin(single_context->stream());
     while (!is_converged(*context)) {
       loop(*context);
       ++iteration;
     }
     finalize(*context);
-    auto runtime = timer.end();
+    auto runtime = timer.end(single_context->stream());
 #if (ESSENTIALS_COLLECT_METRICS)
     benchmark::____.search_depth = iteration;
     benchmark::____.total_runtime = runtime;

@@ -10,6 +10,7 @@
 #pragma once
 
 #include <gunrock/algorithms/algorithms.hxx>
+#include <gunrock/util/iteration_profiler.hxx>
 
 namespace gunrock {
 namespace bfs {
@@ -18,9 +19,14 @@ template <typename vertex_t>
 struct param_t {
   vertex_t single_source;
   operators::load_balance_t advance_load_balance;
-  param_t(vertex_t _single_source, 
-          operators::load_balance_t _advance_load_balance = operators::load_balance_t::block_mapped) 
-    : single_source(_single_source), advance_load_balance(_advance_load_balance) {}
+  util::iteration_profiler::csv_writer_t* iter_profile;
+  param_t(vertex_t _single_source,
+          operators::load_balance_t _advance_load_balance =
+              operators::load_balance_t::block_mapped,
+          util::iteration_profiler::csv_writer_t* _iter_profile = nullptr)
+      : single_source(_single_source),
+        advance_load_balance(_advance_load_balance),
+        iter_profile(_iter_profile) {}
 };
 
 template <typename vertex_t>
@@ -55,9 +61,12 @@ struct problem_t : gunrock::problem_t<graph_t> {
   void reset() override {
     auto n_vertices = this->get_graph().get_number_of_vertices();
     auto d_distances = thrust::device_pointer_cast(this->result.distances);
-    thrust::fill(thrust::device, d_distances + 0, d_distances + n_vertices,
+    auto context = this->get_single_context();
+    thrust::fill(context->execution_policy(),
+                 d_distances + 0, d_distances + n_vertices,
                  std::numeric_limits<vertex_t>::max());
-    thrust::fill(thrust::device, d_distances + this->param.single_source,
+    thrust::fill(context->execution_policy(),
+                 d_distances + this->param.single_source,
                  d_distances + this->param.single_source + 1, 0);
   }
 };
@@ -107,6 +116,18 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
     auto visited = P->visited.data().get();
 
     auto iteration = this->iteration;
+    bool profile_enabled = P->param.iter_profile != nullptr &&
+                           P->param.iter_profile->enabled();
+    auto input_frontier = profile_enabled
+                              ? E->get_input_frontier()->get_number_of_elements()
+                              : 0;
+    std::string range_name =
+        profile_enabled
+            ? util::iteration_profiler::make_range_name("bfs", iteration)
+            : std::string();
+    util::iteration_profiler::range_t range(range_name, profile_enabled);
+    util::iteration_profiler::event_timer_t timer(profile_enabled);
+    timer.start(context.get_context(0)->stream());
 
     auto search = [distances, single_source, iteration] __host__ __device__(
                       vertex_t const& source,    // ... source
@@ -143,12 +164,46 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
 
     // Execute advance operator on the provided lambda
     auto advance_load_balance = P->param.advance_load_balance;
+    std::string advance_range_name =
+        profile_enabled
+            ? util::iteration_profiler::make_range_name("bfs", iteration,
+                                                        "advance")
+            : std::string();
+    util::iteration_profiler::range_t advance_range(advance_range_name,
+                                                    profile_enabled);
+    util::iteration_profiler::event_timer_t advance_timer(profile_enabled);
+    advance_timer.start(context.get_context(0)->stream());
     operators::advance::execute_runtime(G, E, search, advance_load_balance, context);
+    auto advance_elapsed_ms = advance_timer.stop(context.get_context(0)->stream());
+    advance_range.pop();
 
     // Execute filter operator to remove the invalids.
     // @todo: Add CLI option to enable or disable this.
     // operators::filter::execute<operators::filter_algorithm_t::compact>(
     // G, E, remove_invalids, context);
+
+    auto elapsed_ms = timer.stop(context.get_context(0)->stream());
+    range.pop();
+
+    if (profile_enabled) {
+      auto output_frontier = E->get_input_frontier()->get_number_of_elements();
+      P->param.iter_profile->write(
+          iteration,
+          {range_name,
+           static_cast<long long>(input_frontier),
+           -1,
+           static_cast<long long>(input_frontier),
+           static_cast<long long>(output_frontier),
+           elapsed_ms});
+      P->param.iter_profile->write(
+          iteration,
+          {advance_range_name,
+           static_cast<long long>(input_frontier),
+           -1,
+           static_cast<long long>(input_frontier),
+           static_cast<long long>(output_frontier),
+           advance_elapsed_ms});
+    }
   }
 
 };  // struct enactor_t
@@ -176,13 +231,15 @@ float run(graph_t& G,
           std::shared_ptr<gcuda::multi_context_t> context =
               std::shared_ptr<gcuda::multi_context_t>(
                   new gcuda::multi_context_t(0)),  // Context
-          operators::load_balance_t advance_load_balance = operators::load_balance_t::block_mapped
+          operators::load_balance_t advance_load_balance =
+              operators::load_balance_t::block_mapped,
+          util::iteration_profiler::csv_writer_t* iter_profile = nullptr
 ) {
   using vertex_t = typename graph_t::vertex_type;
   using param_type = param_t<vertex_t>;
   using result_type = result_t<vertex_t>;
 
-  param_type param(single_source, advance_load_balance);
+  param_type param(single_source, advance_load_balance, iter_profile);
   result_type result(distances, predecessors);
 
   using problem_type = problem_t<graph_t, param_type, result_type>;

@@ -10,6 +10,7 @@
 #pragma once
 
 #include <gunrock/algorithms/algorithms.hxx>
+#include <gunrock/util/iteration_profiler.hxx>
 #include <thrust/iterator/counting_iterator.h>
 #include <thrust/inner_product.h>
 
@@ -21,9 +22,16 @@ struct param_t {
   weight_t alpha;
   weight_t tol;
   int max_iterations;
+  util::iteration_profiler::csv_writer_t* iter_profile;
 
-  param_t(weight_t _alpha, weight_t _tol, int _max_iterations = 10)
-      : alpha(_alpha), tol(_tol), max_iterations(_max_iterations) {}
+  param_t(weight_t _alpha,
+          weight_t _tol,
+          int _max_iterations = 10,
+          util::iteration_profiler::csv_writer_t* _iter_profile = nullptr)
+      : alpha(_alpha),
+        tol(_tol),
+        max_iterations(_max_iterations),
+        iter_profile(_iter_profile) {}
 };
 
 template <typename weight_t>
@@ -111,12 +119,30 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
     auto G = P->get_graph();
 
     auto n_vertices = G.get_number_of_vertices();
+    auto n_edges = G.get_number_of_edges();
     auto p = P->result.p;
     auto plast = P->plast.data().get();
     auto iweights = P->iweights.data().get();
     auto alpha = P->param.alpha;
+    auto iteration = this->iteration;
 
     auto policy = this->context->get_context(0)->execution_policy();
+    auto stream = this->context->get_context(0)->stream();
+    bool profile_enabled = P->param.iter_profile != nullptr &&
+                           P->param.iter_profile->enabled();
+    auto iter_range_name =
+        profile_enabled
+            ? util::iteration_profiler::make_range_name("pr", iteration)
+            : std::string();
+    auto edge_range_name =
+        profile_enabled
+            ? util::iteration_profiler::make_range_name("pr", iteration,
+                                                        "edge_spread")
+            : std::string();
+    util::iteration_profiler::range_t iter_range(iter_range_name,
+                                                 profile_enabled);
+    util::iteration_profiler::event_timer_t iter_timer(profile_enabled);
+    iter_timer.start(stream);
 
     thrust::copy_n(policy, p, n_vertices, plast);
 
@@ -145,11 +171,17 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
       math::atomic::add(p + dst, update);
     };
 
+    util::iteration_profiler::range_t edge_range(edge_range_name,
+                                                 profile_enabled);
+    util::iteration_profiler::event_timer_t edge_timer(profile_enabled);
+    edge_timer.start(stream);
     operators::parallel_for::execute<operators::parallel_for_each_t::edge>(
         G,              // graph
         spread_coo_op,  // lambda function
         context         // context
     );
+    auto edge_elapsed_ms = edge_timer.stop(stream);
+    edge_range.pop();
 
     // -- OR --
     // You can do the following with advance operator instead:
@@ -167,6 +199,28 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
     //                             operators::advance_io_type_t::none>(
     //     G, E, spread_op, context);
     // <<
+
+    auto iter_elapsed_ms = iter_timer.stop(stream);
+    iter_range.pop();
+
+    if (profile_enabled) {
+      P->param.iter_profile->write(
+          iteration,
+          {iter_range_name,
+           static_cast<long long>(n_vertices),
+           static_cast<long long>(n_edges),
+           static_cast<long long>(n_vertices),
+           static_cast<long long>(n_vertices),
+           iter_elapsed_ms});
+      P->param.iter_profile->write(
+          iteration,
+          {edge_range_name,
+           static_cast<long long>(n_vertices),
+           static_cast<long long>(n_edges),
+           static_cast<long long>(n_vertices),
+           static_cast<long long>(n_vertices),
+           edge_elapsed_ms});
+    }
   }
 
   virtual bool is_converged(gcuda::multi_context_t& context) override {
@@ -186,7 +240,8 @@ float run(graph_t& G,
           typename graph_t::weight_type* p,  // Output
           std::shared_ptr<gcuda::multi_context_t> context =
               std::shared_ptr<gcuda::multi_context_t>(
-                  new gcuda::multi_context_t(0))  // Context
+                  new gcuda::multi_context_t(0)),  // Context
+          util::iteration_profiler::csv_writer_t* iter_profile = nullptr
 ) {
   // <user-defined>
   using vertex_t = typename graph_t::vertex_type;
@@ -195,7 +250,7 @@ float run(graph_t& G,
   using param_type = param_t<weight_t>;
   using result_type = result_t<weight_t>;
 
-  param_type param(alpha, tol, max_iterations);
+  param_type param(alpha, tol, max_iterations, iter_profile);
   result_type result(p);
   // </user-defined>
 

@@ -18,7 +18,9 @@ struct parameters_t {
   std::string json_dir = ".";
   std::string json_file = "";
   std::string tag_string = "";
+  std::string iter_profile = "";
   int num_runs = 1;
+  int max_iterations = 10;
   cxxopts::Options options;
   bool export_metrics = false;
   bool validate = false;
@@ -48,6 +50,8 @@ struct parameters_t {
          cxxopts::value<std::string>())  // json output file
         ("t,tag", "Tags for the JSON output; comma-separated string of tags",
          cxxopts::value<std::string>())  // tags
+        ("iter_profile", "CSV file for per-iteration profiling output",
+         cxxopts::value<std::string>())
         ("advance_load_balance", "Load balancing technique for advance operator (thread_mapped, block_mapped, merge_path, etc.)",
          cxxopts::value<std::string>())  // advance load balance
         ("filter_algorithm", "Filter algorithm (remove, predicated, compact, bypass)",
@@ -71,6 +75,10 @@ struct parameters_t {
     } else {
       options.add_options()("n,num_runs", "Number of runs",
                             cxxopts::value<int>());  // runs
+      if (algorithm == "Page Rank") {
+        options.add_options()("max_iterations", "Maximum iterations",
+                              cxxopts::value<int>());
+      }
     }
 
     // Parse command line arguments
@@ -108,6 +116,14 @@ struct parameters_t {
 
     if (result.count("tag") == 1) {
       tag_string = result["tag"].as<std::string>();
+    }
+
+    if (result.count("iter_profile") == 1) {
+      iter_profile = result["iter_profile"].as<std::string>();
+    }
+
+    if (result.count("max_iterations") == 1) {
+      max_iterations = result["max_iterations"].as<int>();
     }
 
     if (result.count("src") == 1) {

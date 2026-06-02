@@ -13,22 +13,8 @@
 #include <type_traits>
 #include <vector>
 
-#if defined(__has_include)
-#if __has_include(<nvtx3/nvToolsExt.h>)
-#include <nvtx3/nvToolsExt.h>
-#define CGP_BFS_HAS_NVTX 1
-#elif __has_include(<nvToolsExt.h>)
-#include <nvToolsExt.h>
-#define CGP_BFS_HAS_NVTX 1
-#endif
-#endif
-
-#ifndef CGP_BFS_HAS_NVTX
-#define CGP_BFS_HAS_NVTX 0
-#endif
-
 namespace gunrock {
-namespace cgp_bfs {
+namespace cgp_sssp {
 
 template <typename vertex_t>
 struct frontier_item_t {
@@ -45,13 +31,11 @@ struct query_result_t {
 };
 
 enum class traversal_mode_t { push, pull, hybrid };
-
 enum class push_strategy_t {
   edge_balanced,
   shared_node,
   shared_node_query_parallel
 };
-
 enum class pull_strategy_t { bitmap, ge_spmm };
 
 using query_mask_t = std::uint32_t;
@@ -101,7 +85,6 @@ struct options_t {
   double pull_frontier_ratio = 0.15;
   double pull_edge_ratio = 0.20;
   bool profile_levels = false;
-  bool emit_nvtx = false;
 };
 
 struct level_profile_t {
@@ -128,9 +111,9 @@ struct level_profile_t {
   unsigned long long virtual_edge_count = 0;
 };
 
-template <typename vertex_t>
+template <typename vertex_t, typename weight_t>
 struct result_t {
-  thrust::device_vector<vertex_t> distances;
+  thrust::device_vector<weight_t> distances;
   std::vector<query_result_t<vertex_t>> queries;
   std::vector<std::size_t> frontier_sizes;
   std::vector<std::size_t> unique_frontier_sizes;
@@ -150,59 +133,18 @@ struct result_t {
 
 namespace detail {
 
-inline void push_nvtx_range(const std::string& name) {
-#if CGP_BFS_HAS_NVTX
-  nvtxRangePushA(name.c_str());
-#else
-  (void)name;
-#endif
-}
-
-inline void pop_nvtx_range() {
-#if CGP_BFS_HAS_NVTX
-  nvtxRangePop();
-#endif
-}
-
-class nvtx_range_t {
- public:
-  explicit nvtx_range_t(const std::string& name, bool enabled)
-      : active_(enabled) {
-    if (active_) {
-      push_nvtx_range(name);
-    }
-  }
-  nvtx_range_t(const nvtx_range_t&) = delete;
-  nvtx_range_t& operator=(const nvtx_range_t&) = delete;
-  ~nvtx_range_t() {
-    if (active_) {
-      pop_nvtx_range();
-    }
-  }
-
- private:
-  bool active_;
-};
-
-inline std::string candidate_range_name(int query_count,
-                                        int level,
-                                        const char* candidate) {
-  return std::string("cgp:bfs:q") + std::to_string(query_count) +
-         ":iter:" + std::to_string(level) + ":" + candidate;
-}
-
-template <typename graph_t, typename vertex_t>
+template <typename graph_t, typename vertex_t, typename weight_t>
 __global__ void init_kernel(graph_t G,
                             const vertex_t* sources,
                             int num_queries,
-                            vertex_t* distances,
+                            weight_t* distances,
                             frontier_item_t<vertex_t>* frontier) {
   using graph_vertex_t = typename graph_t::vertex_type;
   std::size_t n_vertices = G.get_number_of_vertices();
   std::size_t total = static_cast<std::size_t>(num_queries) * n_vertices;
   std::size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
   std::size_t stride = blockDim.x * gridDim.x;
-  vertex_t infinity = std::numeric_limits<vertex_t>::max();
+  weight_t infinity = std::numeric_limits<weight_t>::max();
 
   for (std::size_t i = tid; i < total; i += stride) {
     distances[i] = infinity;
@@ -211,7 +153,8 @@ __global__ void init_kernel(graph_t G,
   for (std::size_t q = tid; q < static_cast<std::size_t>(num_queries);
        q += stride) {
     auto source = sources[q];
-    distances[q * n_vertices + static_cast<std::size_t>(source)] = 0;
+    distances[q * n_vertices + static_cast<std::size_t>(source)] =
+        static_cast<weight_t>(0);
     frontier[q] = {static_cast<vertex_t>(q),
                    static_cast<graph_vertex_t>(source)};
   }
@@ -221,25 +164,24 @@ __global__ void reset_counter_kernel(unsigned long long* counter) {
   *counter = 0ULL;
 }
 
-template <typename vertex_t>
-__global__ void fill_distances_kernel(vertex_t* distances,
+template <typename weight_t>
+__global__ void fill_distances_kernel(weight_t* distances,
                                       std::size_t total_pairs) {
   std::size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
   std::size_t stride = blockDim.x * gridDim.x;
-  vertex_t infinity = std::numeric_limits<vertex_t>::max();
+  weight_t infinity = std::numeric_limits<weight_t>::max();
 
   for (std::size_t i = tid; i < total_pairs; i += stride) {
     distances[i] = infinity;
   }
 }
 
-template <typename graph_t, typename vertex_t>
+template <typename graph_t, typename vertex_t, typename weight_t>
 __global__ void init_shared_node_sources_kernel(
     graph_t G,
     const vertex_t* sources,
     int num_queries,
-    vertex_t* distances,
-    query_mask_t* visited_mask,
+    weight_t* distances,
     query_mask_t* frontier_mask,
     vertex_t* frontier_vertices,
     unsigned long long* unique_count) {
@@ -251,9 +193,8 @@ __global__ void init_shared_node_sources_kernel(
        q += stride) {
     auto source = sources[q];
     query_mask_t bit = static_cast<query_mask_t>(1u) << q;
-    distances[q * n_vertices + static_cast<std::size_t>(source)] = 0;
-    atomicOr(reinterpret_cast<unsigned int*>(visited_mask + source),
-             static_cast<unsigned int>(bit));
+    distances[q * n_vertices + static_cast<std::size_t>(source)] =
+        static_cast<weight_t>(0);
     query_mask_t old = static_cast<query_mask_t>(atomicOr(
         reinterpret_cast<unsigned int*>(frontier_mask + source),
         static_cast<unsigned int>(bit)));
@@ -303,11 +244,13 @@ __global__ void shared_to_bitmap_kernel(const vertex_t* frontier_vertices,
   }
 }
 
-template <typename vertex_t>
+template <typename vertex_t, typename weight_t>
 __global__ void list_to_dense_kernel(const frontier_item_t<vertex_t>* frontier,
                                      std::size_t count,
                                      int m_eff,
-                                     float* dense) {
+                                     const weight_t* distances,
+                                     std::size_t n_vertices,
+                                     weight_t* dense) {
   std::size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
   std::size_t stride = blockDim.x * gridDim.x;
 
@@ -315,17 +258,21 @@ __global__ void list_to_dense_kernel(const frontier_item_t<vertex_t>* frontier,
     auto item = frontier[i];
     dense[static_cast<std::size_t>(item.vertex) *
               static_cast<std::size_t>(m_eff) +
-          static_cast<std::size_t>(item.query_id)] = 1.0f;
+          static_cast<std::size_t>(item.query_id)] =
+        distances[static_cast<std::size_t>(item.query_id) * n_vertices +
+                  static_cast<std::size_t>(item.vertex)];
   }
 }
 
-template <typename vertex_t>
+template <typename vertex_t, typename weight_t>
 __global__ void shared_to_dense_kernel(const vertex_t* frontier_vertices,
                                        const query_mask_t* frontier_mask,
                                        std::size_t unique_count,
                                        int num_queries,
                                        int m_eff,
-                                       float* dense) {
+                                       const weight_t* distances,
+                                       std::size_t n_vertices,
+                                       weight_t* dense) {
   std::size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
   std::size_t stride = blockDim.x * gridDim.x;
 
@@ -337,7 +284,9 @@ __global__ void shared_to_dense_kernel(const vertex_t* frontier_vertices,
       if (query_id < num_queries) {
         dense[static_cast<std::size_t>(vertex) *
                   static_cast<std::size_t>(m_eff) +
-              static_cast<std::size_t>(query_id)] = 1.0f;
+              static_cast<std::size_t>(query_id)] =
+            distances[static_cast<std::size_t>(query_id) * n_vertices +
+                      static_cast<std::size_t>(vertex)];
       }
       mask &= (mask - 1);
     }
@@ -364,8 +313,8 @@ __global__ void bitmap_to_list_kernel(const unsigned char* bitmap,
   }
 }
 
-template <typename vertex_t>
-__global__ void dense_to_list_kernel(const float* dense,
+template <typename vertex_t, typename weight_t>
+__global__ void dense_to_list_kernel(const weight_t* dense,
                                      std::size_t n_vertices,
                                      int num_queries,
                                      int m_eff,
@@ -379,7 +328,8 @@ __global__ void dense_to_list_kernel(const float* dense,
   for (std::size_t i = tid; i < total_pairs; i += stride) {
     std::size_t vertex = i / static_cast<std::size_t>(num_queries);
     std::size_t query_id = i % static_cast<std::size_t>(num_queries);
-    if (dense[vertex * static_cast<std::size_t>(m_eff) + query_id] == 0.0f) {
+    if (dense[vertex * static_cast<std::size_t>(m_eff) + query_id] ==
+        std::numeric_limits<weight_t>::max()) {
       continue;
     }
     unsigned long long position = atomicAdd(out_count, 1ULL);
@@ -415,9 +365,9 @@ __global__ void bitmap_to_shared_frontier_kernel(
   }
 }
 
-template <typename vertex_t>
+template <typename vertex_t, typename weight_t>
 __global__ void dense_to_shared_frontier_kernel(
-    const float* dense,
+    const weight_t* dense,
     std::size_t n_vertices,
     int num_queries,
     int m_eff,
@@ -431,7 +381,8 @@ __global__ void dense_to_shared_frontier_kernel(
     query_mask_t mask = 0;
     for (int q = 0; q < num_queries; ++q) {
       if (dense[vertex * static_cast<std::size_t>(m_eff) +
-                static_cast<std::size_t>(q)] != 0.0f) {
+                static_cast<std::size_t>(q)] !=
+          std::numeric_limits<weight_t>::max()) {
         mask |= static_cast<query_mask_t>(1u) << q;
       }
     }
@@ -520,7 +471,7 @@ __device__ __forceinline__ std::size_t find_frontier_index_by_end(
   return left;
 }
 
-template <typename graph_t, typename vertex_t>
+template <typename graph_t, typename vertex_t, typename weight_t>
 __global__ void expand_edge_balanced_kernel(
     graph_t G,
     const frontier_item_t<vertex_t>* in_frontier,
@@ -530,8 +481,7 @@ __global__ void expand_edge_balanced_kernel(
     unsigned long long total_edges,
     frontier_item_t<vertex_t>* out_frontier,
     unsigned long long* out_count,
-    vertex_t* distances,
-    vertex_t level) {
+    weight_t* distances) {
   std::size_t n_vertices = G.get_number_of_vertices();
   unsigned long long global_stride =
       static_cast<unsigned long long>(blockDim.x) * gridDim.x;
@@ -563,10 +513,14 @@ __global__ void expand_edge_balanced_kernel(
       auto edge = G.get_starting_edge(source) + local_edge;
       vertex_t neighbor = G.get_destination_vertex(edge);
 
-      vertex_t* distance = distances + query_offset + neighbor;
-      vertex_t old =
-          atomicCAS(distance, std::numeric_limits<vertex_t>::max(), level + 1);
-      if (old == std::numeric_limits<vertex_t>::max()) {
+      weight_t source_distance = distances[query_offset + source];
+      if (source_distance == std::numeric_limits<weight_t>::max()) {
+        continue;
+      }
+      weight_t candidate = source_distance + G.get_edge_weight(edge);
+      weight_t* distance = distances + query_offset + neighbor;
+      weight_t old = math::atomic::min(distance, candidate);
+      if (candidate < old) {
         local_position = atomicAdd(&block_count, 1U);
         output_item = {query_id, neighbor};
         discovered = true;
@@ -600,20 +554,18 @@ __global__ void clear_shared_frontier_mask_kernel(
   }
 }
 
-template <typename graph_t, typename vertex_t>
+template <typename graph_t, typename vertex_t, typename weight_t>
 __global__ void expand_shared_node_kernel(
     graph_t G,
     const vertex_t* frontier_vertices,
     const query_mask_t* frontier_mask,
     std::size_t unique_count,
-    query_mask_t* visited_mask,
     query_mask_t* next_frontier_mask,
     vertex_t* next_frontier_vertices,
     unsigned long long* next_unique_count,
     unsigned long long* next_pair_count,
-    vertex_t* distances,
-    int num_queries,
-    vertex_t level) {
+    weight_t* distances,
+    int num_queries) {
   std::size_t n_vertices = G.get_number_of_vertices();
 
   for (std::size_t i = blockIdx.x; i < unique_count; i += gridDim.x) {
@@ -624,30 +576,36 @@ __global__ void expand_shared_node_kernel(
 
     for (auto edge = begin + threadIdx.x; edge < end; edge += blockDim.x) {
       vertex_t neighbor = G.get_destination_vertex(edge);
-      query_mask_t old_visited = static_cast<query_mask_t>(atomicOr(
-          reinterpret_cast<unsigned int*>(visited_mask + neighbor),
-          static_cast<unsigned int>(active_mask)));
-      query_mask_t newly = active_mask & ~old_visited;
-      if (newly == 0) {
-        continue;
-      }
-
-      query_mask_t bits = newly;
+      query_mask_t improved = 0;
+      query_mask_t bits = active_mask;
       while (bits != 0) {
         int query_id = __ffs(static_cast<unsigned int>(bits)) - 1;
         if (query_id < num_queries) {
-          distances[static_cast<std::size_t>(query_id) * n_vertices +
-                    static_cast<std::size_t>(neighbor)] = level + 1;
+          auto query_offset = static_cast<std::size_t>(query_id) * n_vertices;
+          weight_t source_distance =
+              distances[query_offset + static_cast<std::size_t>(source)];
+          if (source_distance != std::numeric_limits<weight_t>::max()) {
+            weight_t candidate = source_distance + G.get_edge_weight(edge);
+            weight_t old = math::atomic::min(
+                distances + query_offset + static_cast<std::size_t>(neighbor),
+                candidate);
+            if (candidate < old) {
+              improved |= static_cast<query_mask_t>(1u) << query_id;
+            }
+          }
         }
         bits &= (bits - 1);
+      }
+      if (improved == 0) {
+        continue;
       }
 
       atomicAdd(next_pair_count,
                 static_cast<unsigned long long>(
-                    __popc(static_cast<unsigned int>(newly))));
+                    __popc(static_cast<unsigned int>(improved))));
       query_mask_t old_next = static_cast<query_mask_t>(atomicOr(
           reinterpret_cast<unsigned int*>(next_frontier_mask + neighbor),
-          static_cast<unsigned int>(newly)));
+          static_cast<unsigned int>(improved)));
       if (old_next == 0) {
         unsigned long long position = atomicAdd(next_unique_count, 1ULL);
         next_frontier_vertices[position] = neighbor;
@@ -656,20 +614,18 @@ __global__ void expand_shared_node_kernel(
   }
 }
 
-template <typename graph_t, typename vertex_t>
+template <typename graph_t, typename vertex_t, typename weight_t>
 __global__ void expand_shared_node_query_parallel_kernel(
     graph_t G,
     const vertex_t* frontier_vertices,
     const query_mask_t* frontier_mask,
     std::size_t unique_count,
-    query_mask_t* visited_mask,
     query_mask_t* next_frontier_mask,
     vertex_t* next_frontier_vertices,
     unsigned long long* next_unique_count,
     unsigned long long* next_pair_count,
-    vertex_t* distances,
-    int num_queries,
-    vertex_t level) {
+    weight_t* distances,
+    int num_queries) {
   constexpr int warp_size = 32;
   std::size_t n_vertices = G.get_number_of_vertices();
   int lane = threadIdx.x & (warp_size - 1);
@@ -685,32 +641,39 @@ __global__ void expand_shared_node_query_parallel_kernel(
     for (auto edge = begin + warp_in_block; edge < end;
          edge += warps_per_block) {
       vertex_t neighbor = G.get_destination_vertex(edge);
-      query_mask_t newly = 0;
-      if (lane == 0) {
-        query_mask_t old_visited = static_cast<query_mask_t>(atomicOr(
-            reinterpret_cast<unsigned int*>(visited_mask + neighbor),
-            static_cast<unsigned int>(active_mask)));
-        newly = active_mask & ~old_visited;
-      }
-      newly = static_cast<query_mask_t>(
-          __shfl_sync(0xffffffffU, static_cast<unsigned int>(newly), 0));
-      if (newly == 0) {
-        continue;
-      }
-
+      query_mask_t improved = 0;
       if (lane < num_queries &&
-          (newly & (static_cast<query_mask_t>(1u) << lane)) != 0) {
-        distances[static_cast<std::size_t>(lane) * n_vertices +
-                  static_cast<std::size_t>(neighbor)] = level + 1;
+          (active_mask & (static_cast<query_mask_t>(1u) << lane)) != 0) {
+        auto query_offset = static_cast<std::size_t>(lane) * n_vertices;
+        weight_t source_distance =
+            distances[query_offset + static_cast<std::size_t>(source)];
+        if (source_distance != std::numeric_limits<weight_t>::max()) {
+          weight_t candidate = source_distance + G.get_edge_weight(edge);
+          weight_t old = math::atomic::min(
+              distances + query_offset + static_cast<std::size_t>(neighbor),
+              candidate);
+          if (candidate < old) {
+            improved = static_cast<query_mask_t>(1u) << lane;
+          }
+        }
       }
+      unsigned int reduced = static_cast<unsigned int>(improved);
+      for (int offset = warp_size / 2; offset > 0; offset >>= 1) {
+        reduced |= __shfl_down_sync(0xffffffffU, reduced, offset);
+      }
+      improved = static_cast<query_mask_t>(
+          __shfl_sync(0xffffffffU, reduced, 0));
 
       if (lane == 0) {
+        if (improved == 0) {
+          continue;
+        }
         atomicAdd(next_pair_count,
                   static_cast<unsigned long long>(
-                      __popc(static_cast<unsigned int>(newly))));
+                      __popc(static_cast<unsigned int>(improved))));
         query_mask_t old_next = static_cast<query_mask_t>(atomicOr(
             reinterpret_cast<unsigned int*>(next_frontier_mask + neighbor),
-            static_cast<unsigned int>(newly)));
+            static_cast<unsigned int>(improved)));
         if (old_next == 0) {
           unsigned long long position = atomicAdd(next_unique_count, 1ULL);
           next_frontier_vertices[position] = neighbor;
@@ -720,19 +683,17 @@ __global__ void expand_shared_node_query_parallel_kernel(
   }
 }
 
-template <typename graph_t, typename vertex_t>
+template <typename graph_t, typename vertex_t, typename weight_t>
 __global__ void pull_expand_kernel(graph_t G,
                                    int num_queries,
                                    const unsigned char* frontier_bitmap,
                                    unsigned char* next_frontier_bitmap,
                                    unsigned long long* out_count,
-                                   query_mask_t* visited_mask,
                                    query_mask_t* next_frontier_mask,
                                    vertex_t* next_frontier_vertices,
                                    unsigned long long* next_unique_count,
-                                   bool update_visited_mask,
-                                   vertex_t* distances,
-                                   vertex_t level) {
+                                   bool update_shared_frontier,
+                                   weight_t* distances) {
   constexpr unsigned int warp_size = 32;
   std::size_t n_vertices = G.get_number_of_vertices();
   std::size_t total_pairs = n_vertices * static_cast<std::size_t>(num_queries);
@@ -745,43 +706,43 @@ __global__ void pull_expand_kernel(graph_t G,
   for (std::size_t pair = warp_id; pair < total_pairs; pair += warp_stride) {
     vertex_t query_id =
         static_cast<vertex_t>(pair % static_cast<std::size_t>(num_queries));
-    vertex_t vertex =
+    vertex_t source =
         static_cast<vertex_t>(pair / static_cast<std::size_t>(num_queries));
     std::size_t query_offset = static_cast<std::size_t>(query_id) * n_vertices;
-    vertex_t* distance = distances + query_offset + vertex;
-
-    bool found = false;
-    if (*distance == std::numeric_limits<vertex_t>::max()) {
-      auto begin = G.get_starting_edge(vertex);
-      auto end = G.get_starting_edge(vertex + 1);
-      for (auto edge = begin + lane; edge < end; edge += warp_size) {
-        vertex_t neighbor = G.get_destination_vertex(edge);
-        if (frontier_bitmap[static_cast<std::size_t>(neighbor) *
-                                static_cast<std::size_t>(num_queries) +
-                            static_cast<std::size_t>(query_id)] != 0) {
-          found = true;
-          break;
-        }
-      }
+    if (frontier_bitmap[static_cast<std::size_t>(source) *
+                            static_cast<std::size_t>(num_queries) +
+                        static_cast<std::size_t>(query_id)] == 0) {
+      continue;
+    }
+    weight_t source_distance =
+        distances[query_offset + static_cast<std::size_t>(source)];
+    if (source_distance == std::numeric_limits<weight_t>::max()) {
+      continue;
     }
 
-    unsigned int mask = __any_sync(0xffffffffU, found);
-    if (lane == 0 && mask != 0) {
-      *distance = level + 1;
-      next_frontier_bitmap[static_cast<std::size_t>(vertex) *
+    auto begin = G.get_starting_edge(source);
+    auto end = G.get_starting_edge(source + 1);
+    for (auto edge = begin + lane; edge < end; edge += warp_size) {
+      vertex_t neighbor = G.get_destination_vertex(edge);
+      weight_t candidate = source_distance + G.get_edge_weight(edge);
+      weight_t old = math::atomic::min(
+          distances + query_offset + static_cast<std::size_t>(neighbor),
+          candidate);
+      if (candidate >= old) {
+        continue;
+      }
+      next_frontier_bitmap[static_cast<std::size_t>(neighbor) *
                                static_cast<std::size_t>(num_queries) +
                            static_cast<std::size_t>(query_id)] = 1;
-      if (update_visited_mask) {
+      if (update_shared_frontier) {
         query_mask_t bit = static_cast<query_mask_t>(1u)
                            << static_cast<std::size_t>(query_id);
-        atomicOr(reinterpret_cast<unsigned int*>(visited_mask + vertex),
-                 static_cast<unsigned int>(bit));
         query_mask_t old_next = static_cast<query_mask_t>(atomicOr(
-            reinterpret_cast<unsigned int*>(next_frontier_mask + vertex),
+            reinterpret_cast<unsigned int*>(next_frontier_mask + neighbor),
             static_cast<unsigned int>(bit)));
         if (old_next == 0) {
           unsigned long long position = atomicAdd(next_unique_count, 1ULL);
-          next_frontier_vertices[position] = vertex;
+          next_frontier_vertices[position] = neighbor;
         }
       }
       atomicAdd(out_count, 1ULL);
@@ -789,10 +750,10 @@ __global__ void pull_expand_kernel(graph_t G,
   }
 }
 
-template <int M, typename graph_t>
+template <int M, typename graph_t, typename weight_t>
 __global__ void ge_spmm_simple_kernel(graph_t G,
-                                      const float* __restrict__ input,
-                                      float* __restrict__ output,
+                                      const weight_t* __restrict__ input,
+                                      weight_t* __restrict__ output,
                                       int tile_row) {
   using vertex_t = typename graph_t::vertex_type;
   int row = tile_row * blockIdx.x + threadIdx.y;
@@ -801,22 +762,26 @@ __global__ void ge_spmm_simple_kernel(graph_t G,
   }
 
   int col = threadIdx.x;
+  weight_t source_distance =
+      input[static_cast<std::size_t>(row) * M + static_cast<std::size_t>(col)];
+  if (source_distance == std::numeric_limits<weight_t>::max()) {
+    return;
+  }
   auto begin = G.get_starting_edge(static_cast<vertex_t>(row));
   auto end = G.get_starting_edge(static_cast<vertex_t>(row + 1));
-  float acc = 0.0f;
   for (auto edge = begin; edge < end; ++edge) {
     vertex_t neighbor = G.get_destination_vertex(edge);
-    acc += input[static_cast<std::size_t>(neighbor) * M +
-                 static_cast<std::size_t>(col)];
+    weight_t candidate = source_distance + G.get_edge_weight(edge);
+    math::atomic::min(output + static_cast<std::size_t>(neighbor) * M +
+                                  static_cast<std::size_t>(col),
+                      candidate);
   }
-  output[static_cast<std::size_t>(row) * M + static_cast<std::size_t>(col)] =
-      acc;
 }
 
-template <int M, int CF, typename graph_t>
+template <int M, int CF, typename graph_t, typename weight_t>
 __global__ void ge_spmm_smem_kernel(graph_t G,
-                                    const float* __restrict__ input,
-                                    float* __restrict__ output,
+                                    const weight_t* __restrict__ input,
+                                    weight_t* __restrict__ output,
                                     int tile_row) {
   extern __shared__ std::size_t col_ind_sh[];
   using vertex_t = typename graph_t::vertex_type;
@@ -830,13 +795,6 @@ __global__ void ge_spmm_smem_kernel(graph_t G,
   int col = (blockIdx.y * (CF << 5)) + threadIdx.x;
   auto begin = G.get_starting_edge(static_cast<vertex_t>(row));
   auto end = G.get_starting_edge(static_cast<vertex_t>(row + 1));
-  auto ptr = begin + threadIdx.x;
-  float acc[CF];
-#pragma unroll
-  for (int c = 0; c < CF; ++c) {
-    acc[c] = 0.0f;
-  }
-
   int valid_outputs = (M - col + 31) / 32;
   if (valid_outputs < 0) {
     valid_outputs = 0;
@@ -845,79 +803,64 @@ __global__ void ge_spmm_smem_kernel(graph_t G,
     valid_outputs = CF;
   }
 
-  for (auto jj = begin; jj < end; jj += 32) {
-    if (ptr < end) {
-      vertex_t neighbor = G.get_destination_vertex(ptr);
-      col_ind_sh[thread_index] =
-          static_cast<std::size_t>(neighbor) * static_cast<std::size_t>(M);
-    }
-    __syncwarp();
-    ptr += 32;
-
-    for (int kk = 0; kk < 32 && jj + kk < end; ++kk) {
-      std::size_t offset = col_ind_sh[shmem_offset + kk] +
-                           static_cast<std::size_t>(col);
+  for (auto edge = begin; edge < end; ++edge) {
+    vertex_t neighbor = G.get_destination_vertex(edge);
 #pragma unroll
-      for (int c = 0; c < CF; ++c) {
-        if (c < valid_outputs) {
-          acc[c] += input[offset + static_cast<std::size_t>(c * 32)];
+    for (int c = 0; c < CF; ++c) {
+      if (c < valid_outputs) {
+        auto feature = static_cast<std::size_t>(col + c * 32);
+        weight_t source_distance =
+            input[static_cast<std::size_t>(row) * M + feature];
+        if (source_distance != std::numeric_limits<weight_t>::max()) {
+          weight_t candidate = source_distance + G.get_edge_weight(edge);
+          math::atomic::min(output + static_cast<std::size_t>(neighbor) * M +
+                                         feature,
+                            candidate);
         }
       }
-    }
-    __syncwarp();
-  }
-
-  int out_base = row * M + col;
-#pragma unroll
-  for (int c = 0; c < CF; ++c) {
-    if (c < valid_outputs) {
-      output[static_cast<std::size_t>(out_base + c * 32)] = acc[c];
     }
   }
 }
 
-template <typename vertex_t>
-__global__ void ge_spmm_bfs_postprocess_kernel(
-    const float* spmm_out,
+template <typename vertex_t, typename weight_t>
+__global__ void ge_spmm_sssp_postprocess_kernel(
+    const weight_t* spmm_out,
     std::size_t n_vertices,
     int num_queries,
     int m_eff,
-    vertex_t* distances,
-    vertex_t level,
-    float* next_dense,
+    weight_t* distances,
+    weight_t* next_dense,
     unsigned long long* out_count,
-    query_mask_t* visited_mask,
     query_mask_t* next_frontier_mask,
     vertex_t* next_frontier_vertices,
     unsigned long long* next_unique_count,
-    bool update_visited_mask) {
+    bool update_shared_frontier) {
   std::size_t total_pairs =
       n_vertices * static_cast<std::size_t>(num_queries);
   std::size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
   std::size_t stride = blockDim.x * gridDim.x;
-  vertex_t infinity = std::numeric_limits<vertex_t>::max();
+  weight_t infinity = std::numeric_limits<weight_t>::max();
 
   for (std::size_t i = tid; i < total_pairs; i += stride) {
     std::size_t vertex = i / static_cast<std::size_t>(num_queries);
     std::size_t query_id = i % static_cast<std::size_t>(num_queries);
     std::size_t dense_index = vertex * static_cast<std::size_t>(m_eff) +
                               static_cast<std::size_t>(query_id);
-    if (spmm_out[dense_index] <= 0.0f) {
+    weight_t candidate = spmm_out[dense_index];
+    if (candidate == infinity) {
       continue;
     }
 
     std::size_t distance_index = query_id * n_vertices + vertex;
-    if (distances[distance_index] != infinity) {
+    if (candidate >= distances[distance_index]) {
       continue;
     }
-    distances[distance_index] = level + 1;
-    next_dense[dense_index] = 1.0f;
+    distances[distance_index] = candidate;
+    next_dense[dense_index] = candidate;
     atomicAdd(out_count, 1ULL);
 
-    if (update_visited_mask) {
+    if (update_shared_frontier) {
       query_mask_t bit = static_cast<query_mask_t>(1u) << query_id;
-      atomicOr(reinterpret_cast<unsigned int*>(visited_mask + vertex),
-               static_cast<unsigned int>(bit));
       query_mask_t old_next = static_cast<query_mask_t>(atomicOr(
           reinterpret_cast<unsigned int*>(next_frontier_mask + vertex),
           static_cast<unsigned int>(bit)));
@@ -930,82 +873,70 @@ __global__ void ge_spmm_bfs_postprocess_kernel(
 }
 
 inline int effective_query_dim(int num_queries) {
-  constexpr int supported[] = {1, 2, 4, 8, 16, 32, 64, 80, 96, 128};
+  constexpr int supported[] = {1, 2, 4, 8, 16, 32};
   for (int value : supported) {
     if (num_queries <= value) {
       return value;
     }
   }
   throw std::invalid_argument(
-      "ge_spmm pull strategy supports at most 128 queries");
+      "pull modes support at most 32 queries");
 }
 
-template <typename graph_t>
+template <typename graph_t, typename weight_t>
 void launch_ge_spmm_kernel(graph_t G,
-                           const float* input,
-                           float* output,
+                           const weight_t* input,
+                           weight_t* output,
                            int m_eff,
                            hipStream_t stream) {
   int n_vertices = static_cast<int>(G.get_number_of_vertices());
   int tile_row = 8;
 
-#define CGP_BFS_LAUNCH_SIMPLE(M_VALUE)                                        \
+#define CGP_SSSP_LAUNCH_SIMPLE(M_VALUE)                                       \
   do {                                                                        \
     int eff_tile = std::max(tile_row, std::max(1, 128 / (M_VALUE)));          \
     int grid_x = (n_vertices + eff_tile - 1) / eff_tile;                      \
-    ge_spmm_simple_kernel<M_VALUE, graph_t>                                   \
+    ge_spmm_simple_kernel<M_VALUE, graph_t, weight_t>                         \
         <<<grid_x, dim3(M_VALUE, eff_tile), 0, stream>>>(G, input, output,    \
                                                         eff_tile);            \
   } while (0)
 
-#define CGP_BFS_LAUNCH_SMEM(M_VALUE)                                          \
+#define CGP_SSSP_LAUNCH_SMEM(M_VALUE)                                         \
   do {                                                                        \
     constexpr int cf = ((M_VALUE) + 31) / 32;                                 \
     int grid_x = (n_vertices + tile_row - 1) / tile_row;                      \
     int grid_y = ((M_VALUE) + cf * 32 - 1) / (cf * 32);                       \
     int smem = 32 * tile_row * static_cast<int>(sizeof(std::size_t));         \
-    ge_spmm_smem_kernel<M_VALUE, cf, graph_t>                                 \
+    ge_spmm_smem_kernel<M_VALUE, cf, graph_t, weight_t>                       \
         <<<dim3(grid_x, grid_y), dim3(32, tile_row), smem, stream>>>(         \
             G, input, output, tile_row);                                      \
   } while (0)
 
   switch (m_eff) {
     case 1:
-      CGP_BFS_LAUNCH_SIMPLE(1);
+      CGP_SSSP_LAUNCH_SIMPLE(1);
       break;
     case 2:
-      CGP_BFS_LAUNCH_SIMPLE(2);
+      CGP_SSSP_LAUNCH_SIMPLE(2);
       break;
     case 4:
-      CGP_BFS_LAUNCH_SIMPLE(4);
+      CGP_SSSP_LAUNCH_SIMPLE(4);
       break;
     case 8:
-      CGP_BFS_LAUNCH_SIMPLE(8);
+      CGP_SSSP_LAUNCH_SIMPLE(8);
       break;
     case 16:
-      CGP_BFS_LAUNCH_SIMPLE(16);
+      CGP_SSSP_LAUNCH_SIMPLE(16);
       break;
     case 32:
-      CGP_BFS_LAUNCH_SMEM(32);
-      break;
-    case 64:
-      CGP_BFS_LAUNCH_SMEM(64);
-      break;
-    case 80:
-      CGP_BFS_LAUNCH_SMEM(80);
-      break;
-    case 96:
-      CGP_BFS_LAUNCH_SMEM(96);
-      break;
-    case 128:
-      CGP_BFS_LAUNCH_SMEM(128);
+      CGP_SSSP_LAUNCH_SMEM(32);
       break;
     default:
       throw std::invalid_argument("unsupported GE-SpMM query dimension");
   }
 
-#undef CGP_BFS_LAUNCH_SIMPLE
-#undef CGP_BFS_LAUNCH_SMEM
+#undef CGP_SSSP_LAUNCH_SIMPLE
+#undef CGP_SSSP_LAUNCH_SMEM
 }
 
 inline float elapsed_ms(std::chrono::high_resolution_clock::time_point start) {
@@ -1016,13 +947,8 @@ inline float elapsed_ms(std::chrono::high_resolution_clock::time_point start) {
 }
 
 template <typename function_t>
-float timed_gpu(hipStream_t stream,
-                bool enabled,
-                function_t&& function,
-                const std::string& range_name = std::string(),
-                bool emit_nvtx = false) {
+float timed_gpu(hipStream_t stream, bool enabled, function_t&& function) {
   if (!enabled) {
-    nvtx_range_t range(range_name, emit_nvtx && !range_name.empty());
     function();
     return 0.0f;
   }
@@ -1032,10 +958,7 @@ float timed_gpu(hipStream_t stream,
   hipEventCreate(&start);
   hipEventCreate(&stop);
   hipEventRecord(start, stream);
-  {
-    nvtx_range_t range(range_name, emit_nvtx && !range_name.empty());
-    function();
-  }
+  function();
   hipEventRecord(stop, stream);
   hipEventSynchronize(stop);
   float ms = 0.0f;
@@ -1048,18 +971,19 @@ float timed_gpu(hipStream_t stream,
 }  // namespace detail
 
 template <typename graph_t>
-result_t<typename graph_t::vertex_type> run(
+result_t<typename graph_t::vertex_type, typename graph_t::weight_type> run(
     graph_t& G,
     const std::vector<typename graph_t::vertex_type>& sources,
     std::shared_ptr<gcuda::multi_context_t> context =
         std::shared_ptr<gcuda::multi_context_t>(new gcuda::multi_context_t(0)),
     const options_t& options = options_t()) {
   using vertex_t = typename graph_t::vertex_type;
+  using weight_t = typename graph_t::weight_type;
   using item_t = frontier_item_t<vertex_t>;
   static_assert(std::is_same<vertex_t, int>::value,
-                "cgp_bfs currently supports int vertex ids");
+                "cgp_sssp currently supports int vertex ids");
 
-  result_t<vertex_t> result;
+  result_t<vertex_t, weight_t> result;
   result.options = options;
   int num_queries = static_cast<int>(sources.size());
   auto n_vertices = static_cast<std::size_t>(G.get_number_of_vertices());
@@ -1083,6 +1007,12 @@ result_t<typename graph_t::vertex_type> run(
     throw std::invalid_argument(
         "shared_node push strategies support at most 32 queries");
   }
+  if ((options.traversal_mode == traversal_mode_t::pull ||
+       options.traversal_mode == traversal_mode_t::hybrid) &&
+      num_queries > 32) {
+    throw std::invalid_argument(
+        "pull and hybrid traversal modes support at most 32 queries");
+  }
   int m_eff = options.pull_strategy == pull_strategy_t::ge_spmm
                   ? detail::effective_query_dim(num_queries)
                   : num_queries;
@@ -1098,9 +1028,9 @@ result_t<typename graph_t::vertex_type> run(
   thrust::device_vector<item_t> frontier_b(frontier_capacity);
   thrust::device_vector<unsigned char> frontier_bitmap(frontier_capacity);
   thrust::device_vector<unsigned char> next_frontier_bitmap(frontier_capacity);
-  thrust::device_vector<float> frontier_dense;
-  thrust::device_vector<float> next_frontier_dense;
-  thrust::device_vector<float> ge_spmm_out;
+  thrust::device_vector<weight_t> frontier_dense;
+  thrust::device_vector<weight_t> next_frontier_dense;
+  thrust::device_vector<weight_t> ge_spmm_out;
   std::size_t dense_capacity =
       n_vertices * static_cast<std::size_t>(m_eff);
   if (options.pull_strategy == pull_strategy_t::ge_spmm) {
@@ -1114,7 +1044,6 @@ result_t<typename graph_t::vertex_type> run(
       frontier_capacity);
   thrust::device_vector<unsigned long long> d_edge_offsets(frontier_capacity);
   thrust::device_vector<unsigned long long> d_edge_ends(frontier_capacity);
-  thrust::device_vector<query_mask_t> visited_mask;
   thrust::device_vector<query_mask_t> frontier_mask;
   thrust::device_vector<query_mask_t> next_frontier_mask;
   thrust::device_vector<vertex_t> shared_frontier_a;
@@ -1122,7 +1051,6 @@ result_t<typename graph_t::vertex_type> run(
   thrust::device_vector<unsigned long long> d_shared_actual_degrees;
   thrust::device_vector<unsigned long long> d_shared_virtual_degrees;
   if (shared_push_strategy) {
-    visited_mask.resize(n_vertices);
     frontier_mask.resize(n_vertices);
     next_frontier_mask.resize(n_vertices);
     shared_frontier_a.resize(n_vertices);
@@ -1140,7 +1068,8 @@ result_t<typename graph_t::vertex_type> run(
   util::timer_t timer;
   timer.begin(stream);
 
-  detail::init_kernel<<<init_blocks, threads, 0, stream>>>(
+  detail::init_kernel<graph_t, vertex_t, weight_t>
+      <<<init_blocks, threads, 0, stream>>>(
       G, thrust::raw_pointer_cast(d_sources.data()), num_queries,
       thrust::raw_pointer_cast(result.distances.data()),
       thrust::raw_pointer_cast(frontier_a.data()));
@@ -1148,12 +1077,10 @@ result_t<typename graph_t::vertex_type> run(
   std::size_t current_count = sources.size();
   std::size_t current_unique_count = sources.size();
   if (shared_push_strategy) {
-    detail::fill_distances_kernel<vertex_t>
+    detail::fill_distances_kernel<weight_t>
         <<<init_blocks, threads, 0, stream>>>(
             thrust::raw_pointer_cast(result.distances.data()),
             frontier_capacity);
-    hipMemset(thrust::raw_pointer_cast(visited_mask.data()), 0,
-              n_vertices * sizeof(query_mask_t));
     hipMemset(thrust::raw_pointer_cast(frontier_mask.data()), 0,
               n_vertices * sizeof(query_mask_t));
     hipMemset(thrust::raw_pointer_cast(next_frontier_mask.data()), 0,
@@ -1163,11 +1090,10 @@ result_t<typename graph_t::vertex_type> run(
     int source_blocks =
         static_cast<int>((sources.size() + threads - 1) / threads);
     source_blocks = std::max(1, std::min(source_blocks, 65535));
-    detail::init_shared_node_sources_kernel<graph_t, vertex_t>
+    detail::init_shared_node_sources_kernel<graph_t, vertex_t, weight_t>
         <<<source_blocks, threads, 0, stream>>>(
             G, thrust::raw_pointer_cast(d_sources.data()), num_queries,
             thrust::raw_pointer_cast(result.distances.data()),
-            thrust::raw_pointer_cast(visited_mask.data()),
             thrust::raw_pointer_cast(frontier_mask.data()),
             thrust::raw_pointer_cast(shared_frontier_a.data()),
             thrust::raw_pointer_cast(d_out_count.data()));
@@ -1198,12 +1124,6 @@ result_t<typename graph_t::vertex_type> run(
     profile.pull_frontier_threshold = pull_frontier_threshold;
     profile.pull_edge_threshold = pull_edge_threshold;
     auto level_start = std::chrono::high_resolution_clock::now();
-    const auto degree_scan_range = detail::candidate_range_name(
-        num_queries, static_cast<int>(level), "degree_scan");
-    const auto shared_push_range = detail::candidate_range_name(
-        num_queries, static_cast<int>(level), "shared_push");
-    const auto compact_range = detail::candidate_range_name(
-        num_queries, static_cast<int>(level), "compact");
 
     auto compact_bitmap_to_list = [&]() {
       profile.compact_ms +=
@@ -1220,7 +1140,7 @@ result_t<typename graph_t::vertex_type> run(
                     frontier_capacity, num_queries,
                     thrust::raw_pointer_cast(frontier_a.data()),
                     thrust::raw_pointer_cast(d_out_count.data()));
-          }, compact_range, options.emit_nvtx);
+          });
 
       unsigned long long compact_count = 0;
       hipMemcpyAsync(&compact_count,
@@ -1249,7 +1169,7 @@ result_t<typename graph_t::vertex_type> run(
                     thrust::raw_pointer_cast(frontier_mask.data()),
                     thrust::raw_pointer_cast(shared_frontier_a.data()),
                     thrust::raw_pointer_cast(d_out_count.data()));
-          }, compact_range, options.emit_nvtx);
+          });
 
       unsigned long long compact_unique_count = 0;
       hipMemcpyAsync(&compact_unique_count,
@@ -1269,13 +1189,13 @@ result_t<typename graph_t::vertex_type> run(
                 (frontier_capacity + static_cast<std::size_t>(threads) - 1) /
                 static_cast<std::size_t>(threads));
             compact_blocks = std::max(1, std::min(compact_blocks, 65535));
-            detail::dense_to_list_kernel<vertex_t>
+            detail::dense_to_list_kernel<vertex_t, weight_t>
                 <<<compact_blocks, threads, 0, stream>>>(
                     thrust::raw_pointer_cast(frontier_dense.data()),
                     n_vertices, num_queries, m_eff,
                     thrust::raw_pointer_cast(frontier_a.data()),
                     thrust::raw_pointer_cast(d_out_count.data()));
-          }, compact_range, options.emit_nvtx);
+          });
 
       unsigned long long compact_count = 0;
       hipMemcpyAsync(&compact_count,
@@ -1297,14 +1217,14 @@ result_t<typename graph_t::vertex_type> run(
                 (n_vertices + static_cast<std::size_t>(threads) - 1) /
                 static_cast<std::size_t>(threads));
             compact_blocks = std::max(1, std::min(compact_blocks, 65535));
-            detail::dense_to_shared_frontier_kernel<vertex_t>
+            detail::dense_to_shared_frontier_kernel<vertex_t, weight_t>
                 <<<compact_blocks, threads, 0, stream>>>(
                     thrust::raw_pointer_cast(frontier_dense.data()),
                     n_vertices, num_queries, m_eff,
                     thrust::raw_pointer_cast(frontier_mask.data()),
                     thrust::raw_pointer_cast(shared_frontier_a.data()),
                     thrust::raw_pointer_cast(d_out_count.data()));
-          }, compact_range, options.emit_nvtx);
+          });
 
       unsigned long long compact_unique_count = 0;
       hipMemcpyAsync(&compact_unique_count,
@@ -1316,8 +1236,8 @@ result_t<typename graph_t::vertex_type> run(
     };
 
     auto build_dense_frontier = [&]() {
-      hipMemset(thrust::raw_pointer_cast(frontier_dense.data()), 0,
-                dense_capacity * sizeof(float));
+      thrust::fill(policy, frontier_dense.begin(), frontier_dense.end(),
+                   std::numeric_limits<weight_t>::max());
       std::size_t build_count =
           shared_push_strategy ? current_unique_count : current_count;
       int build_blocks = static_cast<int>(
@@ -1327,17 +1247,21 @@ result_t<typename graph_t::vertex_type> run(
       profile.dense_build_ms +=
           detail::timed_gpu(stream, options.profile_levels, [&]() {
             if (current_repr == detail::frontier_repr_t::shared) {
-              detail::shared_to_dense_kernel<vertex_t>
+              detail::shared_to_dense_kernel<vertex_t, weight_t>
                   <<<build_blocks, threads, 0, stream>>>(
                       thrust::raw_pointer_cast(shared_frontier_a.data()),
                       thrust::raw_pointer_cast(frontier_mask.data()),
                       current_unique_count, num_queries, m_eff,
+                      thrust::raw_pointer_cast(result.distances.data()),
+                      n_vertices,
                       thrust::raw_pointer_cast(frontier_dense.data()));
             } else {
-              detail::list_to_dense_kernel<vertex_t>
+              detail::list_to_dense_kernel<vertex_t, weight_t>
                   <<<build_blocks, threads, 0, stream>>>(
                       thrust::raw_pointer_cast(frontier_a.data()),
                       current_count, m_eff,
+                      thrust::raw_pointer_cast(result.distances.data()),
+                      n_vertices,
                       thrust::raw_pointer_cast(frontier_dense.data()));
             }
           });
@@ -1363,7 +1287,7 @@ result_t<typename graph_t::vertex_type> run(
             thrust::inclusive_scan(policy, d_frontier_degrees.begin(),
                                    d_frontier_degrees.begin() + current_count,
                                    d_edge_ends.begin());
-          }, degree_scan_range, options.emit_nvtx);
+          });
 
       auto count_sync_start = std::chrono::high_resolution_clock::now();
       hipMemcpyAsync(
@@ -1398,7 +1322,7 @@ result_t<typename graph_t::vertex_type> run(
                 policy, d_shared_virtual_degrees.begin(),
                 d_shared_virtual_degrees.begin() + current_unique_count,
                 d_shared_virtual_degrees.begin());
-          }, degree_scan_range, options.emit_nvtx);
+          });
 
       auto count_sync_start = std::chrono::high_resolution_clock::now();
       hipMemcpyAsync(
@@ -1516,7 +1440,7 @@ result_t<typename graph_t::vertex_type> run(
                 G, thrust::raw_pointer_cast(frontier_bitmap.data()),
                 frontier_capacity, num_queries,
                 thrust::raw_pointer_cast(d_out_count.data()));
-      }, degree_scan_range, options.emit_nvtx);
+      });
       auto count_sync_start = std::chrono::high_resolution_clock::now();
       hipMemcpyAsync(&total_edges, thrust::raw_pointer_cast(d_out_count.data()),
                      sizeof(unsigned long long), hipMemcpyDeviceToHost, stream);
@@ -1531,17 +1455,18 @@ result_t<typename graph_t::vertex_type> run(
         thrust::raw_pointer_cast(d_shared_pair_count.data()));
 
     if (use_pull && options.pull_strategy == pull_strategy_t::ge_spmm) {
-      hipMemset(thrust::raw_pointer_cast(ge_spmm_out.data()), 0,
-                dense_capacity * sizeof(float));
-      hipMemset(thrust::raw_pointer_cast(next_frontier_dense.data()), 0,
-                dense_capacity * sizeof(float));
+      thrust::fill(policy, ge_spmm_out.begin(), ge_spmm_out.end(),
+                   std::numeric_limits<weight_t>::max());
+      thrust::fill(policy, next_frontier_dense.begin(),
+                   next_frontier_dense.end(),
+                   std::numeric_limits<weight_t>::max());
       if (shared_push_strategy) {
         hipMemset(thrust::raw_pointer_cast(next_frontier_mask.data()), 0,
                   n_vertices * sizeof(query_mask_t));
       }
       profile.ge_spmm_pull_kernel_ms +=
           detail::timed_gpu(stream, options.profile_levels, [&]() {
-            detail::launch_ge_spmm_kernel(
+            detail::launch_ge_spmm_kernel<graph_t, weight_t>(
                 G, thrust::raw_pointer_cast(frontier_dense.data()),
                 thrust::raw_pointer_cast(ge_spmm_out.data()), m_eff, stream);
           });
@@ -1551,16 +1476,13 @@ result_t<typename graph_t::vertex_type> run(
       post_blocks = std::max(1, std::min(post_blocks, 65535));
       profile.ge_spmm_postprocess_ms +=
           detail::timed_gpu(stream, options.profile_levels, [&]() {
-            detail::ge_spmm_bfs_postprocess_kernel<vertex_t>
+            detail::ge_spmm_sssp_postprocess_kernel<vertex_t, weight_t>
                 <<<post_blocks, threads, 0, stream>>>(
                     thrust::raw_pointer_cast(ge_spmm_out.data()), n_vertices,
                     num_queries, m_eff,
-                    thrust::raw_pointer_cast(result.distances.data()), level,
+                    thrust::raw_pointer_cast(result.distances.data()),
                     thrust::raw_pointer_cast(next_frontier_dense.data()),
                     thrust::raw_pointer_cast(d_out_count.data()),
-                    shared_push_strategy
-                        ? thrust::raw_pointer_cast(visited_mask.data())
-                        : nullptr,
                     shared_push_strategy
                         ? thrust::raw_pointer_cast(next_frontier_mask.data())
                         : nullptr,
@@ -1585,15 +1507,12 @@ result_t<typename graph_t::vertex_type> run(
       pull_blocks = std::max(1, std::min(pull_blocks, 65535));
       profile.pull_kernel_ms +=
           detail::timed_gpu(stream, options.profile_levels, [&]() {
-            detail::pull_expand_kernel<graph_t, vertex_t>
+            detail::pull_expand_kernel<graph_t, vertex_t, weight_t>
                 <<<pull_blocks, threads, 0, stream>>>(
                     G, num_queries,
                     thrust::raw_pointer_cast(frontier_bitmap.data()),
                     thrust::raw_pointer_cast(next_frontier_bitmap.data()),
                     thrust::raw_pointer_cast(d_out_count.data()),
-                    shared_push_strategy
-                        ? thrust::raw_pointer_cast(visited_mask.data())
-                        : nullptr,
                     shared_push_strategy
                         ? thrust::raw_pointer_cast(next_frontier_mask.data())
                         : nullptr,
@@ -1604,7 +1523,7 @@ result_t<typename graph_t::vertex_type> run(
                         ? thrust::raw_pointer_cast(d_shared_pair_count.data())
                         : nullptr,
                     shared_push_strategy,
-                    thrust::raw_pointer_cast(result.distances.data()), level);
+                    thrust::raw_pointer_cast(result.distances.data()));
           });
     } else if (shared_push_strategy && actual_edges > 0) {
       hipMemset(thrust::raw_pointer_cast(next_frontier_mask.data()), 0,
@@ -1616,34 +1535,32 @@ result_t<typename graph_t::vertex_type> run(
           detail::timed_gpu(stream, options.profile_levels, [&]() {
             if (options.push_strategy ==
                 push_strategy_t::shared_node_query_parallel) {
-              detail::expand_shared_node_query_parallel_kernel<graph_t,
-                                                               vertex_t>
+              detail::expand_shared_node_query_parallel_kernel<
+                  graph_t, vertex_t, weight_t>
                   <<<vertex_blocks, threads, 0, stream>>>(
                       G, thrust::raw_pointer_cast(shared_frontier_a.data()),
                       thrust::raw_pointer_cast(frontier_mask.data()),
                       current_unique_count,
-                      thrust::raw_pointer_cast(visited_mask.data()),
                       thrust::raw_pointer_cast(next_frontier_mask.data()),
                       thrust::raw_pointer_cast(shared_frontier_b.data()),
                       thrust::raw_pointer_cast(d_out_count.data()),
                       thrust::raw_pointer_cast(d_shared_pair_count.data()),
                       thrust::raw_pointer_cast(result.distances.data()),
-                      num_queries, level);
+                      num_queries);
             } else {
-              detail::expand_shared_node_kernel<graph_t, vertex_t>
+              detail::expand_shared_node_kernel<graph_t, vertex_t, weight_t>
                   <<<vertex_blocks, threads, 0, stream>>>(
                       G, thrust::raw_pointer_cast(shared_frontier_a.data()),
                       thrust::raw_pointer_cast(frontier_mask.data()),
                       current_unique_count,
-                      thrust::raw_pointer_cast(visited_mask.data()),
                       thrust::raw_pointer_cast(next_frontier_mask.data()),
                       thrust::raw_pointer_cast(shared_frontier_b.data()),
                       thrust::raw_pointer_cast(d_out_count.data()),
                       thrust::raw_pointer_cast(d_shared_pair_count.data()),
                       thrust::raw_pointer_cast(result.distances.data()),
-                      num_queries, level);
+                      num_queries);
             }
-          }, shared_push_range, options.emit_nvtx);
+          });
       profile.push_kernel_ms += profile.shared_push_kernel_ms;
       result.shared_push_kernel_ms += profile.shared_push_kernel_ms;
       int clear_blocks =
@@ -1663,7 +1580,7 @@ result_t<typename graph_t::vertex_type> run(
 
       profile.push_kernel_ms +=
           detail::timed_gpu(stream, options.profile_levels, [&]() {
-            detail::expand_edge_balanced_kernel<graph_t, vertex_t>
+            detail::expand_edge_balanced_kernel<graph_t, vertex_t, weight_t>
                 <<<edge_blocks, threads, 0, stream>>>(
                     G, thrust::raw_pointer_cast(frontier_a.data()),
                     current_count,
@@ -1671,7 +1588,7 @@ result_t<typename graph_t::vertex_type> run(
                     thrust::raw_pointer_cast(d_edge_ends.data()), total_edges,
                     thrust::raw_pointer_cast(frontier_b.data()),
                     thrust::raw_pointer_cast(d_out_count.data()),
-                    thrust::raw_pointer_cast(result.distances.data()), level);
+                    thrust::raw_pointer_cast(result.distances.data()));
           });
     }
 
@@ -1757,5 +1674,5 @@ result_t<typename graph_t::vertex_type> run(
   return result;
 }
 
-}  // namespace cgp_bfs
+}  // namespace cgp_sssp
 }  // namespace gunrock

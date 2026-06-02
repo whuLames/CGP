@@ -70,15 +70,15 @@ void execute(graph_t& G,
       auto e = i + starting_edge;            // edge id
       auto n = G.get_destination_vertex(e);  // neighbor id
       auto w = G.get_edge_weight(e);         // weight
-      bool cond = op(v, n, e, w);
+      bool cond = op(v, n, e, w); // {source vertex, destination vertex, edge number, edge weight}
 
       if (output_type != advance_io_type_t::none) {
-        std::size_t out_idx = segments_ptr[tid] + i;
+        std::size_t out_idx = segments_ptr[tid] + i; // 这个不就是 ‘e’ 吗
         type_t element = cond ? n : gunrock::numeric_limits<type_t>::invalid();
         output.set_element_at(element, out_idx);
       }
     }
-  };
+  }; // 看起来太蠢了 但 或许 是我们习惯了 tensor 化的思路，其实这样根本没有意义，关于维护一个output的 frontier，为什么不直接通过vertex data 的角度来实现呢
 
   std::size_t num_elements = (input_type == advance_io_type_t::graph)
                                  ? G.get_number_of_vertices()

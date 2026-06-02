@@ -2,6 +2,9 @@
 #include <gunrock/util/performance.hxx>
 #include <gunrock/io/parameters.hxx>
 #include <gunrock/io/gr.hxx>
+#include <gunrock/util/iteration_profiler.hxx>
+
+#include <filesystem>
 
 using namespace gunrock;
 using namespace memory;
@@ -55,7 +58,7 @@ void test_pr(int num_arguments, char** argument_array) {
 
   weight_t alpha = 0.85;
   weight_t tol = 1e-6;
-  int max_iterations = 10;
+  int max_iterations = arguments.max_iterations;
 
   size_t n_vertices = G.get_number_of_vertices();
   size_t n_edges = G.get_number_of_edges();
@@ -72,11 +75,17 @@ void test_pr(int num_arguments, char** argument_array) {
 
   auto benchmark_metrics =
       std::vector<benchmark::host_benchmark_t>(arguments.num_runs);
+  auto dataset = std::filesystem::path(arguments.filename).stem().string();
+  util::iteration_profiler::csv_writer_t iter_profile(
+      arguments.iter_profile, "pr", dataset, -1);
   for (int i = 0; i < arguments.num_runs; i++) {
     benchmark::INIT_BENCH();
+    iter_profile.set_run(i);
 
-    run_times.push_back(
-        gunrock::pr::run(G, alpha, tol, max_iterations, p.data().get()));
+    run_times.push_back(gunrock::pr::run(G, alpha, tol, max_iterations,
+                                         p.data().get(),
+                                         std::make_shared<gcuda::multi_context_t>(0),
+                                         &iter_profile));
 
     benchmark::host_benchmark_t metrics = benchmark::EXTRACT();
     benchmark_metrics[i] = metrics;

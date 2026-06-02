@@ -1,0 +1,22 @@
+CompileFlags:
+  CompilationDatabase: build
+  Compiler: clang++
+  Add:
+    - --cuda-path=/home/zyl/.conda/envs/torch2.8
+    - --cuda-gpu-arch=sm_52
+    - --cuda-host-only
+    - -I/home/zyl/Projects/ocgp/puercgp/include
+    - -isystem
+    - /home/zyl/.conda/envs/torch2.8/targets/x86_64-linux/include
+    - -D__host__=
+    - -D__device__=
+    - -D__global__=
+    - -D__shared__=
+    - -D__forceinline__=inline
+  Remove:
+    - -forward-unknown-to-host-compiler
+    - --options-file
+    - CMakeFiles/*/includes_CUDA.rsp
+    - --generate-code=*
+    - --extended-lambda
+    - --expt-relaxed-constexpr

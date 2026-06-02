@@ -127,12 +127,12 @@ struct launch_params_dynamic_grid_t
 
   dimensions_t grid_dimensions;
 
-  void calculate_grid_dimensions_strided(std::size_t num_elements) {
+  void calculate_grid_dimensions_strided(std::size_t num_elements) { // 一个thread负责一个元素
     grid_dimensions = dimensions_t(
         (num_elements + block_dimensions.x - 1) / block_dimensions.x, 1, 1);
   }
 
-  void calculate_grid_dimensions_blocked(std::size_t num_elements) {
+  void calculate_grid_dimensions_blocked(std::size_t num_elements) {  // 一个thread负责多个元素
     grid_dimensions = dimensions_t(
         (num_elements + (block_dimensions.x * base_t::items_per_thread) - 1) /
             (block_dimensions.x * base_t::items_per_thread),

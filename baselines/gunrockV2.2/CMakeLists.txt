@@ -249,6 +249,19 @@ target_include_directories(essentials
 )
 
 if(${ESSENTIALS_NVIDIA_BACKEND})
+  find_path(NVTX_INCLUDE_DIR
+    NAMES nvtx3/nvToolsExt.h nvToolsExt.h
+    HINTS
+      "$ENV{CONDA_PREFIX}/lib/python3.10/site-packages/nvidia/nvtx/include"
+      "$ENV{CONDA_PREFIX}/nsight-compute-2025.1.1/host/target-linux-x64/nvtx/include"
+      "$ENV{CONDA_PREFIX}/targets/x86_64-linux/include"
+      "${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}"
+    NO_DEFAULT_PATH)
+  if(NVTX_INCLUDE_DIR)
+    target_include_directories(essentials INTERFACE ${NVTX_INCLUDE_DIR})
+    message(STATUS "NVTX include: ${NVTX_INCLUDE_DIR}")
+  endif()
+
   target_include_directories(essentials
     INTERFACE ${CCCL_INCLUDE_DIR}
   )

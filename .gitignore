@@ -61,6 +61,8 @@ new_profile/
 # Editor and Python cache
 *.vscode*
 .idea/
+.cache/
+**/.cache/
 *.swp
 *.swo
 *.un~

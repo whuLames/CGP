@@ -1,0 +1,42 @@
+CompileFlags:
+  Add:
+    - -std=c++17
+    - -DGUNROCK_CUDA
+    - -D__HIP_PLATFORM_NVIDIA__
+    - -I/home/zyl/Projects/ocgp/cgp/include
+    - -I/home/zyl/Projects/ocgp/cgp/include/gunrock/compat
+    - -I/home/zyl/Projects/ocgp/cgp/externals/cxxopts-src/include
+    - -I/home/zyl/Projects/ocgp/cgp/externals/json-src/include
+    - -I/home/zyl/.conda/envs/torch2.8/targets/x86_64-linux/include
+    - -I/home/zyl/Projects/ocgp/cgp/externals/cccl-src
+    - -I/home/zyl/Projects/ocgp/cgp/externals/cmake_modules-src
+  Remove:
+    - --generate-code=*
+    - --expt-extended-lambda
+    - --expt-relaxed-constexpr
+    - --use_fast_math
+    - --diag-suppress=*
+    - -x
+    - cu
+    - --options-file=*
+    - -forward-unknown-to-host-compiler
+
+Diagnostics:
+  Suppress:
+    - pp_file_not_found
+    - drv_unknown_argument
+    - pp_invalid_access
+    - err_unsupported_friend
+    - err_expected
+    - err_unknown_type_name
+    - ext_default_arg_in_lambda
+  UnusedIncludes: None
+
+InlayHints:
+  Enabled: Yes
+  ParameterNames: Yes
+  DeducedTypes: Yes
+  Designators: Yes
+
+Hover:
+  ShowAKA: Yes

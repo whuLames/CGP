@@ -3,6 +3,9 @@
 #include <gunrock/io/parameters.hxx>
 #include <gunrock/io/gr.hxx>
 #include <gunrock/framework/benchmark.hxx>
+#include <gunrock/util/iteration_profiler.hxx>
+
+#include <filesystem>
 
 #include "bfs_cpu.hxx"  // Reference implementation
 
@@ -74,13 +77,19 @@ void test_bfs(int num_arguments, char** argument_array) {
   std::vector<float> run_times;
 
   auto benchmark_metrics = std::vector<benchmark::host_benchmark_t>(n_runs);
+  auto dataset = std::filesystem::path(arguments.filename).stem().string();
+  util::iteration_profiler::csv_writer_t iter_profile(
+      arguments.iter_profile, "bfs", dataset,
+      source_vect.empty() ? -1 : source_vect.front());
   for (int i = 0; i < n_runs; i++) {
     benchmark::INIT_BENCH();
+    iter_profile.set_run(i);
 
     run_times.push_back(gunrock::bfs::run(G, source_vect[i],
                                           distances.data().get(),
                                           predecessors.data().get(), context,
-                                          arguments.advance_load_balance));
+                                          arguments.advance_load_balance,
+                                          &iter_profile));
 
     benchmark::host_benchmark_t metrics = benchmark::EXTRACT();
     benchmark_metrics[i] = metrics;

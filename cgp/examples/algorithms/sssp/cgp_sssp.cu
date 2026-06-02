@@ -1,17 +1,17 @@
-#include <gunrock/algorithms/cgp_bfs.hxx>
+#include <gunrock/algorithms/cgp_sssp.hxx>
 #include <gunrock/framework/benchmark.hxx>
 #include <gunrock/io/parameters.hxx>
 #include <gunrock/util/performance.hxx>
 
-#include "bfs_cpu.hxx"
+#include "sssp_cpu.hxx"
 #include "nlohmann/json.hpp"
 
 #include <cstdlib>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <limits>
-#include <iomanip>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -49,6 +49,11 @@ struct cgp_csr_graph_t {
   get_destination_vertex(edge_t const& e) const {
     return column_indices[e];
   }
+
+  __host__ __device__ __forceinline__ float get_edge_weight(
+      edge_t const&) const {
+    return 1.0f;
+  }
 };
 
 template <typename vertex_t, typename edge_t>
@@ -79,7 +84,6 @@ struct cgp_arguments_t {
   bool validate = false;
   bool binary = false;
   bool profile_levels = false;
-  std::string iter_profile;
 };
 
 std::string trim(std::string value) {
@@ -92,7 +96,7 @@ std::string trim(std::string value) {
 }
 
 cgp_arguments_t parse_arguments(int argc, char** argv) {
-  cxxopts::Options options(argv[0], "CGP Concurrent Breadth First Search");
+  cxxopts::Options options(argv[0], "CGP Concurrent Single Source Shortest Path");
   options.add_options()("help", "Print help")("m,market", "Matrix file",
                                               cxxopts::value<std::string>())(
       "s,src", "Source(s); comma-separated string of ints",
@@ -116,9 +120,7 @@ cgp_arguments_t parse_arguments(int argc, char** argv) {
       cxxopts::value<double>())(
       "pull_edge_ratio", "Hybrid pull threshold as active frontier-edge ratio",
       cxxopts::value<double>())("profile_levels",
-                                "Record per-level CUDA event timings")(
-      "iter_profile", "CSV file for per-level iteration profiling output",
-      cxxopts::value<std::string>());
+                                "Record per-level CUDA event timings");
 
   auto parsed = options.parse(argc, argv);
   if (parsed.count("help") || parsed.count("market") == 0) {
@@ -189,10 +191,6 @@ cgp_arguments_t parse_arguments(int argc, char** argv) {
     args.pull_edge_ratio = parsed["pull_edge_ratio"].as<double>();
   }
   if (parsed.count("profile_levels")) {
-    args.profile_levels = true;
-  }
-  if (parsed.count("iter_profile")) {
-    args.iter_profile = parsed["iter_profile"].as<std::string>();
     args.profile_levels = true;
   }
   return args;
@@ -352,103 +350,34 @@ std::string command_line(int argc, char** argv) {
   return command;
 }
 
-std::string dataset_name_from_path(const std::string& filename) {
-  return std::filesystem::path(filename).stem().string();
-}
-
-template <typename result_t>
-void export_iter_profile(const cgp_arguments_t& args,
-                         const result_t& result,
-                         std::size_t n_edges,
-                         std::size_t query_count) {
-  if (args.iter_profile.empty()) {
-    return;
-  }
-
-  std::ofstream file(args.iter_profile);
-  if (!file) {
-    std::cerr << "Error: Could not open iter_profile " << args.iter_profile
-              << "\n";
-    std::exit(1);
-  }
-
-  auto dataset = dataset_name_from_path(args.filename);
-  file << "algorithm,dataset,q,source_or_query_file,iteration,range_name,"
-       << "level_mode,active_vertices,processed_edges,input_frontier,"
-       << "output_frontier,actual_edge_count,virtual_edge_count,elapsed_ms\n";
-  file << std::fixed << std::setprecision(6);
-
-  for (const auto& profile : result.level_profiles) {
-    auto next_frontier =
-        static_cast<std::size_t>(profile.level + 1) <
-                result.frontier_sizes.size()
-            ? result.frontier_sizes[static_cast<std::size_t>(profile.level + 1)]
-            : 0;
-    auto source_or_query = args.query_file.empty() ? args.source_string
-                                                   : args.query_file;
-    auto write_row = [&](const std::string& range_name,
-                         unsigned long long processed_edges,
-                         float elapsed_ms) {
-      file << "bfs," << dataset << ',' << query_count << ','
-           << source_or_query << ',' << profile.level << ',' << range_name
-           << ',' << profile.mode << ',' << profile.unique_frontier_size
-           << ',' << processed_edges << ',' << profile.frontier_size << ','
-           << next_frontier << ',' << profile.actual_edge_count << ','
-           << profile.virtual_edge_count << ',' << elapsed_ms << '\n';
-    };
-
-    auto iter_range = std::string("cgp:bfs:q") + std::to_string(query_count) +
-                      ":iter:" + std::to_string(profile.level);
-    write_row(iter_range, profile.edge_count, profile.level_wall_ms);
-
-    auto prefix = iter_range + ":";
-    if (profile.degree_scan_ms > 0.0f) {
-      write_row(prefix + "degree_scan", profile.edge_count,
-                profile.degree_scan_ms);
-    }
-    if (profile.shared_push_kernel_ms > 0.0f) {
-      write_row(prefix + "shared_push", profile.actual_edge_count,
-                profile.shared_push_kernel_ms);
-    }
-    if (profile.compact_ms > 0.0f || profile.dense_compact_ms > 0.0f) {
-      write_row(prefix + "compact", profile.edge_count,
-                profile.compact_ms + profile.dense_compact_ms);
-    }
-    if (profile.count_sync_ms > 0.0f) {
-      write_row(prefix + "count_sync", 0, profile.count_sync_ms);
-    }
-  }
-  (void)n_edges;
-}
-
-gunrock::cgp_bfs::traversal_mode_t parse_traversal_mode(
+gunrock::cgp_sssp::traversal_mode_t parse_traversal_mode(
     const std::string& mode) {
   if (mode == "push") {
-    return gunrock::cgp_bfs::traversal_mode_t::push;
+    return gunrock::cgp_sssp::traversal_mode_t::push;
   }
   if (mode == "pull") {
-    return gunrock::cgp_bfs::traversal_mode_t::pull;
+    return gunrock::cgp_sssp::traversal_mode_t::pull;
   }
-  return gunrock::cgp_bfs::traversal_mode_t::hybrid;
+  return gunrock::cgp_sssp::traversal_mode_t::hybrid;
 }
 
-gunrock::cgp_bfs::push_strategy_t parse_push_strategy(
+gunrock::cgp_sssp::push_strategy_t parse_push_strategy(
     const std::string& strategy) {
   if (strategy == "shared_node") {
-    return gunrock::cgp_bfs::push_strategy_t::shared_node;
+    return gunrock::cgp_sssp::push_strategy_t::shared_node;
   }
   if (strategy == "shared_node_query_parallel") {
-    return gunrock::cgp_bfs::push_strategy_t::shared_node_query_parallel;
+    return gunrock::cgp_sssp::push_strategy_t::shared_node_query_parallel;
   }
-  return gunrock::cgp_bfs::push_strategy_t::edge_balanced;
+  return gunrock::cgp_sssp::push_strategy_t::edge_balanced;
 }
 
-gunrock::cgp_bfs::pull_strategy_t parse_pull_strategy(
+gunrock::cgp_sssp::pull_strategy_t parse_pull_strategy(
     const std::string& strategy) {
   if (strategy == "ge_spmm") {
-    return gunrock::cgp_bfs::pull_strategy_t::ge_spmm;
+    return gunrock::cgp_sssp::pull_strategy_t::ge_spmm;
   }
-  return gunrock::cgp_bfs::pull_strategy_t::bitmap;
+  return gunrock::cgp_sssp::pull_strategy_t::bitmap;
 }
 
 template <typename vertex_t, typename result_t>
@@ -471,7 +400,7 @@ void export_json(const cgp_arguments_t& args,
 
   nlohmann::json jsn;
   jsn["engine"] = "Essentials";
-  jsn["primitive"] = "cgp_bfs";
+  jsn["primitive"] = "cgp_sssp";
   jsn["graph_type"] = "market";
   jsn["graph_file"] = args.filename;
   jsn["num_vertices"] = n_vertices;
@@ -531,8 +460,8 @@ void export_json(const cgp_arguments_t& args,
   jsn["level_profiles"] = level_profiles;
   jsn["optimization"] =
       "edge_balanced_expand, block_local_output_count, "
-      "deferred_query_completion, hybrid_push_pull, shared_node_push, "
-      "ge_spmm_pull, shared_node_query_parallel_push";
+      "relaxation_frontier, hybrid_push_pull, shared_node_push, "
+      "min_plus_ge_spmm_pull, shared_node_query_parallel_push";
   jsn["command_line"] = command_line(argc, argv);
   jsn["git_commit_sha"] = gunrock::io::git_commit_sha1();
   gunrock::util::stats::get_gpu_info(&jsn);
@@ -546,7 +475,7 @@ void export_json(const cgp_arguments_t& args,
     if (last_dot != std::string::npos) {
       graph = graph.substr(0, last_dot);
     }
-    output = "cgp_bfs_" + graph + ".json";
+    output = "cgp_sssp_" + graph + ".json";
   }
 
   std::filesystem::create_directories(args.json_dir);
@@ -562,6 +491,7 @@ void run_loaded_graph(graph_t& G,
                       char** argv) {
   using vertex_t = typename graph_t::vertex_type;
   using edge_t = typename graph_t::edge_type;
+  using weight_t = typename graph_t::weight_type;
 
   auto context = std::make_shared<gcuda::multi_context_t>(0);
   auto n_vertices = static_cast<vertex_t>(G.get_number_of_vertices());
@@ -573,23 +503,22 @@ void run_loaded_graph(graph_t& G,
         << "Error: shared-node push strategies support at most 32 queries\n";
     std::exit(1);
   }
-  if (args.pull_strategy == "ge_spmm" && sources.size() > 128) {
-    std::cerr << "Error: --pull_strategy=ge_spmm supports at most 128 "
-                 "queries\n";
+  if ((args.traversal_mode == "pull" || args.traversal_mode == "hybrid") &&
+      sources.size() > 32) {
+    std::cerr
+        << "Error: pull and hybrid traversal modes support at most 32 queries\n";
     std::exit(1);
   }
-  gunrock::cgp_bfs::options_t run_options;
+  gunrock::cgp_sssp::options_t run_options;
   run_options.traversal_mode = parse_traversal_mode(args.traversal_mode);
   run_options.push_strategy = parse_push_strategy(args.push_strategy);
   run_options.pull_strategy = parse_pull_strategy(args.pull_strategy);
   run_options.pull_frontier_ratio = args.pull_frontier_ratio;
   run_options.pull_edge_ratio = args.pull_edge_ratio;
   run_options.profile_levels = args.profile_levels;
-  run_options.emit_nvtx = !args.iter_profile.empty();
-  auto result = gunrock::cgp_bfs::run(G, sources, context, run_options);
-  export_iter_profile(args, result, G.get_number_of_edges(), sources.size());
+  auto result = gunrock::cgp_sssp::run(G, sources, context, run_options);
 
-  std::cout << "Primitive : cgp_bfs\n";
+  std::cout << "Primitive : cgp_sssp\n";
   std::cout << "Sources : ";
   for (std::size_t i = 0; i < sources.size(); ++i) {
     std::cout << sources[i] << (i + 1 == sources.size() ? "\n" : ",");
@@ -634,20 +563,24 @@ void run_loaded_graph(graph_t& G,
       std::exit(1);
     }
 
-    thrust::host_vector<vertex_t> h_gpu_distances(result.distances);
-    thrust::host_vector<vertex_t> h_cpu_distances(n_vertices);
+    thrust::host_vector<weight_t> h_gpu_distances(result.distances);
+    thrust::host_vector<weight_t> h_cpu_distances(n_vertices);
     thrust::host_vector<vertex_t> h_predecessors(n_vertices);
 
     auto last_query = static_cast<vertex_t>(sources.size() - 1);
     auto last_source = sources.back();
-    float cpu_elapsed = bfs_cpu::run<csr_t, vertex_t, edge_t>(
+    float cpu_elapsed = sssp_cpu::run<csr_t, vertex_t, edge_t, weight_t>(
         *validation_csr, last_source, h_cpu_distances.data(),
         h_predecessors.data());
 
     int errors = 0;
     auto query_offset = static_cast<std::size_t>(last_query) * n_vertices;
     for (vertex_t v = 0; v < n_vertices; ++v) {
-      if (h_gpu_distances[query_offset + v] != h_cpu_distances[v]) {
+      auto gpu = h_gpu_distances[query_offset + v];
+      auto cpu = h_cpu_distances[v];
+      auto inf = std::numeric_limits<weight_t>::max();
+      if ((gpu == inf || cpu == inf) ? gpu != cpu
+                                     : std::abs(gpu - cpu) > 1e-4f) {
         ++errors;
       }
     }
@@ -660,7 +593,7 @@ void run_loaded_graph(graph_t& G,
 
 }  // namespace
 
-void test_cgp_bfs(int argc, char** argv) {
+void test_cgp_sssp(int argc, char** argv) {
   using vertex_t = int;
   using edge_t = int;
   using weight_t = float;
@@ -691,5 +624,5 @@ void test_cgp_bfs(int argc, char** argv) {
 }
 
 int main(int argc, char** argv) {
-  test_cgp_bfs(argc, argv);
+  test_cgp_sssp(argc, argv);
 }

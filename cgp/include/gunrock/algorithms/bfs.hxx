@@ -26,7 +26,7 @@ struct param_t {
 template <typename vertex_t>
 struct result_t {
   vertex_t* distances;
-  vertex_t* predecessors;  /// @todo: implement this.
+  vertex_t* predecessors;  /// @todo: implement this. 
   result_t(vertex_t* _distances, vertex_t* _predecessors)
       : distances(_distances), predecessors(_predecessors) {}
 };
@@ -62,8 +62,11 @@ struct problem_t : gunrock::problem_t<graph_t> {
     
     auto n_vertices = this->get_graph().get_number_of_vertices();
     auto d_distances = thrust::device_pointer_cast(this->result.distances);
+    
+    // 参数初始化
     thrust::fill(policy, d_distances + 0, d_distances + n_vertices,
-                 std::numeric_limits<vertex_t>::max());
+                 std::numeric_limits<vertex_t>::max()); 
+
     thrust::fill(policy, d_distances + this->param.single_source,
                  d_distances + this->param.single_source + 1, 0);
   }
@@ -87,7 +90,7 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
   void prepare_frontier(frontier_t* f,
                         gcuda::multi_context_t& context) override {
     auto P = this->get_problem();
-    f->push_back(P->param.single_source);
+    f->push_back(P->param.single_source); // f 看起来是vector 并非mask
   }
 
   void loop(gcuda::multi_context_t& context) override {
@@ -124,7 +127,7 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
       // Simpler logic for the above.
       auto old_distance =
           math::atomic::min(&distances[neighbor], iteration + 1);
-      return (iteration + 1 < old_distance);
+      return (iteration + 1 < old_distance); // true 说明不用更新
     };
 
     auto remove_invalids =
@@ -136,7 +139,8 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
     };
 
     // Execute advance operator on the provided lambda
-    auto advance_load_balance = P->param.options.advance_load_balance;
+    auto advance_load_balance = P->param.options.advance_load_balance; // The optimization strategy for kernel
+
     operators::advance::execute_runtime(G, E, search, advance_load_balance, context);
 
     // Execute filter operator to remove the invalids (if enabled via options).
