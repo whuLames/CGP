@@ -145,6 +145,7 @@ inline host_csr_graph load_binary_csr_directory(const std::string& path) {
   fs::path dir(path);
   fs::path row_path = dir / "csr_vlist.bin";
   fs::path col_path = dir / "csr_elist.bin";
+  fs::path w_path = dir / "csr_weightlist.bin";
   if (!fs::is_regular_file(row_path) || !fs::is_regular_file(col_path)) {
     throw std::runtime_error("CSR directory must contain csr_vlist.bin and "
                              "csr_elist.bin: " + path);
@@ -162,6 +163,7 @@ inline host_csr_graph load_binary_csr_directory(const std::string& path) {
   graph.edges = static_cast<int>(col_bytes / sizeof(int));
   graph.row_offsets.resize(static_cast<std::size_t>(graph.vertices) + 1);
   graph.column_indices.resize(static_cast<std::size_t>(graph.edges));
+  graph.edge_weights.resize(static_cast<std::size_t>(graph.edges));
 
   std::ifstream rows(row_path, std::ios::binary);
   std::ifstream cols(col_path, std::ios::binary);
@@ -176,12 +178,38 @@ inline host_csr_graph load_binary_csr_directory(const std::string& path) {
     throw std::runtime_error("failed to read CSR binary files: " + path);
   }
 
+  // 权重文件可选：存在则读 int32 → float；不存在则填单位权（SSSP 退化为 BFS）
+  const bool has_weights = fs::is_regular_file(w_path);
+  if (has_weights) {
+    auto w_bytes = fs::file_size(w_path);
+    if (w_bytes != col_bytes) {
+      throw std::runtime_error(
+          "csr_weightlist.bin size must equal csr_elist.bin size: " + path);
+    }
+    std::vector<int> w_int(static_cast<std::size_t>(graph.edges));
+    std::ifstream ws(w_path, std::ios::binary);
+    if (!ws) {
+      throw std::runtime_error("could not open csr_weightlist.bin: " + path);
+    }
+    ws.read(reinterpret_cast<char*>(w_int.data()),
+            static_cast<std::streamsize>(w_bytes));
+    for (std::size_t i = 0; i < w_int.size(); ++i) {
+      graph.edge_weights[i] = static_cast<float>(w_int[i]);
+    }
+  } else {
+    for (std::size_t i = 0; i < graph.edge_weights.size(); ++i) {
+      graph.edge_weights[i] = 1.0f;
+    }
+  }
+
   thrust::host_vector<int> row_offsets(graph.row_offsets.begin(),
                                        graph.row_offsets.end());
   thrust::host_vector<int> column_indices(graph.column_indices.begin(),
                                           graph.column_indices.end());
+  thrust::host_vector<float> edge_weights(graph.edge_weights.begin(),
+                                          graph.edge_weights.end());
   graph.device_graph = puercgp::csr_graph_storage<int, int, float>(
-      graph.vertices, row_offsets, column_indices);
+      graph.vertices, row_offsets, column_indices, edge_weights);
   return graph;
 }
 
@@ -242,6 +270,43 @@ inline std::vector<float> cpu_sssp(const host_csr_graph& graph, int source) {
     }
   }
   return distances;
+}
+
+// WCC via Label Propagation（异步 LP，与 GPU hybrid push 语义一致）
+//   init : label[v] = v  （每个顶点初始为自己的连通分量代表）
+//   iter : for each edge (v, u): label[v] = min(label[v], label[u])
+//          异步更新——本轮修改立即影响后续顶点读取（与 GPU atomicMin push 同构）
+//   conv : label[v] 收敛到 CC(v) 内的 min vertex id（min-reduce 单调减有下界）
+//   CSR  : 假定双向存储（对称），遍历 row_offsets[v]..row_offsets[v+1] 即覆盖邻居
+//   比对 : GPU 与 CPU 都用 min-reduce，收敛值 = CC 内 min vertex id，可直接 == 比对
+inline std::vector<float> cpu_wcc(const host_csr_graph& graph,
+                                  int max_iterations = 10000) {
+  const int V = graph.vertices;
+  std::vector<float> label(static_cast<std::size_t>(V));
+  for (int v = 0; v < V; ++v) {
+    label[static_cast<std::size_t>(v)] = static_cast<float>(v);
+  }
+  for (int iter = 0; iter < max_iterations; ++iter) {
+    bool changed = false;
+    for (int v = 0; v < V; ++v) {
+      const float cur = label[static_cast<std::size_t>(v)];
+      float best = cur;
+      for (int edge = graph.row_offsets[static_cast<std::size_t>(v)];
+           edge < graph.row_offsets[static_cast<std::size_t>(v) + 1]; ++edge) {
+        float nb = label[static_cast<std::size_t>(
+            graph.column_indices[static_cast<std::size_t>(edge)])];
+        if (nb < best) {
+          best = nb;
+        }
+      }
+      if (best < cur) {
+        label[static_cast<std::size_t>(v)] = best;
+        changed = true;
+      }
+    }
+    if (!changed) break;
+  }
+  return label;
 }
 
 inline float median(std::vector<float> values) {

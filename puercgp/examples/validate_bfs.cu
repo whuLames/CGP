@@ -37,9 +37,12 @@ puercgp::push_strategy_t parse_push_strategy(const std::string& value) {
   if (value == "shared_node_warp") {
     return puercgp::push_strategy_t::shared_node_warp;
   }
+  if (value == "shared_node_degree") {
+    return puercgp::push_strategy_t::shared_node_degree;
+  }
   throw std::invalid_argument(
       "push_strategy must be edge_balanced, shared_node, "
-      "shared_node_query_parallel, or shared_node_warp");
+      "shared_node_query_parallel, shared_node_warp, or shared_node_degree");
 }
 
 puercgp::pull_strategy_t parse_pull_strategy(const std::string& value) {

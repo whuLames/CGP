@@ -59,7 +59,7 @@ target_include_directories(puercgp
 target_link_libraries(puercgp INTERFACE CUDA::cudart)
 
 if(PUERCGP_BUILD_EXAMPLES)
-  foreach(_puercgp_example smoke_frontier validate_bfs validate_sssp)
+  foreach(_puercgp_example smoke_frontier validate_bfs validate_sssp smoke_reduce_ops smoke_hybrid_init smoke_hybrid_push validate_hybrid validate_wcc validate_hybrid_real bench_hybrid)
     add_executable(${_puercgp_example} examples/${_puercgp_example}.cu)
     target_link_libraries(${_puercgp_example} PRIVATE puercgp::puercgp)
     set_target_properties(${_puercgp_example}
