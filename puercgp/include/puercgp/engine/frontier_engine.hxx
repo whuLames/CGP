@@ -15,9 +15,11 @@
 
 #include <puercgp/algorithms/bfs.hxx>
 #include <puercgp/algorithms/sssp.hxx>
+#include <puercgp/algorithms/wcc.hxx>
 #include <puercgp/backend/graph_adapter.hxx>
 #include <puercgp/core/query_batch.hxx>
 #include <puercgp/core/result.hxx>
+#include <puercgp/state/frontier_storage.hxx>
 
 namespace puercgp {
 namespace detail {
@@ -222,6 +224,36 @@ __global__ void init_shared_sources_kernel(
     if (old == 0) {
       unsigned long long position = atomicAdd(unique_count, 1ULL);
       frontier_vertices[position] = source;
+    }
+  }
+}
+
+// WCC per-vertex init：每个顶点的 label = vertex_id，所有顶点入 frontier
+// 仅在 Policy == wcc_policy 时由 init 段调用
+template <typename graph_t, typename vertex_t>
+__global__ void init_wcc_labels_kernel(
+    graph_t graph,
+    int query_count,
+    float* values,
+    query_mask_t* frontier_mask,
+    vertex_t* frontier_vertices,
+    unsigned long long* unique_count) {
+  std::size_t vertex_count = graph.get_number_of_vertices();
+  std::size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+  std::size_t stride = blockDim.x * gridDim.x;
+  for (std::size_t v = tid; v < vertex_count; v += stride) {
+    for (int q = 0; q < query_count; ++q) {
+      values[value_index(v, static_cast<std::size_t>(q),
+                         static_cast<std::size_t>(query_count))] =
+          static_cast<float>(static_cast<int>(v));  // label = vertex id
+    }
+    for (int q = 0; q < query_count; ++q) {
+      query_mask_t bit = query_bit(q);
+      query_mask_t old = atomic_or_query_mask(frontier_mask + v, bit);
+      if (old == 0) {
+        unsigned long long position = atomicAdd(unique_count, 1ULL);
+        frontier_vertices[position] = static_cast<vertex_t>(v);
+      }
     }
   }
 }
@@ -870,6 +902,298 @@ __global__ void expand_shared_node_warp_kernel(
                                 next_pair_count);
     }
   }
+}
+
+constexpr int shared_node_degree_low_threshold = 8;
+constexpr int shared_node_degree_high_threshold = 512;
+
+template <typename graph_t, typename vertex_t>
+__global__ void expand_shared_node_degree_low_bfs_kernel(
+    graph_t graph,
+    const vertex_t* frontier_vertices,
+    const query_mask_t* frontier_mask,
+    std::size_t unique_count,
+    query_mask_t* visited_mask,
+    query_mask_t* next_frontier_mask,
+    vertex_t* next_frontier_vertices,
+    unsigned long long* next_unique_count,
+    unsigned long long* next_pair_count,
+    algorithms::bfs_policy::value_type* values,
+    int query_count,
+    vertex_t level) {
+  using value_t = algorithms::bfs_policy::value_type;
+  constexpr int subwarp_size = 8;
+  int lane = threadIdx.x & (subwarp_size - 1);
+  std::size_t subwarp_id =
+      (static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x) /
+      subwarp_size;
+  std::size_t subwarp_stride =
+      (static_cast<std::size_t>(blockDim.x) * gridDim.x) / subwarp_size;
+
+  for (std::size_t i = subwarp_id; i < unique_count; i += subwarp_stride) {
+    vertex_t source = frontier_vertices[i];
+    query_mask_t active_mask = frontier_mask[source];
+    if (active_mask == 0) {
+      continue;
+    }
+    auto begin = graph.get_starting_edge(source);
+    auto end = graph.get_starting_edge(source + 1);
+    auto degree = end - begin;
+    if (degree > shared_node_degree_low_threshold) {
+      continue;
+    }
+
+    if (lane < degree) {
+      auto edge = begin + lane;
+      vertex_t neighbor = graph.get_destination_vertex(edge);
+      query_mask_t old_visited =
+          atomic_or_query_mask(visited_mask + neighbor, active_mask);
+      query_mask_t improved = active_mask & ~old_visited;
+      query_mask_t bits = improved;
+
+      while (bits != 0) {
+        int query_id = mask_ffs(bits) - 1;
+        if (query_id < query_count) {
+          values[value_index(static_cast<std::size_t>(neighbor),
+                             static_cast<std::size_t>(query_id),
+                             static_cast<std::size_t>(query_count))] =
+              static_cast<value_t>(level + 1);
+        }
+        bits &= (bits - 1);
+      }
+
+      mark_next_shared_frontier(neighbor, improved, next_frontier_mask,
+                                next_frontier_vertices, next_unique_count,
+                                next_pair_count);
+    }
+  }
+}
+
+template <int query_tile, typename graph_t, typename vertex_t>
+__global__ void expand_shared_node_degree_medium_bfs_kernel(
+    graph_t graph,
+    const vertex_t* frontier_vertices,
+    const query_mask_t* frontier_mask,
+    std::size_t unique_count,
+    query_mask_t* visited_mask,
+    query_mask_t* next_frontier_mask,
+    vertex_t* next_frontier_vertices,
+    unsigned long long* next_unique_count,
+    unsigned long long* next_pair_count,
+    algorithms::bfs_policy::value_type* values,
+    int query_count,
+    vertex_t level) {
+  using value_t = algorithms::bfs_policy::value_type;
+  constexpr int warp_size = 32;
+  constexpr int edge_lanes = warp_size / query_tile;
+  static_assert(query_tile == 2 || query_tile == 4 || query_tile == 8 ||
+                    query_tile == 16 || query_tile == 32,
+                "unsupported query tile");
+
+  int lane = threadIdx.x & (warp_size - 1);
+  int edge_slot = lane / query_tile;
+  int query_slot = lane - edge_slot * query_tile;
+  int leader_lane = edge_slot * query_tile;
+  unsigned int tile_mask = 0xffffffffU;
+  if constexpr (query_tile < warp_size) {
+    tile_mask =
+        ((1U << query_tile) - 1U) << static_cast<unsigned int>(leader_lane);
+  }
+  std::size_t warp_id =
+      (static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x) >> 5;
+  std::size_t warp_stride =
+      (static_cast<std::size_t>(blockDim.x) * gridDim.x) >> 5;
+
+  for (std::size_t i = warp_id; i < unique_count; i += warp_stride) {
+    vertex_t source = frontier_vertices[i];
+    query_mask_t active_mask = frontier_mask[source];
+    if (active_mask == 0) {
+      continue;
+    }
+    auto begin = graph.get_starting_edge(source);
+    auto end = graph.get_starting_edge(source + 1);
+    auto degree = end - begin;
+    if (degree <= shared_node_degree_low_threshold ||
+        degree > shared_node_degree_high_threshold) {
+      continue;
+    }
+
+    for (auto local_edge = edge_slot; local_edge < degree;
+         local_edge += edge_lanes) {
+      auto edge = begin + local_edge;
+      vertex_t neighbor = graph.get_destination_vertex(edge);
+      query_mask_t improved = 0;
+      if (query_slot == 0) {
+        query_mask_t old_visited =
+            atomic_or_query_mask(visited_mask + neighbor, active_mask);
+        improved = active_mask & ~old_visited;
+      }
+      unsigned long long improved_bits = static_cast<unsigned long long>(improved);
+      improved_bits = __shfl_sync(tile_mask, improved_bits, leader_lane);
+      improved = static_cast<query_mask_t>(improved_bits);
+
+      for (int query_id = query_slot; query_id < query_count;
+           query_id += query_tile) {
+        if ((improved & query_bit(query_id)) != 0) {
+          values[value_index(static_cast<std::size_t>(neighbor),
+                             static_cast<std::size_t>(query_id),
+                             static_cast<std::size_t>(query_count))] =
+              static_cast<value_t>(level + 1);
+        }
+      }
+      __syncwarp(tile_mask);
+
+      if (query_slot == 0) {
+        mark_next_shared_frontier(neighbor, improved, next_frontier_mask,
+                                  next_frontier_vertices, next_unique_count,
+                                  next_pair_count);
+      }
+    }
+  }
+}
+
+template <typename graph_t, typename vertex_t>
+__global__ void expand_shared_node_degree_high_bfs_kernel(
+    graph_t graph,
+    const vertex_t* frontier_vertices,
+    const query_mask_t* frontier_mask,
+    std::size_t unique_count,
+    query_mask_t* visited_mask,
+    query_mask_t* next_frontier_mask,
+    vertex_t* next_frontier_vertices,
+    unsigned long long* next_unique_count,
+    unsigned long long* next_pair_count,
+    algorithms::bfs_policy::value_type* values,
+    int query_count,
+    vertex_t level) {
+  using value_t = algorithms::bfs_policy::value_type;
+
+  for (std::size_t i = blockIdx.x; i < unique_count; i += gridDim.x) {
+    vertex_t source = frontier_vertices[i];
+    query_mask_t active_mask = frontier_mask[source];
+    if (active_mask == 0) {
+      continue;
+    }
+    auto begin = graph.get_starting_edge(source);
+    auto end = graph.get_starting_edge(source + 1);
+    auto degree = end - begin;
+    if (degree <= shared_node_degree_high_threshold) {
+      continue;
+    }
+
+    for (auto edge = begin + threadIdx.x; edge < end; edge += blockDim.x) {
+      vertex_t neighbor = graph.get_destination_vertex(edge);
+      query_mask_t old_visited =
+          atomic_or_query_mask(visited_mask + neighbor, active_mask);
+      query_mask_t improved = active_mask & ~old_visited;
+      query_mask_t bits = improved;
+
+      while (bits != 0) {
+        int query_id = mask_ffs(bits) - 1;
+        if (query_id < query_count) {
+          values[value_index(static_cast<std::size_t>(neighbor),
+                             static_cast<std::size_t>(query_id),
+                             static_cast<std::size_t>(query_count))] =
+              static_cast<value_t>(level + 1);
+        }
+        bits &= (bits - 1);
+      }
+
+      mark_next_shared_frontier(neighbor, improved, next_frontier_mask,
+                                next_frontier_vertices, next_unique_count,
+                                next_pair_count);
+    }
+  }
+}
+
+template <int query_tile, typename graph_t, typename vertex_t>
+void launch_expand_shared_node_degree_medium_bfs(
+    graph_t graph,
+    const vertex_t* frontier_vertices,
+    const query_mask_t* frontier_mask,
+    std::size_t unique_count,
+    query_mask_t* visited_mask,
+    query_mask_t* next_frontier_mask,
+    vertex_t* next_frontier_vertices,
+    unsigned long long* next_unique_count,
+    unsigned long long* next_pair_count,
+    algorithms::bfs_policy::value_type* values,
+    int query_count,
+    vertex_t level,
+    int blocks,
+    int threads,
+    cudaStream_t stream) {
+  expand_shared_node_degree_medium_bfs_kernel<query_tile, graph_t, vertex_t>
+      <<<blocks, threads, 0, stream>>>(
+          graph, frontier_vertices, frontier_mask, unique_count, visited_mask,
+          next_frontier_mask, next_frontier_vertices, next_unique_count,
+          next_pair_count, values, query_count, level);
+}
+
+template <typename graph_t, typename vertex_t>
+void launch_expand_shared_node_degree_bfs(
+    graph_t graph,
+    const vertex_t* frontier_vertices,
+    const query_mask_t* frontier_mask,
+    std::size_t unique_count,
+    query_mask_t* visited_mask,
+    query_mask_t* next_frontier_mask,
+    vertex_t* next_frontier_vertices,
+    unsigned long long* next_unique_count,
+    unsigned long long* next_pair_count,
+    algorithms::bfs_policy::value_type* values,
+    int query_count,
+    vertex_t level,
+    int threads,
+    cudaStream_t stream) {
+  int low_blocks = grid_for(unique_count * 8ULL, threads);
+  int warp_blocks = grid_for(unique_count * 32ULL, threads);
+  int high_blocks = static_cast<int>(
+      std::min<std::size_t>(std::max<std::size_t>(unique_count, 1), 65535));
+
+  expand_shared_node_degree_low_bfs_kernel<graph_t, vertex_t>
+      <<<low_blocks, threads, 0, stream>>>(
+          graph, frontier_vertices, frontier_mask, unique_count, visited_mask,
+          next_frontier_mask, next_frontier_vertices, next_unique_count,
+          next_pair_count, values, query_count, level);
+
+  if (query_count <= 2) {
+    launch_expand_shared_node_degree_medium_bfs<2>(
+        graph, frontier_vertices, frontier_mask, unique_count, visited_mask,
+        next_frontier_mask, next_frontier_vertices, next_unique_count,
+        next_pair_count, values, query_count, level, warp_blocks, threads,
+        stream);
+  } else if (query_count <= 4) {
+    launch_expand_shared_node_degree_medium_bfs<4>(
+        graph, frontier_vertices, frontier_mask, unique_count, visited_mask,
+        next_frontier_mask, next_frontier_vertices, next_unique_count,
+        next_pair_count, values, query_count, level, warp_blocks, threads,
+        stream);
+  } else if (query_count <= 8) {
+    launch_expand_shared_node_degree_medium_bfs<8>(
+        graph, frontier_vertices, frontier_mask, unique_count, visited_mask,
+        next_frontier_mask, next_frontier_vertices, next_unique_count,
+        next_pair_count, values, query_count, level, warp_blocks, threads,
+        stream);
+  } else if (query_count <= 16) {
+    launch_expand_shared_node_degree_medium_bfs<16>(
+        graph, frontier_vertices, frontier_mask, unique_count, visited_mask,
+        next_frontier_mask, next_frontier_vertices, next_unique_count,
+        next_pair_count, values, query_count, level, warp_blocks, threads,
+        stream);
+  } else {
+    launch_expand_shared_node_degree_medium_bfs<32>(
+        graph, frontier_vertices, frontier_mask, unique_count, visited_mask,
+        next_frontier_mask, next_frontier_vertices, next_unique_count,
+        next_pair_count, values, query_count, level, warp_blocks, threads,
+        stream);
+  }
+
+  expand_shared_node_degree_high_bfs_kernel<graph_t, vertex_t>
+      <<<high_blocks, threads, 0, stream>>>(
+          graph, frontier_vertices, frontier_mask, unique_count, visited_mask,
+          next_frontier_mask, next_frontier_vertices, next_unique_count,
+          next_pair_count, values, query_count, level);
 }
 
 template <typename Policy, typename graph_t, typename vertex_t>
@@ -1860,7 +2184,8 @@ class frontier_engine {
     bool shared_push = options.push_strategy == push_strategy_t::shared_node ||
                        options.push_strategy ==
                            push_strategy_t::shared_node_query_parallel ||
-                       options.push_strategy == push_strategy_t::shared_node_warp;
+                       options.push_strategy == push_strategy_t::shared_node_warp ||
+                       options.push_strategy == push_strategy_t::shared_node_degree;
     if (shared_push && query_count > 64) {
       throw std::invalid_argument(
           "shared_node push strategies support at most 64 queries");
@@ -1956,16 +2281,29 @@ class frontier_engine {
           "cudaMemsetAsync(next_frontier_mask)");
       detail::reset_counter_kernel<<<1, 1, 0, stream>>>(
           thrust::raw_pointer_cast(out_count.data()));
-      detail::init_shared_sources_kernel<Policy>
-          <<<detail::grid_for(queries.size(), threads), threads, 0, stream>>>(
-              graph, thrust::raw_pointer_cast(device_sources.data()),
-              query_count, thrust::raw_pointer_cast(values.data()),
-              thrust::raw_pointer_cast(visited_mask.data()),
-              thrust::raw_pointer_cast(frontier_mask.data()),
-              thrust::raw_pointer_cast(shared_frontier_a.data()),
-              thrust::raw_pointer_cast(out_count.data()));
-      detail::throw_if_cuda_error(cudaGetLastError(),
-                                  "init_shared_sources_kernel");
+      if constexpr (std::is_same<Policy, algorithms::wcc_policy>::value) {
+        detail::init_wcc_labels_kernel<graph_t, vertex_type><<<detail::grid_for(
+            vertex_count * static_cast<std::size_t>(query_count), threads),
+            threads, 0, stream>>>(
+            graph, query_count,
+            thrust::raw_pointer_cast(values.data()),
+            thrust::raw_pointer_cast(frontier_mask.data()),
+            thrust::raw_pointer_cast(shared_frontier_a.data()),
+            thrust::raw_pointer_cast(out_count.data()));
+        detail::throw_if_cuda_error(cudaGetLastError(),
+                                    "init_wcc_labels_kernel");
+      } else {
+        detail::init_shared_sources_kernel<Policy>
+            <<<detail::grid_for(queries.size(), threads), threads, 0, stream>>>(
+                graph, thrust::raw_pointer_cast(device_sources.data()),
+                query_count, thrust::raw_pointer_cast(values.data()),
+                thrust::raw_pointer_cast(visited_mask.data()),
+                thrust::raw_pointer_cast(frontier_mask.data()),
+                thrust::raw_pointer_cast(shared_frontier_a.data()),
+                thrust::raw_pointer_cast(out_count.data()));
+        detail::throw_if_cuda_error(cudaGetLastError(),
+                                    "init_shared_sources_kernel");
+      }
       unsigned long long unique_count = 0;
       detail::throw_if_cuda_error(
           cudaMemcpyAsync(&unique_count, thrust::raw_pointer_cast(out_count.data()),
@@ -2239,10 +2577,11 @@ class frontier_engine {
         shared_push ? compact_dense_to_shared() : compact_dense_to_list();
       }
 
-      bool skip_shared_warp_edge_count =
+      bool skip_shared_direct_edge_count =
           options.traversal_mode == traversal_mode_t::push &&
           current_repr == frontier_repr_t::shared &&
-          options.push_strategy == push_strategy_t::shared_node_warp;
+          (options.push_strategy == push_strategy_t::shared_node_warp ||
+           options.push_strategy == push_strategy_t::shared_node_degree);
 
       bool forced_pull = options.traversal_mode == traversal_mode_t::pull;
       bool pull_by_frontier =
@@ -2252,7 +2591,7 @@ class frontier_engine {
 
       if (current_repr == frontier_repr_t::shared &&
           need_edge_count_for_decision &&
-          !skip_shared_warp_edge_count) {
+          !skip_shared_direct_edge_count) {
         compute_shared_push_edge_count();
       } else if (current_repr == frontier_repr_t::list &&
                  need_edge_count_for_decision) {
@@ -2521,7 +2860,7 @@ class frontier_engine {
         detail::throw_if_cuda_error(cudaGetLastError(), "pull_expand_kernel");
       } else if (shared_push &&
                  (actual_edges > 0 ||
-                  (skip_shared_warp_edge_count && current_unique_count > 0))) {
+                  (skip_shared_direct_edge_count && current_unique_count > 0))) {
         detail::throw_if_cuda_error(
             cudaMemsetAsync(thrust::raw_pointer_cast(next_frontier_mask.data()),
                             0, vertex_count * sizeof(query_mask_t), stream),
@@ -2565,6 +2904,41 @@ class frontier_engine {
                         thrust::raw_pointer_cast(shared_pair_count.data()),
                         thrust::raw_pointer_cast(values.data()), query_count,
                         level);
+              } else if (options.push_strategy ==
+                         push_strategy_t::shared_node_degree) {
+                if constexpr (std::is_same<Policy,
+                                            algorithms::bfs_policy>::value) {
+                  detail::launch_expand_shared_node_degree_bfs<
+                      graph_t, vertex_type>(
+                      graph,
+                      thrust::raw_pointer_cast(shared_frontier_a.data()),
+                      thrust::raw_pointer_cast(frontier_mask.data()),
+                      current_unique_count,
+                      thrust::raw_pointer_cast(visited_mask.data()),
+                      thrust::raw_pointer_cast(next_frontier_mask.data()),
+                      thrust::raw_pointer_cast(shared_frontier_b.data()),
+                      thrust::raw_pointer_cast(out_count.data()),
+                      thrust::raw_pointer_cast(shared_pair_count.data()),
+                      thrust::raw_pointer_cast(values.data()), query_count,
+                      level, threads, stream);
+                } else {
+                  int warp_blocks =
+                      detail::grid_for(current_unique_count * 32ULL, threads);
+                  detail::expand_shared_node_warp_kernel<
+                      Policy, graph_t, vertex_type>
+                      <<<warp_blocks, threads, 0, stream>>>(
+                          graph,
+                          thrust::raw_pointer_cast(shared_frontier_a.data()),
+                          thrust::raw_pointer_cast(frontier_mask.data()),
+                          current_unique_count,
+                          thrust::raw_pointer_cast(visited_mask.data()),
+                          thrust::raw_pointer_cast(next_frontier_mask.data()),
+                          thrust::raw_pointer_cast(shared_frontier_b.data()),
+                          thrust::raw_pointer_cast(out_count.data()),
+                          thrust::raw_pointer_cast(shared_pair_count.data()),
+                          thrust::raw_pointer_cast(values.data()), query_count,
+                          level);
+                }
               } else {
                 detail::expand_shared_node_kernel<Policy, graph_t, vertex_type>
                     <<<vertex_blocks, threads, 0, stream>>>(

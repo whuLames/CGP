@@ -13,7 +13,8 @@ enum class push_strategy_t {
   edge_balanced,
   shared_node,
   shared_node_query_parallel,
-  shared_node_warp
+  shared_node_warp,
+  shared_node_degree
 };
 
 enum class pull_strategy_t { bitmap, ge_spmm };
@@ -56,6 +57,8 @@ inline const char* push_strategy_name(push_strategy_t strategy) {
       return "shared_node_query_parallel";
     case push_strategy_t::shared_node_warp:
       return "shared_node_warp";
+    case push_strategy_t::shared_node_degree:
+      return "shared_node_degree";
   }
   return "unknown";
 }
