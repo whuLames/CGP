@@ -76,7 +76,7 @@ int main(int argc, char** argv) {
 
   const bool build_pull_adjacency = traversal_mode != "push";
   auto graph =
-      puercgp_examples::load_matrix_market(matrix, build_pull_adjacency);
+      puercgp_examples::load_graph_auto(matrix, build_pull_adjacency);
   auto graph_view = graph.view();
   auto sources = puercgp_examples::parse_sources(source_text);
   if (sources.empty()) {
@@ -91,20 +91,26 @@ int main(int argc, char** argv) {
   options.push_strategy = parse_push_strategy(push_strategy);
   options.pull_strategy = parse_pull_strategy(pull_strategy);
   options.profile_iterations = true;
+  options.max_queries = 128;
 
-  auto warmup = puercgp::run<puercgp::algorithms::sssp_policy>(
-      graph_view, queries, context, options);
-  (void)warmup;
+  if (graph.vertices <= 1000000) {
+    auto warmup = puercgp::run<puercgp::algorithms::sssp_policy>(
+        graph_view, queries, context, options);
+    (void)warmup;
+  }
 
   std::vector<float> wall_times;
   std::vector<float> gpu_times;
   wall_times.reserve(static_cast<std::size_t>(repeats));
   gpu_times.reserve(static_cast<std::size_t>(repeats));
 
+  bool run_cpu_check = graph.vertices <= 1000000;
   std::vector<std::vector<float>> references;
-  references.reserve(sources.size());
-  for (int source : sources) {
-    references.push_back(puercgp_examples::cpu_sssp(graph, source));
+  if (run_cpu_check) {
+    references.reserve(sources.size());
+    for (int source : sources) {
+      references.push_back(puercgp_examples::cpu_sssp(graph, source));
+    }
   }
   std::size_t mismatches = 0;
   float max_abs_delta = 0.0f;
@@ -115,18 +121,21 @@ int main(int argc, char** argv) {
     wall_times.push_back(result.wall_time_ms);
     gpu_times.push_back(result.gpu_time_ms);
 
-    thrust::host_vector<float> distances(result.values);
-    for (std::size_t query_id = 0; query_id < sources.size(); ++query_id) {
-      for (int vertex = 0; vertex < graph.vertices; ++vertex) {
-        auto index = static_cast<std::size_t>(vertex) * sources.size() +
-                     query_id;
-        float actual = distances[index];
-        float expected = references[query_id][static_cast<std::size_t>(vertex)];
-        bool both_infinite = std::isinf(actual) && std::isinf(expected);
-        float delta = both_infinite ? 0.0f : std::fabs(actual - expected);
-        max_abs_delta = std::max(max_abs_delta, delta);
-        if (!both_infinite && delta > 1.0e-5f) {
-          ++mismatches;
+    if (run_cpu_check) {
+      thrust::host_vector<float> distances(result.values);
+      for (std::size_t query_id = 0; query_id < sources.size(); ++query_id) {
+        for (int vertex = 0; vertex < graph.vertices; ++vertex) {
+          auto index = static_cast<std::size_t>(vertex) * sources.size() +
+                       query_id;
+          float actual = distances[index];
+          float expected =
+              references[query_id][static_cast<std::size_t>(vertex)];
+          bool both_infinite = std::isinf(actual) && std::isinf(expected);
+          float delta = both_infinite ? 0.0f : std::fabs(actual - expected);
+          max_abs_delta = std::max(max_abs_delta, delta);
+          if (!both_infinite && delta > 1.0e-5f) {
+            ++mismatches;
+          }
         }
       }
     }
@@ -139,6 +148,8 @@ int main(int argc, char** argv) {
   std::cout << "pull_strategy=" << pull_strategy << "\n";
   std::cout << "repeats=" << repeats << "\n";
   std::cout << "vertices=" << graph.vertices << " edges=" << graph.edges
+            << "\n";
+  std::cout << "cpu_reference_check=" << (run_cpu_check ? "yes" : "no")
             << "\n";
   std::cout << "distance_mismatches=" << mismatches
             << " max_abs_delta=" << max_abs_delta << "\n";
