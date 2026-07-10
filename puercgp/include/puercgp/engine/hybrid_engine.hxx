@@ -21,6 +21,8 @@
 #include <puercgp/core/reduce_ops.hxx>
 #include <puercgp/core/types.hxx>
 #include <puercgp/engine/frontier_engine.hxx>  // 复用 detail::
+#include <puercgp/state/engine_workspace.hxx>
+#include <puercgp/state/pull_workspace.hxx>
 
 namespace puercgp {
 namespace hybrid_detail {
@@ -819,21 +821,25 @@ class hybrid_frontier_engine {
     detail::cuda_event_timer total_timer;
     total_timer.begin(stream);
 
-    thrust::device_vector<value_t> values(V * static_cast<std::size_t>(Q));
-    thrust::device_vector<query_mask_t> visited_mask(V);
-    thrust::device_vector<query_mask_t> frontier_mask(V);
-    thrust::device_vector<query_mask_t> next_frontier_mask(V);
-    thrust::device_vector<int> frontier_vertices(V);
-    thrust::device_vector<int> next_frontier_vertices(V);
-    thrust::device_vector<unsigned long long> unique_count_dev(1);
-    thrust::device_vector<unsigned long long> next_unique_count_dev(1);
-    thrust::device_vector<unsigned long long> next_pair_count_dev(1);
+    engine_workspace<int, value_t> workspace;
+    workspace.resize(V, static_cast<std::size_t>(Q));
+    auto& values = workspace.values_vector();
+    auto& visited_mask = workspace.visited_mask_vector();
+    auto& frontier_mask = workspace.frontier_mask_vector();
+    auto& next_frontier_mask = workspace.next_frontier_mask_vector();
+    auto& frontier_vertices = workspace.frontier_vertices_vector();
+    auto& next_frontier_vertices = workspace.next_frontier_vertices_vector();
+    auto& unique_count_dev = workspace.current_unique_count_vector();
+    auto& next_unique_count_dev = workspace.next_unique_count_vector();
+    auto& next_pair_count_dev = workspace.next_pair_count_vector();
     // replenishment 收敛信号：bit s=1 表示 slot s 本轮产生了 frontier 写入
     thrust::device_vector<query_mask_t> active_union_dev(1);
     // pull 路径专用 buffer（参照同质引擎 compact_shared_pull_frontier 模式）
-    thrust::device_vector<unsigned long long> unique_flags(V);
-    thrust::device_vector<unsigned long long> pair_counts_buf(V);
-    thrust::device_vector<unsigned long long> unique_offsets(V);
+    pull_workspace pull_state;
+    pull_state.resize(V);
+    auto& unique_flags = pull_state.unique_flags_vector();
+    auto& pair_counts_buf = pull_state.pair_counts_vector();
+    auto& unique_offsets = pull_state.unique_offsets_vector();
 
     auto mask_bytes = V * sizeof(query_mask_t);
 
@@ -999,8 +1005,7 @@ class hybrid_frontier_engine {
         context.synchronize();
         profile.query_convergence_mask = h_union;
 
-        thrust::swap(frontier_mask, next_frontier_mask);
-        thrust::swap(frontier_vertices, next_frontier_vertices);
+        workspace.swap_frontiers();
         current_unique = static_cast<std::size_t>(h_next_uc);
       } else {
         profile.mode = "push";
@@ -1108,8 +1113,7 @@ class hybrid_frontier_engine {
         context.synchronize();
         profile.query_convergence_mask = h_union;
 
-        thrust::swap(frontier_mask, next_frontier_mask);
-        thrust::swap(frontier_vertices, next_frontier_vertices);
+        workspace.swap_frontiers();
         current_unique = static_cast<std::size_t>(h_next_uc);
       }
 
