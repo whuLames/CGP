@@ -25,6 +25,7 @@
 #include <puercgp/engine/query_partition.hxx>
 #include <puercgp/engine/pull_executor.hxx>
 #include <puercgp/engine/push_executor.hxx>
+#include <puercgp/kernels/common/frontier_metrics.hxx>
 #include <puercgp/kernels/common/pull_postprocess.hxx>
 #include <puercgp/kernels/pull/fused_pull_kernels.hxx>
 #include <puercgp/kernels/push/shared_push_kernels.hxx>
@@ -154,6 +155,7 @@ class frontier_engine {
     auto& unique_count_dev = workspace.current_unique_count_vector();
     auto& next_unique_count_dev = workspace.next_unique_count_vector();
     auto& next_pair_count_dev = workspace.next_pair_count_vector();
+    thrust::device_vector<unsigned long long> frontier_metric_counters(3);
 
     pull_workspace pull_state;
     pull_state.resize(vertex_count);
@@ -225,7 +227,7 @@ class frontier_engine {
     }
 
     const double pull_frontier_threshold =
-        options.pull_frontier_ratio * static_cast<double>(vertex_count);
+        options.pull_frontier_ratio * static_cast<double>(value_count);
     const double pull_edge_threshold =
         options.pull_edge_ratio * static_cast<double>(query_count) *
         static_cast<double>(graph.get_number_of_edges());
@@ -267,13 +269,64 @@ class frontier_engine {
       detail::throw_if_cuda_error(cudaGetLastError(),
                                   "reset_frontier_counters");
 
+      unsigned long long actual_edges = 0;
+      unsigned long long virtual_edges = 0;
+      unsigned long long active_pairs = 0;
+
+      auto compute_frontier_metrics = [&]() {
+        detail::throw_if_cuda_error(
+            cudaMemsetAsync(
+                thrust::raw_pointer_cast(frontier_metric_counters.data()), 0,
+                frontier_metric_counters.size() * sizeof(unsigned long long),
+                stream),
+            "cudaMemsetAsync(frontier_metric_counters)");
+        profile.degree_scan_ms += detail::timed_gpu(
+            stream, options.profile_iterations, [&]() {
+              detail::launch_compute_shared_frontier_metrics<graph_t,
+                                                             vertex_type>(
+                  graph, thrust::raw_pointer_cast(frontier_vertices.data()),
+                  thrust::raw_pointer_cast(frontier_mask.data()),
+                  current_unique_count, partition.active_slots,
+                  thrust::raw_pointer_cast(frontier_metric_counters.data()),
+                  thrust::raw_pointer_cast(frontier_metric_counters.data()) + 1,
+                  thrust::raw_pointer_cast(frontier_metric_counters.data()) + 2,
+                  threads, stream);
+            });
+        detail::throw_if_cuda_error(cudaGetLastError(),
+                                    "compute_shared_frontier_metrics_kernel");
+
+        unsigned long long host_metrics[3] = {0ULL, 0ULL, 0ULL};
+        auto sync_start = std::chrono::high_resolution_clock::now();
+        detail::throw_if_cuda_error(
+            cudaMemcpyAsync(host_metrics,
+                            thrust::raw_pointer_cast(
+                                frontier_metric_counters.data()),
+                            sizeof(host_metrics), cudaMemcpyDeviceToHost,
+                            stream),
+            "cudaMemcpyAsync(frontier_metric_counters)");
+        context.synchronize();
+        profile.count_sync_ms += detail::elapsed_ms(sync_start);
+
+        actual_edges = host_metrics[0];
+        virtual_edges = host_metrics[1];
+        active_pairs = host_metrics[2];
+        profile.edge_count = virtual_edges;
+        profile.actual_edge_count = actual_edges;
+        profile.virtual_edge_count = virtual_edges;
+      };
+
       bool use_pull = false;
       if (options.traversal_mode == traversal_mode_t::pull) {
         use_pull = true;
       } else if (options.traversal_mode == traversal_mode_t::hybrid) {
-        use_pull = has_pull_adjacency &&
-                   static_cast<double>(current_unique_count) >=
-                       pull_frontier_threshold;
+        if (has_pull_adjacency) {
+          compute_frontier_metrics();
+          if (active_pairs != 0) {
+            current_count = static_cast<std::size_t>(active_pairs);
+            profile.frontier_size = current_count;
+          }
+          use_pull = static_cast<double>(virtual_edges) >= pull_edge_threshold;
+        }
       }
 
       unsigned long long next_count = 0;

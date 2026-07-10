@@ -193,18 +193,14 @@ void launch_fused_pull(graph_t graph,
                        unsigned long long* pair_counts,
                        cudaStream_t stream) {
   int vertex_count = static_cast<int>(graph.get_number_of_vertices());
-  if (query_count <= 32) {
+  if (query_count <= 64) {
+    // The row-query layout is faster than the smem-tiled variant on the
+    // current Q=16/32/64 BFS hybrid matrix. Keep the smem kernel above for
+    // focused experiments, but use simple as the default fused pull path.
     int tile_row = std::max(1, 128 / std::max(1, query_count));
     int grid_x = (vertex_count + tile_row - 1) / tile_row;
     fused_pull_simple_kernel<Policy, graph_t, vertex_t>
         <<<grid_x, dim3(query_count, tile_row), 0, stream>>>(
-            graph, query_count, values, visited_mask, next_frontier_mask,
-            unique_flags, pair_counts);
-  } else if (query_count <= 64) {
-    constexpr int tile_row = 4;
-    int grid_x = (vertex_count + tile_row - 1) / tile_row;
-    fused_pull_smem_kernel<tile_row, Policy, graph_t, vertex_t>
-        <<<grid_x, dim3(32, tile_row), 0, stream>>>(
             graph, query_count, values, visited_mask, next_frontier_mask,
             unique_flags, pair_counts);
   } else {
