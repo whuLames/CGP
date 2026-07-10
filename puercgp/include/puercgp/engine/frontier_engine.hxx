@@ -22,6 +22,7 @@
 #include <puercgp/core/mask.hxx>
 #include <puercgp/core/query_batch.hxx>
 #include <puercgp/core/result.hxx>
+#include <puercgp/engine/query_partition.hxx>
 #include <puercgp/engine/pull_executor.hxx>
 #include <puercgp/engine/push_executor.hxx>
 #include <puercgp/kernels/common/pull_postprocess.hxx>
@@ -240,6 +241,8 @@ class frontier_engine {
     result.effective_query_dim = query_count;
     result.frontier_sizes.push_back(current_count);
     result.unique_frontier_sizes.push_back(current_unique_count);
+    const query_partition_t partition =
+        query_partition_t::all_slots(query_count, options.traversal_mode);
 
     vertex_type level = 0;
     while (current_unique_count > 0 &&
@@ -340,8 +343,8 @@ class frontier_engine {
                     thrust::raw_pointer_cast(next_frontier_vertices.data()),
                     thrust::raw_pointer_cast(next_unique_count_dev.data()),
                     thrust::raw_pointer_cast(next_pair_count_dev.data()),
-                    thrust::raw_pointer_cast(values.data()), query_count, level,
-                    threads, stream);
+                    thrust::raw_pointer_cast(values.data()), query_count,
+                    partition.active_slots, level, threads, stream);
               } else if (options.push_strategy == push_strategy_t::shared_node) {
                 detail::launch_shared_push_simple<Policy, graph_t, vertex_type>(
                     graph, thrust::raw_pointer_cast(frontier_vertices.data()),
@@ -352,8 +355,8 @@ class frontier_engine {
                     thrust::raw_pointer_cast(next_frontier_vertices.data()),
                     thrust::raw_pointer_cast(next_unique_count_dev.data()),
                     thrust::raw_pointer_cast(next_pair_count_dev.data()),
-                    thrust::raw_pointer_cast(values.data()), query_count, level,
-                    threads, stream);
+                    thrust::raw_pointer_cast(values.data()), query_count,
+                    partition.active_slots, level, threads, stream);
               } else {
                 detail::launch_shared_push_warp<Policy, graph_t, vertex_type>(
                     graph, thrust::raw_pointer_cast(frontier_vertices.data()),
@@ -364,8 +367,8 @@ class frontier_engine {
                     thrust::raw_pointer_cast(next_frontier_vertices.data()),
                     thrust::raw_pointer_cast(next_unique_count_dev.data()),
                     thrust::raw_pointer_cast(next_pair_count_dev.data()),
-                    thrust::raw_pointer_cast(values.data()), query_count, level,
-                    threads, stream);
+                    thrust::raw_pointer_cast(values.data()), query_count,
+                    partition.active_slots, level, threads, stream);
               }
             });
         detail::throw_if_cuda_error(cudaGetLastError(),

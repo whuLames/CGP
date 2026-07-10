@@ -27,13 +27,17 @@ __global__ void expand_shared_node_kernel(
     unsigned long long* next_pair_count,
     typename Policy::value_type* values,
     int query_count,
+    query_mask_t active_slots,
     vertex_t level) {
   using value_t = typename Policy::value_type;
   std::size_t vertex_count = graph.get_number_of_vertices();
 
   for (std::size_t i = blockIdx.x; i < unique_count; i += gridDim.x) {
     vertex_t source = frontier_vertices[i];
-    query_mask_t active_mask = frontier_mask[source];
+    query_mask_t active_mask = frontier_mask[source] & active_slots;
+    if (active_mask == 0) {
+      continue;
+    }
     auto begin = graph.get_starting_edge(source);
     auto end = graph.get_starting_edge(source + 1);
 
@@ -108,6 +112,7 @@ __global__ void expand_shared_node_query_parallel_kernel(
     unsigned long long* next_pair_count,
     typename Policy::value_type* values,
     int query_count,
+    query_mask_t active_slots,
     vertex_t level) {
   using value_t = typename Policy::value_type;
   constexpr int warp_size = 32;
@@ -118,7 +123,10 @@ __global__ void expand_shared_node_query_parallel_kernel(
 
   for (std::size_t i = blockIdx.x; i < unique_count; i += gridDim.x) {
     vertex_t source = frontier_vertices[i];
-    query_mask_t active_mask = frontier_mask[source];
+    query_mask_t active_mask = frontier_mask[source] & active_slots;
+    if (active_mask == 0) {
+      continue;
+    }
     auto begin = graph.get_starting_edge(source);
     auto end = graph.get_starting_edge(source + 1);
 
@@ -195,6 +203,7 @@ __global__ void expand_shared_node_warp_kernel(
     unsigned long long* next_pair_count,
     typename Policy::value_type* values,
     int query_count,
+    query_mask_t active_slots,
     vertex_t level) {
   using value_t = typename Policy::value_type;
   constexpr int warp_size = 32;
@@ -207,7 +216,7 @@ __global__ void expand_shared_node_warp_kernel(
 
   for (std::size_t i = warp_id; i < unique_count; i += warp_stride) {
     vertex_t source = frontier_vertices[i];
-    query_mask_t active_mask = frontier_mask[source];
+    query_mask_t active_mask = frontier_mask[source] & active_slots;
     if (active_mask == 0) {
       continue;
     }

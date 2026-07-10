@@ -24,6 +24,7 @@ void launch_shared_push_simple(graph_t graph,
                                unsigned long long* next_pair_count,
                                typename Policy::value_type* values,
                                int query_count,
+                               query_mask_t active_slots,
                                vertex_t level,
                                int threads,
                                cudaStream_t stream) {
@@ -33,7 +34,7 @@ void launch_shared_push_simple(graph_t graph,
       <<<blocks, threads, 0, stream>>>(
           graph, frontier_vertices, frontier_mask, unique_count, visited_mask,
           next_frontier_mask, next_frontier_vertices, next_unique_count,
-          next_pair_count, values, query_count, level);
+          next_pair_count, values, query_count, active_slots, level);
 }
 
 template <typename Policy, typename graph_t, typename vertex_t>
@@ -48,6 +49,7 @@ void launch_shared_push_query_parallel(graph_t graph,
                                        unsigned long long* next_pair_count,
                                        typename Policy::value_type* values,
                                        int query_count,
+                                       query_mask_t active_slots,
                                        vertex_t level,
                                        int threads,
                                        cudaStream_t stream) {
@@ -57,7 +59,7 @@ void launch_shared_push_query_parallel(graph_t graph,
       <<<blocks, threads, 0, stream>>>(
           graph, frontier_vertices, frontier_mask, unique_count, visited_mask,
           next_frontier_mask, next_frontier_vertices, next_unique_count,
-          next_pair_count, values, query_count, level);
+          next_pair_count, values, query_count, active_slots, level);
 }
 
 template <typename Policy, typename graph_t, typename vertex_t>
@@ -72,6 +74,7 @@ void launch_shared_push_warp(graph_t graph,
                              unsigned long long* next_pair_count,
                              typename Policy::value_type* values,
                              int query_count,
+                             query_mask_t active_slots,
                              vertex_t level,
                              int threads,
                              cudaStream_t stream) {
@@ -80,7 +83,7 @@ void launch_shared_push_warp(graph_t graph,
       <<<blocks, threads, 0, stream>>>(
           graph, frontier_vertices, frontier_mask, unique_count, visited_mask,
           next_frontier_mask, next_frontier_vertices, next_unique_count,
-          next_pair_count, values, query_count, level);
+          next_pair_count, values, query_count, active_slots, level);
 }
 
 }  // namespace detail
