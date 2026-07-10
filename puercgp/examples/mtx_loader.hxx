@@ -31,6 +31,52 @@ struct host_csr_graph {
   }
 };
 
+// 附加独立长链分量（双向 path），用于构造 WCC 长尾场景：
+//   长链顶点 V_old..V_old+L-1，双向边 (j)<->(j+1)，不连主图（独立连通分量）
+//   BFS/SSSP source 在主图 [0,V_old) 不进入长链，收敛快（O(主图直径)）
+//   WCC 覆盖全图，label 沿长链逐跳传播，O(L) 轮收敛（长尾）
+inline void attach_chain(host_csr_graph& g, int chain_length) {
+  if (chain_length <= 1) return;
+  const int V_old = g.vertices;
+  const int E_old = g.edges;
+  const int L = chain_length;
+  const int chain_edges = 2 * (L - 1);  // 双向 path
+
+  std::vector<int> new_row(static_cast<std::size_t>(V_old) + L + 1);
+  for (int i = 0; i <= V_old; ++i) new_row[i] = g.row_offsets[i];
+  int offset = E_old;
+  for (int j = 0; j < L; ++j) {
+    new_row[V_old + j] = offset;
+    int deg = (j > 0 ? 1 : 0) + (j < L - 1 ? 1 : 0);
+    offset += deg;
+  }
+  new_row[V_old + L] = offset;
+
+  std::vector<int> new_col(static_cast<std::size_t>(E_old) + chain_edges);
+  for (int i = 0; i < E_old; ++i) new_col[i] = g.column_indices[i];
+  int pos = E_old;
+  for (int j = 0; j < L; ++j) {
+    if (j > 0) new_col[pos++] = V_old + (j - 1);
+    if (j < L - 1) new_col[pos++] = V_old + (j + 1);
+  }
+
+  std::vector<float> new_w(static_cast<std::size_t>(E_old) + chain_edges, 1.0f);
+  for (int i = 0; i < E_old && i < static_cast<int>(g.edge_weights.size()); ++i)
+    new_w[i] = g.edge_weights[i];
+
+  g.vertices = V_old + L;
+  g.edges = E_old + chain_edges;
+  g.row_offsets = std::move(new_row);
+  g.column_indices = std::move(new_col);
+  g.edge_weights = std::move(new_w);
+
+  thrust::host_vector<int> row_offsets(g.row_offsets.begin(), g.row_offsets.end());
+  thrust::host_vector<int> column_indices(g.column_indices.begin(), g.column_indices.end());
+  thrust::host_vector<float> edge_weights(g.edge_weights.begin(), g.edge_weights.end());
+  g.device_graph = puercgp::csr_graph_storage<int, int, float>(
+      g.vertices, row_offsets, column_indices, edge_weights);
+}
+
 inline std::string lower_copy(std::string value) {
   for (char& c : value) {
     c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));

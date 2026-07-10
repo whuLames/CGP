@@ -163,7 +163,9 @@ int main(int argc, char** argv) {
       std::cout << "iteration_profile="
                 << "iter,mode,frontier,unique,pull_ms,ge_pull_ms,"
                    "dense_build_ms,postprocess_ms,degree_scan_ms,"
-                   "shared_push_ms,iteration_wall_ms\n";
+                   "shared_push_ms,iteration_wall_ms,edge_count,"
+                   "actual_edge_count,virtual_edge_count,compact_ms,"
+                   "count_sync_ms\n";
       for (const auto& profile : result.iteration_profiles) {
         std::cout << profile.iteration << "," << profile.mode << ","
                   << profile.frontier_size << ","
@@ -174,7 +176,12 @@ int main(int argc, char** argv) {
                   << profile.ge_spmm_postprocess_ms << ","
                   << profile.degree_scan_ms << ","
                   << profile.shared_push_kernel_ms << ","
-                  << profile.iteration_wall_ms << "\n";
+                  << profile.iteration_wall_ms << ","
+                  << profile.edge_count << ","
+                  << profile.actual_edge_count << ","
+                  << profile.virtual_edge_count << ","
+                  << profile.compact_ms << ","
+                  << profile.count_sync_ms << "\n";
       }
     }
   }

@@ -89,6 +89,7 @@ int main() {
   thrust::device_vector<unsigned long long> unique_count(1, 0);
   thrust::device_vector<unsigned long long> next_unique_count(1, 0);
   thrust::device_vector<unsigned long long> next_pair_count(1, 0);
+  thrust::device_vector<query_mask_t> active_union_dev(1, 0);
 
   constexpr int threads = 256;
 
@@ -128,9 +129,15 @@ int main() {
           thrust::raw_pointer_cast(next_unique_count.data()),
           thrust::raw_pointer_cast(next_pair_count.data()),
           thrust::raw_pointer_cast(values.data()),
-          views.kinds, Q, /*level=*/0, bfs_mask, nonbfs_mask);
+          views.kinds, Q, /*level=*/0, bfs_mask, nonbfs_mask,
+          thrust::raw_pointer_cast(active_union_dev.data()));
   CUDA_CHECK(cudaGetLastError());
   CUDA_CHECK(cudaDeviceSynchronize());
+
+  // active_union 收敛信号验证：BFS slot(bit0) + SSSP slot(bit1) 都改进了 vertex 1,2
+  query_mask_t h_union = 0;
+  thrust::copy(active_union_dev.begin(), active_union_dev.end(), &h_union);
+  check("active_union == 0b11 (BFS|SSSP both improved)", h_union == 0b11);
 
   // verify
   std::vector<unified_value_t> h_values(static_cast<std::size_t>(V) * Q);

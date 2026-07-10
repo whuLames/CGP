@@ -30,6 +30,7 @@ using puercgp::detail::atomic_or_query_mask;
 using puercgp::detail::elapsed_ms;
 using puercgp::detail::grid_for;
 using puercgp::detail::mark_next_shared_frontier;
+using puercgp::detail::mark_next_shared_frontier_with_signal;
 using puercgp::detail::mask_ffs;
 using puercgp::detail::mask_popcount;
 using puercgp::detail::query_bit;
@@ -144,7 +145,8 @@ __global__ void expand_shared_node_hybrid_kernel(
     int query_count,
     int level,
     query_mask_t bfs_slot_mask,
-    query_mask_t nonbfs_slot_mask) {
+    query_mask_t nonbfs_slot_mask,
+    query_mask_t* active_union) {
   for (std::size_t i = blockIdx.x; i < unique_count; i += gridDim.x) {
     int source = frontier_vertices[i];
     query_mask_t active_mask = frontier_mask[source];
@@ -211,9 +213,9 @@ __global__ void expand_shared_node_hybrid_kernel(
       if (improved == 0) {
         continue;
       }
-      mark_next_shared_frontier(neighbor, improved, next_frontier_mask,
-                                next_frontier_vertices, next_unique_count,
-                                next_pair_count);
+      mark_next_shared_frontier_with_signal(
+          neighbor, improved, next_frontier_mask, next_frontier_vertices,
+          next_unique_count, next_pair_count, active_union);
     }
   }
 }
@@ -241,7 +243,8 @@ __global__ void expand_shared_node_warp_hybrid_kernel(
     int query_count,
     int level,
     query_mask_t bfs_slot_mask,
-    query_mask_t nonbfs_slot_mask) {
+    query_mask_t nonbfs_slot_mask,
+    query_mask_t* active_union) {
   constexpr int warp_size = 32;
   int lane = threadIdx.x & (warp_size - 1);
   std::size_t warp_id =
@@ -319,9 +322,9 @@ __global__ void expand_shared_node_warp_hybrid_kernel(
       if (improved == 0) {
         continue;
       }
-      mark_next_shared_frontier(neighbor, improved, next_frontier_mask,
-                                next_frontier_vertices, next_unique_count,
-                                next_pair_count);
+      mark_next_shared_frontier_with_signal(
+          neighbor, improved, next_frontier_mask, next_frontier_vertices,
+          next_unique_count, next_pair_count, active_union);
     }
   }
 }
@@ -340,7 +343,8 @@ __global__ void fused_pull_hybrid_simple_kernel(
     query_mask_t* visited_mask,
     query_mask_t* next_frontier_mask,
     unsigned long long* unique_flags,
-    unsigned long long* pair_counts) {
+    unsigned long long* pair_counts,
+    query_mask_t* active_union) {
   __shared__ query_mask_t thread_masks[128];
 
   std::size_t vertex_count = graph.get_number_of_vertices();
@@ -390,6 +394,7 @@ __global__ void fused_pull_hybrid_simple_kernel(
     unique_flags[vertex] = improved_mask != 0 ? 1ULL : 0ULL;
     pair_counts[vertex] =
         static_cast<unsigned long long>(mask_popcount(improved_mask));
+    atomic_or_query_mask(active_union, improved_mask);
   }
 }
 
@@ -412,7 +417,8 @@ __global__ void fused_pull_hybrid_smem_kernel(
     query_mask_t* visited_mask,
     query_mask_t* next_frontier_mask,
     unsigned long long* unique_flags,
-    unsigned long long* pair_counts) {
+    unsigned long long* pair_counts,
+    query_mask_t* active_union) {
   constexpr int warp_size = 32;
   using vertex_t = typename graph_t::vertex_type;
   __shared__ vertex_t neighbor_tile[TILE_ROW][warp_size];
@@ -509,6 +515,7 @@ __global__ void fused_pull_hybrid_smem_kernel(
     unique_flags[vertex] = improved_mask != 0 ? 1ULL : 0ULL;
     pair_counts[vertex] =
         static_cast<unsigned long long>(mask_popcount(improved_mask));
+    atomic_or_query_mask(active_union, improved_mask);
   }
 }
 
@@ -521,6 +528,7 @@ void launch_fused_pull_hybrid(graph_t graph,
                               query_mask_t* next_frontier_mask,
                               unsigned long long* unique_flags,
                               unsigned long long* pair_counts,
+                              query_mask_t* active_union,
                               cudaStream_t stream) {
   int vertex_count = static_cast<int>(graph.get_number_of_vertices());
   if (query_count <= 32) {
@@ -529,18 +537,250 @@ void launch_fused_pull_hybrid(graph_t graph,
     fused_pull_hybrid_simple_kernel<graph_t>
         <<<grid_x, dim3(query_count, tile_row), 0, stream>>>(
             graph, query_count, values, slot_kinds, visited_mask,
-            next_frontier_mask, unique_flags, pair_counts);
+            next_frontier_mask, unique_flags, pair_counts, active_union);
   } else if (query_count <= 64) {
     constexpr int tile_row = 4;
     int grid_x = (vertex_count + tile_row - 1) / tile_row;
     fused_pull_hybrid_smem_kernel<tile_row, graph_t>
         <<<grid_x, dim3(32, tile_row), 0, stream>>>(
             graph, query_count, values, slot_kinds, visited_mask,
-            next_frontier_mask, unique_flags, pair_counts);
+            next_frontier_mask, unique_flags, pair_counts, active_union);
   } else {
     throw std::invalid_argument(
         "fused_pull_hybrid supports at most 64 queries");
   }
+}
+
+// ============================================================
+// Replenishment device helper：单 slot 重 init（仅 BFS/SSSP，WCC 被 host 拒绝）
+// 分两个同 stream 串行 kernel（stream FIFO 保证 clear 完成后 set 才开始）：
+//   clear_single_slot_kernel：grid_for(V) 清 slot 的 values 列(vertex-major strided)
+//                             + visited/frontier/next_frontier 三张 mask 的 bit s
+//   set_slot_source_kernel   ：单 thread 设 source 值 + BFS visited bit + frontier bit
+//                             + 入 frontier_vertices（atomicAdd unique_count 拿 position）
+// values 是 vertex-major [V*Q]：values[v*Q+s]，清/设都跨 V strided
+// ============================================================
+__global__ void clear_single_slot_kernel(
+    int slot,
+    int query_count,
+    std::size_t vertex_count,
+    algorithms::unified_value_t* values,
+    query_mask_t* visited_mask,
+    query_mask_t* frontier_mask,
+    query_mask_t* next_frontier_mask) {
+  std::size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+  std::size_t stride = blockDim.x * gridDim.x;
+  unsigned long long clear_mask_ll =
+      static_cast<unsigned long long>(~query_bit(slot));
+  std::size_t q_stride = static_cast<std::size_t>(query_count);
+  for (std::size_t v = tid; v < vertex_count; v += stride) {
+    values[value_index(v, static_cast<std::size_t>(slot), q_stride)] =
+        algorithms::unified_infinity();
+    atomicAnd(reinterpret_cast<unsigned long long*>(visited_mask + v),
+              clear_mask_ll);
+    atomicAnd(reinterpret_cast<unsigned long long*>(frontier_mask + v),
+              clear_mask_ll);
+    atomicAnd(reinterpret_cast<unsigned long long*>(next_frontier_mask + v),
+              clear_mask_ll);
+  }
+}
+
+__global__ void set_slot_source_kernel(
+    int slot,
+    algorithms::algo_kind_t kind,
+    int source,
+    algorithms::unified_value_t source_value,
+    int query_count,
+    algorithms::unified_value_t* values,
+    query_mask_t* visited_mask,
+    query_mask_t* frontier_mask,
+    int* frontier_vertices,
+    unsigned long long* unique_count) {
+  if (threadIdx.x != 0 || blockIdx.x != 0) return;
+  query_mask_t bit = query_bit(slot);
+  std::size_t q_stride = static_cast<std::size_t>(query_count);
+  values[value_index(static_cast<std::size_t>(source),
+                     static_cast<std::size_t>(slot), q_stride)] = source_value;
+  if (kind == algorithms::algo_kind_t::bfs) {
+    atomic_or_query_mask(visited_mask + source, bit);
+  }
+  // 让 source 进入下一轮 frontier（frontier_mask 是 swap 后的 current）
+  query_mask_t old = atomic_or_query_mask(frontier_mask + source, bit);
+  if (old == 0) {
+    unsigned long long position = atomicAdd(unique_count, 1ULL);
+    frontier_vertices[position] = source;
+  }
+}
+
+// host wrapper：replenishment 调度段调用，重 init 单个 slot 装载新 query
+// 拒绝 WCC（label 污染防护，replenishment 硬约束）
+template <typename graph_t>
+void launch_reinit_single_slot(graph_t graph,
+                               int slot,
+                               query_descriptor_t desc,
+                               int query_count,
+                               algorithms::unified_value_t* values,
+                               query_mask_t* visited_mask,
+                               query_mask_t* frontier_mask,
+                               query_mask_t* next_frontier_mask,
+                               int* frontier_vertices,
+                               unsigned long long* unique_count,
+                               cudaStream_t stream) {
+  if (desc.kind == algorithms::algo_kind_t::wcc) {
+    throw std::invalid_argument(
+        "reinit_single_slot does not support WCC (label pollution)");
+  }
+  constexpr int threads = 256;
+  std::size_t V = graph.get_number_of_vertices();
+  clear_single_slot_kernel<<<grid_for(V, threads), threads, 0, stream>>>(
+      slot, query_count, V, values, visited_mask, frontier_mask,
+      next_frontier_mask);
+  set_slot_source_kernel<<<1, 1, 0, stream>>>(
+      slot, desc.kind, desc.source, desc.source_value, query_count, values,
+      visited_mask, frontier_mask, frontier_vertices, unique_count);
+  throw_if_cuda_error(cudaGetLastError(), "reinit_single_slot");
+}
+
+// ============================================================
+// Replenishment device helper：slot 结果快照（vertex-major strided → row-major）
+// 回收 slot 前把 values[v*Q+s] 拷到 final_row[v]（避免被同 slot 后续 query 覆盖）
+// 纯读 values + 写 final，无原子，无图结构依赖
+// ============================================================
+__global__ void snapshot_slot_values_kernel(
+    const algorithms::unified_value_t* values,
+    int slot,
+    int query_count,
+    std::size_t vertex_count,
+    algorithms::unified_value_t* final_row) {
+  std::size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+  std::size_t stride = blockDim.x * gridDim.x;
+  std::size_t q_stride = static_cast<std::size_t>(query_count);
+  for (std::size_t v = tid; v < vertex_count; v += stride) {
+    final_row[v] = values[value_index(v, static_cast<std::size_t>(slot),
+                                      q_stride)];
+  }
+}
+
+inline void launch_snapshot_slot_values(
+    int slot,
+    int query_count,
+    std::size_t vertex_count,
+    const algorithms::unified_value_t* values,
+    algorithms::unified_value_t* final_row,
+    cudaStream_t stream) {
+  constexpr int threads = 256;
+  snapshot_slot_values_kernel<<<grid_for(vertex_count, threads), threads, 0,
+                                stream>>>(
+      values, slot, query_count, vertex_count, final_row);
+  throw_if_cuda_error(cudaGetLastError(), "snapshot_slot_values");
+}
+
+// ============================================================
+// Replenishment 批量 helper（优化1+2+3）：一次处理多个收敛 slot
+//   snapshot_and_clear_multi_slot_kernel：grid_for(V) 一趟遍历，
+//     每 thread 对所有 converged slot 做 snapshot(读旧值→final)+clear(values=INF)，
+//     合并清三张 mask 的多 slot bit（一次 atomicAnd，避免逐 slot 原子争用）。
+//     相比单 slot 循环：V 遍历趟数 N→1，cache line 利用率 1/Q→~1。
+//   set_sources_multi_kernel：grid_for(k) 每 thread 设一个 slot 的 source（O(1)）
+// 配合 host 循环外批量 sync，把 k 次单 slot launch+sync 压成 2 次 launch+1 次 sync。
+// ============================================================
+__global__ void snapshot_and_clear_multi_slot_kernel(
+    const int* converged_slots,        // [k] 收敛 slot 列表
+    const int* final_query_ids,        // [k] 每个 slot 的 orig query id（final 行偏移）
+    int num_converged,
+    int query_count,
+    std::size_t vertex_count,
+    algorithms::unified_value_t* values,            // [V*Q] vertex-major
+    query_mask_t* visited_mask,
+    query_mask_t* frontier_mask,
+    query_mask_t* next_frontier_mask,
+    algorithms::unified_value_t* final_buffer,      // [N*V] row-major
+    std::size_t final_row_stride,                   // = V
+    query_mask_t clear_mask) {                      // host 预算：~(OR of converged bits)
+  std::size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+  std::size_t stride = blockDim.x * gridDim.x;
+  std::size_t q_stride = static_cast<std::size_t>(query_count);
+  unsigned long long clear_ll = static_cast<unsigned long long>(clear_mask);
+  for (std::size_t v = tid; v < vertex_count; v += stride) {
+    // 对每个 converged slot：snapshot（读旧值→final）+ clear（values=INF）
+    for (int i = 0; i < num_converged; ++i) {
+      int s = converged_slots[i];
+      std::size_t pos = value_index(v, static_cast<std::size_t>(s), q_stride);
+      std::size_t final_pos =
+          static_cast<std::size_t>(final_query_ids[i]) * final_row_stride + v;
+      if (final_buffer != nullptr) final_buffer[final_pos] = values[pos];
+      values[pos] = algorithms::unified_infinity();
+    }
+    // 合并清三张 mask（一次 atomicAnd 清所有 converged bit，避免逐 slot 争用）
+    atomicAnd(reinterpret_cast<unsigned long long*>(visited_mask + v), clear_ll);
+    atomicAnd(reinterpret_cast<unsigned long long*>(frontier_mask + v), clear_ll);
+    atomicAnd(reinterpret_cast<unsigned long long*>(next_frontier_mask + v), clear_ll);
+  }
+}
+
+__global__ void set_sources_multi_kernel(
+    const int* slots,                              // [k] 要设 source 的 slot
+    const algorithms::algo_kind_t* kinds,          // [k]
+    const int* sources,                            // [k]
+    const algorithms::unified_value_t* source_values,  // [k]
+    int num_slots,
+    int query_count,
+    algorithms::unified_value_t* values,
+    query_mask_t* visited_mask,
+    query_mask_t* frontier_mask,
+    int* frontier_vertices,
+    unsigned long long* unique_count) {
+  std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= static_cast<std::size_t>(num_slots)) return;
+  int s = slots[i];
+  int src = sources[i];
+  query_mask_t bit = query_bit(s);
+  std::size_t q_stride = static_cast<std::size_t>(query_count);
+  values[value_index(static_cast<std::size_t>(src),
+                     static_cast<std::size_t>(s), q_stride)] = source_values[i];
+  if (kinds[i] == algorithms::algo_kind_t::bfs) {
+    atomic_or_query_mask(visited_mask + src, bit);
+  }
+  query_mask_t old = atomic_or_query_mask(frontier_mask + src, bit);
+  if (old == 0) {
+    unsigned long long position = atomicAdd(unique_count, 1ULL);
+    frontier_vertices[position] = src;
+  }
+}
+
+inline void launch_snapshot_and_clear_multi_slot(
+    const int* converged_slots, const int* final_query_ids, int num_converged,
+    int query_count, std::size_t vertex_count,
+    algorithms::unified_value_t* values,
+    query_mask_t* visited_mask, query_mask_t* frontier_mask,
+    query_mask_t* next_frontier_mask,
+    algorithms::unified_value_t* final_buffer, std::size_t final_row_stride,
+    query_mask_t clear_mask, cudaStream_t stream) {
+  if (num_converged <= 0) return;
+  constexpr int threads = 256;
+  snapshot_and_clear_multi_slot_kernel<<<grid_for(vertex_count, threads),
+                                         threads, 0, stream>>>(
+      converged_slots, final_query_ids, num_converged, query_count, vertex_count,
+      values, visited_mask, frontier_mask, next_frontier_mask, final_buffer,
+      final_row_stride, clear_mask);
+  throw_if_cuda_error(cudaGetLastError(), "snapshot_and_clear_multi_slot");
+}
+
+inline void launch_set_sources_multi(
+    const int* slots, const algorithms::algo_kind_t* kinds,
+    const int* sources, const algorithms::unified_value_t* source_values,
+    int num_slots, int query_count,
+    algorithms::unified_value_t* values,
+    query_mask_t* visited_mask, query_mask_t* frontier_mask,
+    int* frontier_vertices, unsigned long long* unique_count,
+    cudaStream_t stream) {
+  if (num_slots <= 0) return;
+  constexpr int threads = 64;
+  set_sources_multi_kernel<<<grid_for(num_slots, threads), threads, 0,
+                             stream>>>(
+      slots, kinds, sources, source_values, num_slots, query_count, values,
+      visited_mask, frontier_mask, frontier_vertices, unique_count);
+  throw_if_cuda_error(cudaGetLastError(), "set_sources_multi");
 }
 
 }  // namespace hybrid_detail
@@ -588,6 +828,8 @@ class hybrid_frontier_engine {
     thrust::device_vector<unsigned long long> unique_count_dev(1);
     thrust::device_vector<unsigned long long> next_unique_count_dev(1);
     thrust::device_vector<unsigned long long> next_pair_count_dev(1);
+    // replenishment 收敛信号：bit s=1 表示 slot s 本轮产生了 frontier 写入
+    thrust::device_vector<query_mask_t> active_union_dev(1);
     // pull 路径专用 buffer（参照同质引擎 compact_shared_pull_frontier 模式）
     thrust::device_vector<unsigned long long> unique_flags(V);
     thrust::device_vector<unsigned long long> pair_counts_buf(V);
@@ -616,6 +858,10 @@ class hybrid_frontier_engine {
 
     detail::reset_counter_kernel<<<1, 1, 0, stream>>>(
         thrust::raw_pointer_cast(unique_count_dev.data()));
+    hybrid_detail::throw_if_cuda_error(
+        cudaMemsetAsync(thrust::raw_pointer_cast(active_union_dev.data()), 0,
+                        sizeof(query_mask_t), stream),
+        "memset active_union (init)");
 
     hybrid_detail::init_hybrid_sources_kernel<<<hybrid_detail::grid_for(Q, threads),
                                                 threads, 0, stream>>>(
@@ -689,6 +935,10 @@ class hybrid_frontier_engine {
           cudaMemsetAsync(thrust::raw_pointer_cast(next_frontier_mask.data()), 0,
                           mask_bytes, stream),
           "memset next_frontier (loop)");
+      hybrid_detail::throw_if_cuda_error(
+          cudaMemsetAsync(thrust::raw_pointer_cast(active_union_dev.data()), 0,
+                          sizeof(query_mask_t), stream),
+          "memset active_union (loop)");
 
       if (use_pull) {
         profile.mode = "pull";
@@ -704,7 +954,8 @@ class hybrid_frontier_engine {
                   thrust::raw_pointer_cast(visited_mask.data()),
                   thrust::raw_pointer_cast(next_frontier_mask.data()),
                   thrust::raw_pointer_cast(unique_flags.data()),
-                  thrust::raw_pointer_cast(pair_counts_buf.data()), stream);
+                  thrust::raw_pointer_cast(pair_counts_buf.data()),
+                  thrust::raw_pointer_cast(active_union_dev.data()), stream);
             });
         hybrid_detail::throw_if_cuda_error(cudaGetLastError(),
                                            "fused_pull_hybrid");
@@ -739,7 +990,14 @@ class hybrid_frontier_engine {
                             sizeof(unsigned long long), cudaMemcpyDeviceToHost,
                             stream),
             "memcpy pull next_unique");
+        query_mask_t h_union = 0;
+        hybrid_detail::throw_if_cuda_error(
+            cudaMemcpyAsync(&h_union,
+                            thrust::raw_pointer_cast(active_union_dev.data()),
+                            sizeof(query_mask_t), cudaMemcpyDeviceToHost, stream),
+            "memcpy active_union (pull)");
         context.synchronize();
+        profile.query_convergence_mask = h_union;
 
         thrust::swap(frontier_mask, next_frontier_mask);
         thrust::swap(frontier_vertices, next_frontier_vertices);
@@ -775,7 +1033,8 @@ class hybrid_frontier_engine {
                     thrust::raw_pointer_cast(next_unique_count_dev.data()),
                     thrust::raw_pointer_cast(next_pair_count_dev.data()),
                     thrust::raw_pointer_cast(values.data()), views.kinds, Q,
-                    level, bfs_mask, nonbfs_mask);
+                    level, bfs_mask, nonbfs_mask,
+                    thrust::raw_pointer_cast(active_union_dev.data()));
           } else {
             hybrid_detail::expand_shared_node_hybrid_kernel<graph_t>
                 <<<hybrid_detail::grid_for(current_unique, threads), threads,
@@ -790,7 +1049,8 @@ class hybrid_frontier_engine {
                     thrust::raw_pointer_cast(next_unique_count_dev.data()),
                     thrust::raw_pointer_cast(next_pair_count_dev.data()),
                     thrust::raw_pointer_cast(values.data()), views.kinds, Q,
-                    level, bfs_mask, nonbfs_mask);
+                    level, bfs_mask, nonbfs_mask,
+                    thrust::raw_pointer_cast(active_union_dev.data()));
           }
           push_gpu_ms = kt.end(stream);
         } else {
@@ -808,7 +1068,8 @@ class hybrid_frontier_engine {
                     thrust::raw_pointer_cast(next_unique_count_dev.data()),
                     thrust::raw_pointer_cast(next_pair_count_dev.data()),
                     thrust::raw_pointer_cast(values.data()), views.kinds, Q,
-                    level, bfs_mask, nonbfs_mask);
+                    level, bfs_mask, nonbfs_mask,
+                    thrust::raw_pointer_cast(active_union_dev.data()));
           } else {
             hybrid_detail::expand_shared_node_hybrid_kernel<graph_t>
                 <<<hybrid_detail::grid_for(current_unique, threads), threads,
@@ -823,7 +1084,8 @@ class hybrid_frontier_engine {
                     thrust::raw_pointer_cast(next_unique_count_dev.data()),
                     thrust::raw_pointer_cast(next_pair_count_dev.data()),
                     thrust::raw_pointer_cast(values.data()), views.kinds, Q,
-                    level, bfs_mask, nonbfs_mask);
+                    level, bfs_mask, nonbfs_mask,
+                    thrust::raw_pointer_cast(active_union_dev.data()));
           }
         }
         profile.shared_push_kernel_ms = push_gpu_ms;
@@ -837,7 +1099,14 @@ class hybrid_frontier_engine {
                             sizeof(unsigned long long), cudaMemcpyDeviceToHost,
                             stream),
             "memcpy next_unique");
+        query_mask_t h_union = 0;
+        hybrid_detail::throw_if_cuda_error(
+            cudaMemcpyAsync(&h_union,
+                            thrust::raw_pointer_cast(active_union_dev.data()),
+                            sizeof(query_mask_t), cudaMemcpyDeviceToHost, stream),
+            "memcpy active_union (push)");
         context.synchronize();
+        profile.query_convergence_mask = h_union;
 
         thrust::swap(frontier_mask, next_frontier_mask);
         thrust::swap(frontier_vertices, next_frontier_vertices);

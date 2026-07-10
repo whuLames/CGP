@@ -1,204 +1,230 @@
-# Hybrid Batch 待完成工作
+# Hybrid Batch 后续工作
 
-> **最后更新：2026-06-14**
+> **最后更新：2026-07-06**
 >
-> 对应实施计划 `/home/zyl/.claude/plans/sunny-dancing-fog.md` 中未完成部分。
-> 已完成内容见 `../completed_plan/hybrid_batch_implementation.md`。
-> 本文档按优先级排序，每项给出现状、目标、实施要点。
+> 本文档替代早期的 "pull 接入 / warp push / bench 待实现" 计划。
+> 当前代码已经完成这些功能的主要实现，后续重点转为验证矩阵、性能结论、策略优化和文档/API 清理。
 
-## 现状概述
+## 当前状态概览
 
-Hybrid batch 的**功能核心已完成并端到端验证**：`run_heterogeneous` 能在
-push 模式下跑通 BFS+SSSP+WCC 混合 batch（`validate_hybrid` ALL PASS）。
+Hybrid heterogeneous batch 的功能核心已经完成：
 
-未完成项集中在三方面：**pull 路径接入**、**性能优化**、**真实图验证**。
-均不影响 hybrid 功能正确性，是完整度与性能的提升。
+- `run_heterogeneous` 支持同一 batch 内混合 BFS / SSSP / WCC。
+- `traversal_mode = push / pull / hybrid` 已接入主循环。
+- `push_strategy = shared_node_warp` 已接入 hybrid push。
+- `validate_hybrid_real` 已支持真实图 correctness 验证。
+- `bench_hybrid` 已支持 sequential / hybrid / ideal upper 对比。
+- `run_replenish_pipeline` 已实现 slot replenishment experimental path。
 
----
+当前最重要的缺口不是"功能能否跑"，而是：
 
-## P0：真实图验证（最高优先级）
+1. 系统性跑完真实图、多 Q、多算法组合、多 traversal mode 的验证矩阵。
+2. 产出 hybrid batch 的论文级性能数据。
+3. 明确 replenishment 路线的结论和取舍。
+4. 清理过期注释、结果布局和文档。
 
-### 现状
-所有验证（`validate_hybrid` 等）用 toy 4 顶点图。未在真实图（cit-Patents、
-soc-orkut 等）上验证正确性。
+## 历史计划完成状态
 
-### 目标
-把 `validate_hybrid` 接入现有 CSR bin / mtx loader，在真实图上跑混合 batch，
-确认大图、多 query 场景正确且不崩溃。
+| 旧计划项 | 当前状态 |
+|----------|----------|
+| P0 真实图验证 | 工具已实现：`validate_hybrid_real.cu`；完整矩阵仍待跑 |
+| P1 fused_pull_hybrid 接入 | 已完成，simple/smem pull 均已接入 `run_heterogeneous` |
+| P2 `bench_hybrid.cu` | 工具已实现；系统实验和论文表格仍待产出 |
+| P3 warp hybrid push | 已完成，`shared_node_warp` 可分派到 hybrid warp kernel |
+| P4 完整验证矩阵 | 仍待做 |
+| P5 小清理 | 部分仍待做 |
+| latency/fairness replenishment | 已实现并实验评估；当前结论为 NO-GO |
 
-### 实施要点
-1. 复用 `examples/validate_bfs.cu` 的 `load_graph_auto` 或 `load_matrix_market`
-2. CLI：`validate_hybrid <graph> <bfs_srcs> <sssp_srcs> <wcc_count> [repeats]`
-3. CPU reference：
-   - `cpu_bfs`（queue-based，复用 validate_bfs 的）
-   - `cpu_sssp`（Bellman-Ford/Dijkstra，复用 validate_sssp 的）
-   - `cpu_wcc_lp`（LP 迭代 + label 归一化到 min vertex id，**需新写**）
-4. 比对方式按 algo_kind：BFS 取整、SSSP float epsilon（建议 1e-3，因 unified float）、
-   WCC label 归一化后比对
-5. 数据集优先级：cit-Patents（小）→ soc-LiveJournal1（中）→ soc-orkut（大）
-
-### 风险
-- WCC(LP) 在大图收敛轮次可能爆炸（path graph O(V) 轮），强制 `max_iterations` 上限
-- unified float 的 SSSP 距离在长路径累加误差，需放宽 epsilon 或记录误差分布
-
-### 工作量
-3-4 天（含 cpu_wcc_lp 实现与多数据集调试）
-
----
-
-## P1：fused_pull_hybrid 接入 run 主循环
+## P0：完整验证矩阵
 
 ### 现状
-`fused_pull_hybrid_simple_kernel` + `launch_fused_pull_hybrid` 已实现并编译通过
-（`engine/hybrid_engine.hxx`），但 `hybrid_frontier_engine::run()` 是 **push-only**，
-没有调用 pull kernel。
+
+`validate_hybrid_real` 已经具备真实图验证能力，但还没有把所有组合系统跑完并固化成记录。
+大图上当前 validator 会在 `V > 5,000,000` 时跳过 CPU reference check，因此大图 correctness 证据仍不足。
 
 ### 目标
-让 `run_heterogeneous` 支持 `traversal_mode = pull / hybrid`，复用现有 frontier
-密度判定逻辑（`pull_frontier_ratio` / `pull_edge_ratio`）自动切换 push/pull。
 
-### 实施要点
-1. **frontier 表示转换**：push 用 shared（frontier_vertices + frontier_mask），
-   pull 输出 next_frontier_mask + per-vertex unique_flags/pair_counts。需要：
-   - `compact_shared_pull_frontier_kernel` 的 hybrid 版（从 per-vertex mask 重建
-     frontier_vertices list + next_unique_count）
-   - inclusive_scan 聚合 unique_flags（复用现有 `thrust::inclusive_scan` 模式）
-2. **主循环决策**：每轮根据 `current_unique_count` vs `pull_frontier_threshold`
-   决定走 push 还是 pull；pull 后做 frontier 表示转换回 shared
-3. **visited_mask 一致性**：pull kernel 设 `visited_mask |= improved`，
-   push BFS 用 visited 判重——两者共享同一 visited_mask（与现有 frontier_engine 一致）
-4. **smem pull 变体**（query_count 33-64）：当前只实现 simple 版（≤32），
-   需补 `fused_pull_hybrid_smem_kernel`（参照 `fused_pull_smem_kernel:1747-1848`）
+形成一张可复现的 correctness matrix，覆盖：
 
-### 参考代码
-- 现有 pull 分派与 compact：`frontier_engine.hxx:2646-2820`
-- `launch_fused_pull`：`frontier_engine.hxx:1850-1878`
-- `compact_shared_pull_frontier_kernel`：`frontier_engine.hxx:1880+`
-
-### 工作量
-5-6 天（frontier 表示转换是主循环最复杂的部分）
-
----
-
-## P2：性能对比 benchmark（`bench_hybrid.cu`）
-
-### 现状
-无性能数据。不知道 hybrid batch 相比"3 个同质 batch 串行执行"是赢是输，
-也不知道相比 iBFS baseline 表现如何。
-
-### 目标
-产出 ICDE 论文 Experiment 4（异构 query 分析）的核心数据：
-- hybrid vs N× sequential 同质执行的吞吐/时间对比
-- 不同算法组合（BFS+SSSP / BFS+WCC / 三方混合）的加速比
-- shared traversal ratio（hybrid 共享了多少图遍历）
-
-### 实施要点
-1. CLI：`bench_hybrid <graph> <config>`，config 描述混合 batch 组成
-2. 三组对比：
-   - sequential：`run<bfs_policy>` + `run<sssp_policy>` + `run<wcc_policy>` 串行
-   - hybrid：`run_heterogeneous` 一次混合 batch
-   - 理想上界：单算法 N× 同质 batch（如 N× BFS）
-3. 指标：wall_ms / gpu_ms / kernel_ms / iterations，取 7 次中位数
-4. 输出 CSV，便于后续画图
-
-### 工作量
-2-3 天
-
-### 风险
-- 如果 hybrid 输给 sequential（因双路开销 + WCC 长尾），需要回头优化
-  （见 P3 warp hybrid）。这是论文 Go/No-Go 的关键数据点
-  （`FRAMING_SINGLE_GPU_CONCURRENT.md:701-713`）
-
----
-
-## P3：expand_shared_node_warp_hybrid_kernel（性能优化）
-
-### 现状
-异构 push 只有 block 版（`expand_shared_node_hybrid_kernel`）。
-现有同质 SSSP 默认 fallback 走 warp 版（`expand_shared_node_warp_kernel:787-874`），
-性能更好。hybrid 缺对应版本。
-
-### 目标
-提供 warp 级异构 push kernel，作为 block 版的性能优化补充。
-
-### 实施要点
-1. 参照 `expand_shared_node_warp_kernel:787-874` 结构
-2. update 段套用 Step 5 的双路设计（BFS 批量 + 非 BFS apply_min_reduce）
-3. launch：warp-per-vertex，`grid_for(unique_count * 32, threads)`
-4. 在 `hybrid_frontier_engine::run` 加 push_strategy 分派
-   （shared_node / shared_node_warp）
-
-### 工作量
-2-3 天
-
----
-
-## P4：完整验证矩阵
-
-### 现状
-验证矩阵（plan 定义）只覆盖了 BFS+SSSP+WCC 三方混合这一个点。
-
-### 目标
-覆盖 plan 验证矩阵的全部组合 × 多 Q × 多数据集。
-
-### 待补组合
-| 组合 | 状态 |
+| 维度 | 候选 |
 |------|------|
-| {BFS} × {SSSP} × {WCC} 单算法回归 | WCC✓（validate_wcc）；BFS/SSSP 同质已有 validate_bfs/sssp |
-| BFS+SSSP | validate_hybrid 含（但 toy 图）|
-| BFS+WCC | validate_hybrid 含 |
-| SSSP+WCC | validate_hybrid 含（验证 apply_min_reduce 通用性）|
-| BFS+SSSP+WCC | validate_hybrid 含 |
-| Q ∈ {4, 16, 32, 48, 64} 扩展 | ❌ 当前 toy 图 Q=3 |
+| 算法组合 | BFS+SSSP、BFS+WCC、SSSP+WCC、BFS+SSSP+WCC |
+| Q | 4、16、32、48、64 |
+| traversal mode | push、pull、hybrid |
+| push strategy | shared_node、shared_node_warp |
+| 数据集 | cit-Patents、soc-LiveJournal1、soc-orkut、soc-twitter、soc-sinaweibo |
 
 ### 实施要点
-1. 扩展 validate_hybrid 支持参数化 Q 和算法组合
-2. 在真实图上跑全矩阵
-3. 与同质 validate_bfs/sssp/wcc 交叉验证（同算法同 source 结果一致）
 
-### 工作量
-2 天（依赖 P0 真实图 loader）
+1. 用 `validate_hybrid_real` 跑完整组合。
+2. 对 `V <= 5M` 的图保留完整 CPU reference。
+3. 对更大图补 sampled reference 或离线 reference：
+   - 随机抽样若干 source 和 vertex 检查。
+   - 对可疑 case 单独导出子图或使用 CPU/GPU baseline 交叉验证。
+4. 记录每组命令、GPU 型号、CUDA 版本、是否跑 CPU reference、mismatch 计数。
+5. 把结果汇总成新的 `experiments/hybrid_correctness_matrix.md`。
 
----
+### 风险
 
-## P5：代码清理与小改进
+- WCC label propagation 在长链或弱连通长直径图上轮次很大，需要统一 `max_iterations` 规则。
+- SSSP 使用 `unified_value_t=float`，长路径/大权重图需要记录 max abs/relative error。
 
-### 5.1 `validate_hybrid.cu` 未使用变量
-`const unified_value_t INF = unified_infinity();` 声明未用（编译 warning）。
-删除或用于不可达顶点的 INF 比对。
+## P1：Hybrid 性能实验矩阵
 
-### 5.2 pull kernel 的 smem 变体
-`launch_fused_pull_hybrid` 对 query_count > 32 抛异常（"smem variant TODO"）。
-需补 `fused_pull_hybrid_smem_kernel`（P1 的一部分）。
+### 现状
 
-### 5.3 unified float 精度分析
-论文需报告 SSSP 距离的 float 精度。建议：
-- 在真实图上测 max relative error 分布
-- 若超阈值，提供 `unified_value_t = double` 的 typedef 开关（一行改动 + 寄存器压力评估）
+`bench_hybrid.cu` 已实现，但还缺系统性实验结果。当前仍不能回答：
 
-### 5.4 hybrid_query_batch 的 device 缓存 mutable
-当前 `d_sources_` 等用 mutable 支持 const `upload_to_device`。
-可考虑改为每次返回临时 device_vector（RAII），但会增加拷贝。当前方案可接受。
+- hybrid 是否稳定快于 sequential 同质 batch。
+- 哪些算法组合有收益。
+- block push 和 warp push 哪个更适合作为默认路径。
+- push/pull/hybrid traversal 在不同图结构上的 break-even 在哪里。
 
----
+### 目标
 
-## 后续 Roadmap（ICDE 投稿视角）
+产出论文可用的 hybrid 性能表：
 
-按 `FRAMING_SINGLE_GPU_CONCURRENT.md` 的 Minimum Bar（第 601-613 行），
-当前满足情况：
+| 对比 | 指标 |
+|------|------|
+| sequential vs hybrid | wall_ms、gpu_ms、iterations、speedup |
+| block vs warp hybrid push | wall_ms、gpu_ms、speedup |
+| push vs pull vs hybrid traversal | mode breakdown、speedup、失败/退化 case |
+| 不同算法比例 | BFS/SSSP/WCC 混合比例对性能的影响 |
+| 不同 Q | Q=4/16/32/48/64 scaling |
 
-| Bar | 状态 |
-|-----|------|
-| 1. 端到端吞吐 vs 串行/naive streams | ❌ 需 P2 bench |
-| 2. 强 baseline（blind batching + SpMM/GNN）| ❌ 未对比 |
-| 3. 异构 workload 增益 | ⚠️ 功能就位（P0 真实图验证），性能数据缺（P2）|
-| 4. 兼容性分组/fallback | ❌ 未来 Feature（不在本 plan）|
-| 5. push/pull 差异处理 | ⚠️ push✓ pull 待 P1 |
-| 6. latency/fairness | ❌ 未来 Feature（replenishment）|
-| 7. break-even | ❌ 未来 |
+### 实施要点
 
-**建议执行顺序**：P0（真实图正确性）→ P2（性能数据，决定 Go/No-Go）→ P1（pull 接入）→
-P3（warp 优化）→ P4（完整矩阵）。
+1. 固定 sources 生成规则，保证 sequential 和 hybrid 使用相同 query set。
+2. 每组至少 warmup 1-2 次，repeat 5-7 次取 median。
+3. 优先用 `shared_node_warp` 避免 edge-balanced 在大图上分配 QxE 中间结构导致 OOM。
+4. 输出 CSV，另存 `experiments/hybrid_benchmark_matrix.md` 记录摘要。
+5. 如果 hybrid 输给 sequential，保留 negative result 并定位原因：
+   - runtime algo tag 分支开销。
+   - BFS/SSSP/WCC 轮次不一致导致长尾。
+   - pull 全图扫描放大了异构 slot 计算。
 
-P0 和 P2 是 ICDE 投稿的前置：P0 证明大图正确，P2 证明有性能收益。
-两者完成后可判断 hybrid batch 这个 contribution 是否足够支撑论文。
+## P2：Pull/Hybrid Traversal 策略优化
+
+### 现状
+
+Hybrid 主循环已经支持 push/pull/hybrid，但 hybrid mode 的切换主要看：
+
+```text
+current_unique >= pull_frontier_ratio * V
+```
+
+`pull_edge_ratio` 已写入 profile，但 hybrid 决策还没有完整使用 frontier edge work 估计。
+
+### 目标
+
+减少误切 pull 的概率，让 push/pull/hybrid mode 在真实图上更稳定。
+
+### 实施要点
+
+1. 在 hybrid path 中补 frontier edge count 或近似 degree sum。
+2. 同时考虑：
+   - unique frontier vertices。
+   - active query pair count。
+   - frontier outgoing edge work。
+   - 当前 batch 的 BFS/SSSP/WCC slot 组成。
+3. 记录每轮 mode、frontier size、edge count、active slot mask。
+4. 用 P1 的 benchmark 结果校准默认阈值。
+
+## P3：Replenishment 路线处置
+
+### 现状
+
+Replenishment 已实现：
+
+- `run_replenish_pipeline`
+- active slot convergence detection
+- slot snapshot + clear + pending injection
+- `discard_results`
+- `bench_replenish`
+
+实验记录在：
+
+- `experiments/replenish_throughput_benchmark.md`
+- `experiments/replenish_latency_benchmark.md`
+- `experiments/replenish_longtail_benchmark.md`
+- `experiments/replenish_e2e_throughput.md`
+
+当前实验结论：
+
+- 无长尾 BFS/SSSP workload：throughput `0.71-0.86x`，replenishment 慢。
+- latency：p25 有优势，但 median/p90/p99 更差。
+- WCC 长尾构造：push `0.84x`，pull `0.41x`，仍然 NO-GO。
+
+### 目标
+
+明确 replenishment 不作为当前主线 contribution，避免继续投入与论文主目标不匹配的优化。
+
+### 建议处置
+
+1. 保留代码作为 experimental feature，默认不开启。
+2. 保留实验记录，作为 negative result 或 appendix 候选。
+3. 不再把 replenishment 作为 ICDE main bar 的核心支撑。
+4. 若以后重启，需要先改变执行模型假设；当前 push 下空 slot mask 过滤几乎免费，pull 下复用会增加全图扫描计算。
+
+## P4：PageRank / Dense Engine
+
+### 现状
+
+`dense_engine` 仍是 placeholder：只分配 values、填 result metadata，不执行 PageRank kernel 或 convergence。
+
+### 目标
+
+如果 `puercgp` 的目标是完整 concurrent graph processing framework，而不仅是 frontier traversal，
+需要补 dense algorithm path。
+
+### 实施要点
+
+1. 实现 PageRank 初始化、pull-style rank update、damping factor、convergence check。
+2. 增加 `validate_pagerank`，与 CPU reference 或已知实现比对。
+3. 决定 PageRank 是否参与 heterogeneous batch；如果参与，需要定义与 BFS/SSSP/WCC 不同轮次语义下的调度规则。
+4. 如果论文主线不需要 PageRank，应在 README/API 文档中明确 dense engine 仍为 scaffold。
+
+## P5：API 和结果布局清理
+
+### 现状
+
+不同路径的 result layout 不一致：
+
+- `run_heterogeneous` 返回 vertex-major：`values[v * Q + q]`。
+- `run_replenish_pipeline` 返回 row-major：`values[q * V + v]`。
+
+这种差异对 benchmark 和外部用户都容易出错。
+
+### 目标
+
+明确或统一 result layout。
+
+### 可选方案
+
+1. 文档化现状，并提供 helper accessor：
+   - `hybrid_value(result, v, q)`
+   - `replenish_value(result, q, v)`
+2. 统一 layout，但会带来迁移和额外转置成本。
+3. 在 `run_result_t` 中增加 layout metadata，避免调用方猜测。
+
+## P6：代码和文档清理
+
+### 仍待清理
+
+- `examples/validate_hybrid.cu` 中 `INF` 未使用，编译时有 warning。
+- `include/puercgp/engine/hybrid_engine.hxx` 内仍有旧注释写着 "push-only 第一版"。
+- `README.md` 仍说 dense engine 是 placeholder，这点属实；但 README 也没有反映 hybrid pull、
+  warp push、真实图 validator、benchmark、replenishment 的最新进展。
+- `docs/` 与 `experiments/` 之间缺一个总索引，后续可以补 `docs/experiment_index.md`。
+
+## 建议执行顺序
+
+1. P0：先跑 correctness matrix，确保功能证据稳固。
+2. P1：跑 hybrid benchmark matrix，判断 hybrid contribution 的性能强度。
+3. P2：根据 benchmark 结果优化 push/pull 切换策略。
+4. P6：清理 warning、过期注释和 README。
+5. P5：统一或文档化 result layout。
+6. P4：只有在论文/系统目标需要 dense algorithms 时再投入 PageRank。
+
+当前主线应聚焦 **hybrid heterogeneous batch 的 correctness + performance proof**。
+Replenishment 已经完成实现和评估，但不建议继续作为主贡献推进。

@@ -112,6 +112,17 @@ class hybrid_query_batch {
     return m;
   }
 
+  // replenishment 用：替换 slot=s 的 descriptor 并重 upload device_views
+  // 全量 re-upload（Q≤64，3 个 ≤64 元素 vector copy，开销 <10μs，可忽略）
+  // 非 const：改 descs_；upload_to_device 的 device buffer 是 mutable，二者共存
+  device_views update_slot(std::size_t s, query_descriptor_t d) {
+    if (s >= descs_.size()) {
+      throw std::out_of_range("update_slot: slot index out of range");
+    }
+    descs_[s] = std::move(d);
+    return upload_to_device();
+  }
+
   bool has_bfs() const {
     for (const auto& d : descs_) {
       if (d.kind == algorithms::algo_kind_t::bfs) return true;

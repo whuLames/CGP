@@ -40,6 +40,9 @@ struct iteration_profile_t {
   float ge_spmm_postprocess_ms = 0.0f;
   float compact_ms = 0.0f;
   float count_sync_ms = 0.0f;
+  // 本轮结束时各 slot 的活跃 frontier 位掩码：bit s=1 表示 slot s 本轮产生了 frontier 写入
+  // （未收敛）；bit s=0 表示 slot s 本轮无写入（已收敛）。replenishment 调度依据。
+  query_mask_t query_convergence_mask = 0;
 };
 
 template <typename vertex_t, typename value_t>

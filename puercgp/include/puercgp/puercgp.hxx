@@ -15,6 +15,7 @@
 #include <puercgp/engine/frontier_engine.hxx>
 #include <puercgp/engine/dense_engine.hxx>
 #include <puercgp/engine/hybrid_engine.hxx>
+#include <puercgp/engine/replenish_engine.hxx>
 
 #include <puercgp/algorithms/bfs.hxx>
 #include <puercgp/algorithms/sssp.hxx>

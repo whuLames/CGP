@@ -68,9 +68,13 @@ __device__ __forceinline__ algorithms::unified_value_t compute_candidate(
     algorithms::unified_value_t source_value,
     float edge_weight,
     int level) {
+  (void)level;  // BFS 改用相对层级（source_value+1），不再依赖全局 level
   switch (kind) {
     case algorithms::algo_kind_t::bfs:
-      return static_cast<algorithms::unified_value_t>(level + 1);
+      // BFS 层级 = source_value + 1（相对，与 pull 的 nb+1 一致）
+      // 同质路径下 source_value 即当前层级，等价于 level+1；
+      // replenishment 下新注入 BFS query 从相对 0 开始正确累计
+      return source_value + algorithms::unified_value_t{1};
     case algorithms::algo_kind_t::sssp:
       return source_value + edge_weight;
     case algorithms::algo_kind_t::wcc:
@@ -88,6 +92,8 @@ __device__ __forceinline__ algorithms::unified_value_t compute_candidate(
 //   SSSP: neighbor_value + weight
 //   WCC : neighbor_value        （identity）
 // ============================================================
+
+// 这里其实是把relax操作做松弛
 __device__ __forceinline__ algorithms::unified_value_t compute_candidate_pull(
     algorithms::algo_kind_t kind,
     algorithms::unified_value_t neighbor_value,

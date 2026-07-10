@@ -138,6 +138,40 @@ __device__ __forceinline__ void mark_next_shared_frontier(
   }
 }
 
+// mark_next_shared_frontier 的带信号版（replenishment 用）：
+//   语义与原函数完全一致，额外把 improved OR 累加到 active_union 标量
+//   （1-element device scalar）。host 每轮读回后，bit s=0 即 slot s 本轮无写入（已收敛）。
+//   atomicOr 到全局标量存在争用，但仅对产生 improved 的 frontier vertex 调用，
+//   单轮开销相对 push kernel 本身可忽略（阶段5 实测确认，必要时改 block 内归约）。
+//   同质 push kernel 继续调旧 mark_next_shared_frontier（无 signal），零回归。
+template <typename vertex_t>
+__device__ __forceinline__ void mark_next_shared_frontier_with_signal(
+    vertex_t vertex,
+    query_mask_t improved,
+    query_mask_t* next_frontier_mask,
+    vertex_t* next_frontier_vertices,
+    unsigned long long* next_unique_count,
+    unsigned long long* next_pair_count,
+    query_mask_t* active_union) {
+  if (improved == 0) {
+    return;
+  }
+  // 先累加收敛信号（与 next_frontier_mask 写入独立，不影响原语义）
+  atomic_or_query_mask(active_union, improved);
+  // 以下与 mark_next_shared_frontier 主体一字不差
+  query_mask_t old_next = atomic_or_query_mask(next_frontier_mask + vertex,
+                                               improved);
+  query_mask_t new_bits = improved & ~old_next;
+  if (new_bits != 0) {
+    atomicAdd(next_pair_count,
+              static_cast<unsigned long long>(mask_popcount(new_bits)));
+  }
+  if (old_next == 0) {
+    unsigned long long position = atomicAdd(next_unique_count, 1ULL);
+    next_frontier_vertices[position] = vertex;
+  }
+}
+
 template <typename value_t>
 __device__ __forceinline__ value_t atomic_min_value(value_t* address,
                                                     value_t value) {
@@ -496,6 +530,7 @@ __global__ void compute_bitmap_degrees_kernel(graph_t graph,
   }
 }
 
+// 计算节点共享信息
 template <typename graph_t, typename vertex_t>
 __global__ void compute_shared_degrees_kernel(
     graph_t graph,
@@ -505,12 +540,14 @@ __global__ void compute_shared_degrees_kernel(
     unsigned long long* actual_degrees,
     unsigned long long* virtual_degrees) {
   std::size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-  std::size_t stride = blockDim.x * gridDim.x;
+  std::size_t stride = blockDim.x * gridDim.x; // The number of launched thread
   for (std::size_t i = tid; i < unique_count; i += stride) {
     vertex_t vertex = frontier_vertices[i];
     query_mask_t mask = frontier_mask[vertex];
+
     auto degree = static_cast<unsigned long long>(
         graph.get_starting_edge(vertex + 1) - graph.get_starting_edge(vertex));
+
     actual_degrees[i] = degree;
     virtual_degrees[i] =
         degree * static_cast<unsigned long long>(mask_popcount(mask));
@@ -662,17 +699,18 @@ __global__ void expand_shared_node_kernel(
     auto end = graph.get_starting_edge(source + 1);
 
     for (auto edge = begin + threadIdx.x; edge < end; edge += blockDim.x) {
+      //
       vertex_t neighbor = graph.get_destination_vertex(edge);  // 这样的写法是否会影响 kernel的编译局部性？ compiler足够强大应该会识别到
       query_mask_t improved = 0;
 
       if constexpr (std::is_same<Policy, algorithms::bfs_policy>::value) {  // The fixed & optimized implementation for BFS
-        query_mask_t old_visited =
-            atomic_or_query_mask(visited_mask + neighbor, active_mask);
+        // 下面的两个代码不能调换顺序
+        query_mask_t old_visited = atomic_or_query_mask(visited_mask + neighbor, active_mask);
 
         improved = active_mask & ~old_visited;  // find the vetices that have not been visited and need to be updated
         query_mask_t bits = improved;
 
-        while (bits != 0) {
+        while (bits != 0) { // 这一步是否可以展开计算？
           int query_id = mask_ffs(bits) - 1;
           if (query_id < query_count) {
             values[value_index(static_cast<std::size_t>(neighbor),
@@ -686,8 +724,8 @@ __global__ void expand_shared_node_kernel(
         /*
         To maximize the sharing, we process all active queries for an edge at once.
         */
-        query_mask_t bits = active_mask;  
-        while (bits != 0) {
+        query_mask_t bits = active_mask;  // 当前frontier的激活query有哪些
+        while (bits != 0) { // 遍历每一个query
           int query_id = mask_ffs(bits) - 1;
           if (query_id < query_count) {
             value_t source_distance =
@@ -697,7 +735,7 @@ __global__ void expand_shared_node_kernel(
             if (source_distance != Policy::infinity()) {
               value_t candidate =
                   Policy::relax(source_distance, graph.get_edge_weight(edge)); // 有点多此一举
-              
+
               /*
 
               Here we use atomic_min_value for avoid concurrent update for query data.
@@ -709,8 +747,8 @@ __global__ void expand_shared_node_kernel(
                                        static_cast<std::size_t>(query_id),
                                        static_cast<std::size_t>(query_count)),
                   candidate);
-              if (candidate < old) {
-                improved |= query_bit(query_id);  // 
+              if (candidate < old) { // 需要更新
+                improved |= query_bit(query_id);  //
               }
             }
           }
@@ -837,7 +875,7 @@ __global__ void expand_shared_node_warp_kernel(
       (static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x) >> 5;
   std::size_t warp_stride =
       (static_cast<std::size_t>(blockDim.x) * gridDim.x) >> 5;
-
+  // 一个warp 负责 一个 节点
   for (std::size_t i = warp_id; i < unique_count; i += warp_stride) {
     vertex_t source = frontier_vertices[i];
     query_mask_t active_mask = frontier_mask[source];
@@ -1732,10 +1770,21 @@ __global__ void fused_pull_simple_kernel(
   int shared_index = threadIdx.y * blockDim.x + threadIdx.x;
   query_mask_t local_mask = 0;
 
+  /*
+  threadIdx.x 为列数，threadIdx.y 为行数
+  一个warp负责一个vertex，因为此时我们确定了一个vertex最多只涉及32个query，一个warp刚好也是32个thread
+  这样起码保证了，warp内部的工作量是均衡的
+
+  threadIdx.x 对应warp内的lane id
+  threadIdx.y 对应一个block内的warp id
+
+  连续的query_count个shared_index对应一个vertex的多个query status
+  */
   if (vertex < vertex_count && query_id < query_count) {
     value_t acc = Policy::infinity();
     auto begin = graph.get_starting_edge(static_cast<vertex_t>(vertex));
     auto end = graph.get_starting_edge(static_cast<vertex_t>(vertex + 1));
+    // 这里相当于, 一个thread读取一个query的在不同neighbor下的数据，本身也不是连续读取
     for (auto edge = begin; edge < end; ++edge) {
       vertex_t neighbor = graph.get_destination_vertex(edge);
       value_t nb_val =
@@ -1744,8 +1793,8 @@ __global__ void fused_pull_simple_kernel(
                              query_stride)];
       if (nb_val != Policy::infinity()) {
         value_t candidate =
-            Policy::relax(nb_val, graph.get_edge_weight(edge));
-        if (candidate < acc) {
+            Policy::relax(nb_val, graph.get_edge_weight(edge)); // 在hybird版本，加一个flag去indicate不同的relax方式
+        if (candidate < acc) {   // 这里的小于是min reduce relax，这里应该修正，虽然大多数场景下我们确实是min reduce
           acc = candidate;
         }
       }
@@ -1754,14 +1803,14 @@ __global__ void fused_pull_simple_kernel(
         value_index(vertex, static_cast<std::size_t>(query_id), query_stride);
     if (Policy::should_update(acc, values[value_pos])) {
       values[value_pos] = acc;
-      local_mask = query_bit(query_id);
+      local_mask = query_bit(query_id);  // 当前的这个query对应的计算是否应该更新
     }
   }
 
   thread_masks[shared_index] = local_mask;
   __syncthreads();
 
-  if (vertex < vertex_count && threadIdx.x == 0) {
+  if (vertex < vertex_count && threadIdx.x == 0) { //每个warp内的第一个线程做汇总
     query_mask_t improved_mask = 0;
     int row_base = threadIdx.y * blockDim.x;
     for (int q = 0; q < query_count; ++q) {
@@ -2577,9 +2626,13 @@ class frontier_engine {
         shared_push ? compact_dense_to_shared() : compact_dense_to_list();
       }
 
+      // profile 模式下强制计算 edge_count（即使 shared_node_warp），
+      // 以便 hybrid 策略评估时能拿到完整的 degree_sum / virtual_edge_count。
+      // 非.profile 模式保持原 skip 行为避免性能损失。
       bool skip_shared_direct_edge_count =
           options.traversal_mode == traversal_mode_t::push &&
           current_repr == frontier_repr_t::shared &&
+          !options.profile_iterations &&
           (options.push_strategy == push_strategy_t::shared_node_warp ||
            options.push_strategy == push_strategy_t::shared_node_degree);
 
