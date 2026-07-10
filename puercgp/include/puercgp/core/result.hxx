@@ -32,12 +32,7 @@ struct iteration_profile_t {
   float degree_scan_ms = 0.0f;
   float push_kernel_ms = 0.0f;
   float shared_push_kernel_ms = 0.0f;
-  float bitmap_build_ms = 0.0f;
   float pull_kernel_ms = 0.0f;
-  float ge_spmm_pull_kernel_ms = 0.0f;
-  float dense_build_ms = 0.0f;
-  float dense_compact_ms = 0.0f;
-  float ge_spmm_postprocess_ms = 0.0f;
   float compact_ms = 0.0f;
   float count_sync_ms = 0.0f;
   // 本轮结束时各 slot 的活跃 frontier 位掩码：bit s=1 表示 slot s 本轮产生了 frontier 写入

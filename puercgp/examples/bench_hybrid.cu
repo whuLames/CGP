@@ -99,7 +99,9 @@ int main(int argc, char** argv) {
       run_ideal = false;
   }
 
-  auto graph = puercgp_examples::load_graph_auto(matrix);
+  const bool build_pull_adjacency = mode_text != "push";
+  auto graph =
+      puercgp_examples::load_graph_auto(matrix, build_pull_adjacency);
   auto graph_view = graph.view();
   const int total_q = static_cast<int>(bfs_srcs.size() + sssp_srcs.size()) +
                       wcc_count;
@@ -119,7 +121,7 @@ int main(int argc, char** argv) {
   execution_context ctx;
   // 内存安全的对比设置：
   //   - sequential / ideal_upper（同质引擎）统一用 shared_node_warp
-  //     （edge_balanced 会为 SSSP 分配 Q×E 大 list，在密图/大图上 OOM）
+  //     （历史 list 路径已删除，避免 SSSP 在密图/大图上 OOM）
   //   - hybrid（异构引擎）用 CLI 指定的 push（block/warp）
   //   - 所有对比路径均使用 shared_node 系列，避免 edge-level list 分配
   run_options opt_seq;

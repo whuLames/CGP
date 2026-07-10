@@ -199,6 +199,13 @@ class replenish_frontier_engine {
         options.pull_frontier_ratio * static_cast<double>(V);
     const std::size_t total_edges_static =
         static_cast<std::size_t>(graph.get_number_of_edges());
+    (void)total_edges_static;
+    const bool has_pull_adjacency = detail::graph_has_pull_adjacency(graph);
+    if (options.traversal_mode == traversal_mode_t::pull &&
+        !has_pull_adjacency) {
+      throw std::invalid_argument(
+          "replenish fused pull requires a graph view with incoming adjacency");
+    }
 
     // ===== slot 调度状态 =====
     query_mask_t h_active_slot_mask =
@@ -236,7 +243,7 @@ class replenish_frontier_engine {
       if (options.traversal_mode == traversal_mode_t::pull) {
         use_pull = true;
       } else if (options.traversal_mode == traversal_mode_t::hybrid) {
-        use_pull =
+        use_pull = has_pull_adjacency &&
             static_cast<double>(current_unique) >= pull_frontier_threshold;
       }
 

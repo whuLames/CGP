@@ -25,9 +25,6 @@ puercgp::traversal_mode_t parse_traversal_mode(const std::string& value) {
 }
 
 puercgp::push_strategy_t parse_push_strategy(const std::string& value) {
-  if (value == "edge_balanced") {
-    return puercgp::push_strategy_t::edge_balanced;
-  }
   if (value == "shared_node") {
     return puercgp::push_strategy_t::shared_node;
   }
@@ -37,22 +34,16 @@ puercgp::push_strategy_t parse_push_strategy(const std::string& value) {
   if (value == "shared_node_warp") {
     return puercgp::push_strategy_t::shared_node_warp;
   }
-  if (value == "shared_node_degree") {
-    return puercgp::push_strategy_t::shared_node_degree;
-  }
   throw std::invalid_argument(
-      "push_strategy must be edge_balanced, shared_node, "
-      "shared_node_query_parallel, shared_node_warp, or shared_node_degree");
+      "push_strategy must be shared_node, shared_node_query_parallel, or "
+      "shared_node_warp");
 }
 
 puercgp::pull_strategy_t parse_pull_strategy(const std::string& value) {
-  if (value == "bitmap") {
-    return puercgp::pull_strategy_t::bitmap;
+  if (value == "fused") {
+    return puercgp::pull_strategy_t::fused;
   }
-  if (value == "ge_spmm") {
-    return puercgp::pull_strategy_t::ge_spmm;
-  }
-  throw std::invalid_argument("pull_strategy must be bitmap or ge_spmm");
+  throw std::invalid_argument("pull_strategy must be fused");
 }
 
 int main(int argc, char** argv) {
@@ -61,8 +52,8 @@ int main(int argc, char** argv) {
   std::string source_text = "0,1,2,3";
   int repeats = 7;
   std::string traversal_mode = "push";
-  std::string push_strategy = "edge_balanced";
-  std::string pull_strategy = "bitmap";
+  std::string push_strategy = "shared_node_warp";
+  std::string pull_strategy = "fused";
   if (argc > 1) {
     matrix = argv[1];
   }
@@ -82,7 +73,9 @@ int main(int argc, char** argv) {
     pull_strategy = argv[6];
   }
 
-  auto graph = puercgp_examples::load_graph_auto(matrix);
+  const bool build_pull_adjacency = traversal_mode != "push";
+  auto graph =
+      puercgp_examples::load_graph_auto(matrix, build_pull_adjacency);
   auto graph_view = graph.view();
   auto sources = puercgp_examples::parse_sources(source_text);
   
@@ -161,8 +154,7 @@ int main(int argc, char** argv) {
       std::cout << "effective_query_dim=" << result.effective_query_dim
                 << "\n";
       std::cout << "iteration_profile="
-                << "iter,mode,frontier,unique,pull_ms,ge_pull_ms,"
-                   "dense_build_ms,postprocess_ms,degree_scan_ms,"
+                << "iter,mode,frontier,unique,pull_ms,degree_scan_ms,"
                    "shared_push_ms,iteration_wall_ms,edge_count,"
                    "actual_edge_count,virtual_edge_count,compact_ms,"
                    "count_sync_ms\n";
@@ -171,9 +163,6 @@ int main(int argc, char** argv) {
                   << profile.frontier_size << ","
                   << profile.unique_frontier_size << ","
                   << profile.pull_kernel_ms << ","
-                  << profile.ge_spmm_pull_kernel_ms << ","
-                  << profile.dense_build_ms << ","
-                  << profile.ge_spmm_postprocess_ms << ","
                   << profile.degree_scan_ms << ","
                   << profile.shared_push_kernel_ms << ","
                   << profile.iteration_wall_ms << ","

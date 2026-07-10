@@ -6,6 +6,7 @@
 
 #include <cuda_runtime.h>
 
+#include <puercgp/backend/pull_graph_access.hxx>
 #include <puercgp/core/layout.hxx>
 #include <puercgp/core/mask.hxx>
 #include <puercgp/core/types.hxx>
@@ -34,17 +35,19 @@ __global__ void fused_pull_simple_kernel(
 
   if (vertex < vertex_count && query_id < query_count) {
     value_t acc = Policy::infinity();
-    auto begin = graph.get_starting_edge(static_cast<vertex_t>(vertex));
-    auto end = graph.get_starting_edge(static_cast<vertex_t>(vertex + 1));
+    auto begin =
+        get_pull_starting_edge(graph, static_cast<vertex_t>(vertex));
+    auto end =
+        get_pull_starting_edge(graph, static_cast<vertex_t>(vertex + 1));
     for (auto edge = begin; edge < end; ++edge) {
-      vertex_t neighbor = graph.get_destination_vertex(edge);
+      vertex_t neighbor = get_pull_neighbor_vertex(graph, edge);
       value_t nb_val =
           values[value_index(static_cast<std::size_t>(neighbor),
                              static_cast<std::size_t>(query_id),
                              query_stride)];
       if (nb_val != Policy::infinity()) {
         value_t candidate =
-            Policy::relax(nb_val, graph.get_edge_weight(edge));
+            Policy::relax(nb_val, get_pull_edge_weight(graph, edge));
         if (candidate < acc) {
           acc = candidate;
         }
@@ -100,11 +103,11 @@ __global__ void fused_pull_smem_kernel(
   value_t acc0 = Policy::infinity();
   value_t acc1 = Policy::infinity();
 
-  decltype(graph.get_starting_edge(static_cast<vertex_t>(0))) begin = 0;
+  decltype(get_pull_starting_edge(graph, static_cast<vertex_t>(0))) begin = 0;
   decltype(begin) end = 0;
   if (row_valid) {
-    begin = graph.get_starting_edge(static_cast<vertex_t>(vertex));
-    end = graph.get_starting_edge(static_cast<vertex_t>(vertex + 1));
+    begin = get_pull_starting_edge(graph, static_cast<vertex_t>(vertex));
+    end = get_pull_starting_edge(graph, static_cast<vertex_t>(vertex + 1));
   }
   for (auto tile = begin; tile < end; tile += warp_size) {
     auto remaining = end - tile;
@@ -112,13 +115,13 @@ __global__ void fused_pull_smem_kernel(
         remaining < warp_size ? static_cast<int>(remaining) : warp_size;
     if (lane < tile_count) {
       neighbor_tile[threadIdx.y][lane] =
-          graph.get_destination_vertex(tile + lane);
+          get_pull_neighbor_vertex(graph, tile + lane);
     }
     __syncthreads();
 
     for (int i = 0; i < tile_count; ++i) {
       vertex_t neighbor = neighbor_tile[threadIdx.y][i];
-      auto weight = graph.get_edge_weight(tile + i);
+      auto weight = get_pull_edge_weight(graph, tile + i);
       if (query0 < query_count) {
         value_t nb_val =
             values[value_index(static_cast<std::size_t>(neighbor),

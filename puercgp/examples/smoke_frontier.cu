@@ -28,8 +28,8 @@ int main(int argc, char** argv) {
 
   puercgp::run_options options;
   options.traversal_mode = puercgp::traversal_mode_t::hybrid;
-  options.push_strategy = puercgp::push_strategy_t::edge_balanced;
-  options.pull_strategy = puercgp::pull_strategy_t::bitmap;
+  options.push_strategy = puercgp::push_strategy_t::shared_node_warp;
+  options.pull_strategy = puercgp::pull_strategy_t::fused;
   options.profile_iterations = true;
 
   puercgp::execution_context context;

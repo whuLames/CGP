@@ -35,7 +35,9 @@ struct host_csr_graph {
 //   长链顶点 V_old..V_old+L-1，双向边 (j)<->(j+1)，不连主图（独立连通分量）
 //   BFS/SSSP source 在主图 [0,V_old) 不进入长链，收敛快（O(主图直径)）
 //   WCC 覆盖全图，label 沿长链逐跳传播，O(L) 轮收敛（长尾）
-inline void attach_chain(host_csr_graph& g, int chain_length) {
+inline void attach_chain(host_csr_graph& g,
+                         int chain_length,
+                         bool build_pull_adjacency = false) {
   if (chain_length <= 1) return;
   const int V_old = g.vertices;
   const int E_old = g.edges;
@@ -74,7 +76,8 @@ inline void attach_chain(host_csr_graph& g, int chain_length) {
   thrust::host_vector<int> column_indices(g.column_indices.begin(), g.column_indices.end());
   thrust::host_vector<float> edge_weights(g.edge_weights.begin(), g.edge_weights.end());
   g.device_graph = puercgp::csr_graph_storage<int, int, float>(
-      g.vertices, row_offsets, column_indices, edge_weights);
+      g.vertices, row_offsets, column_indices, edge_weights,
+      build_pull_adjacency);
 }
 
 inline std::string lower_copy(std::string value) {
@@ -96,7 +99,8 @@ inline std::vector<int> parse_sources(const std::string& text) {
   return sources;
 }
 
-inline host_csr_graph load_matrix_market(const std::string& path) {
+inline host_csr_graph load_matrix_market(const std::string& path,
+                                         bool build_pull_adjacency = false) {
   std::ifstream input(path);
   if (!input) {
     throw std::runtime_error("could not open matrix: " + path);
@@ -182,11 +186,14 @@ inline host_csr_graph load_matrix_market(const std::string& path) {
   thrust::host_vector<float> edge_weights(graph.edge_weights.begin(),
                                           graph.edge_weights.end());
   graph.device_graph = puercgp::csr_graph_storage<int, int, float>(
-      vertices, row_offsets, column_indices, edge_weights);
+      vertices, row_offsets, column_indices, edge_weights,
+      build_pull_adjacency);
   return graph;
 }
 
-inline host_csr_graph load_binary_csr_directory(const std::string& path) {
+inline host_csr_graph load_binary_csr_directory(
+    const std::string& path,
+    bool build_pull_adjacency = false) {
   namespace fs = std::filesystem;
   fs::path dir(path);
   fs::path row_path = dir / "csr_vlist.bin";
@@ -255,15 +262,17 @@ inline host_csr_graph load_binary_csr_directory(const std::string& path) {
   thrust::host_vector<float> edge_weights(graph.edge_weights.begin(),
                                           graph.edge_weights.end());
   graph.device_graph = puercgp::csr_graph_storage<int, int, float>(
-      graph.vertices, row_offsets, column_indices, edge_weights);
+      graph.vertices, row_offsets, column_indices, edge_weights,
+      build_pull_adjacency);
   return graph;
 }
 
-inline host_csr_graph load_graph_auto(const std::string& path) {
+inline host_csr_graph load_graph_auto(const std::string& path,
+                                      bool build_pull_adjacency = false) {
   if (std::filesystem::is_directory(path)) {
-    return load_binary_csr_directory(path);
+    return load_binary_csr_directory(path, build_pull_adjacency);
   }
-  return load_matrix_market(path);
+  return load_matrix_market(path, build_pull_adjacency);
 }
 
 inline std::vector<int> cpu_bfs(const host_csr_graph& graph, int source) {

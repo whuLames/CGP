@@ -10,7 +10,9 @@
 #include <puercgp/backend/csr_graph.hxx>
 
 #include <puercgp/state/value_matrix.hxx>
-#include <puercgp/state/frontier_storage.hxx>
+#include <puercgp/state/engine_workspace.hxx>
+#include <puercgp/state/pull_workspace.hxx>
+#include <puercgp/state/replenish_workspace.hxx>
 
 #include <puercgp/engine/frontier_engine.hxx>
 #include <puercgp/engine/dense_engine.hxx>

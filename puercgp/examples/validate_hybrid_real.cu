@@ -67,9 +67,8 @@ inline puercgp::traversal_mode_t parse_traversal_mode(const std::string& value) 
 inline puercgp::push_strategy_t parse_push_strategy(const std::string& value) {
   if (value == "shared_node") return puercgp::push_strategy_t::shared_node;
   if (value == "shared_node_warp") return puercgp::push_strategy_t::shared_node_warp;
-  if (value == "edge_balanced") return puercgp::push_strategy_t::edge_balanced;
   throw std::invalid_argument(
-      "push_strategy must be shared_node, shared_node_warp, or edge_balanced");
+      "push_strategy must be shared_node or shared_node_warp");
 }
 
 int main(int argc, char** argv) {
@@ -91,7 +90,9 @@ int main(int argc, char** argv) {
   const std::string push_text = (argc > 8) ? argv[8] : "shared_node";
 
   // 加载图（自动识别 CSR 目录 vs mtx）
-  auto graph = puercgp_examples::load_graph_auto(matrix);
+  const bool build_pull_adjacency = mode_text != "push";
+  auto graph =
+      puercgp_examples::load_graph_auto(matrix, build_pull_adjacency);
   auto graph_view = graph.view();
   const int V = graph.vertices;
   const long long E = static_cast<long long>(graph.edges);

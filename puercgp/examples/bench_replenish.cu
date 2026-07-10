@@ -129,10 +129,12 @@ int main(int argc, char** argv) {
   }
   const int total = bfs_count + sssp_count + wcc_count;
 
-  auto graph = puercgp_examples::load_graph_auto(matrix);
+  const bool build_pull_adjacency = mode_text != "push";
+  auto graph =
+      puercgp_examples::load_graph_auto(matrix, build_pull_adjacency);
   const int V_main = graph.vertices;  // 主图顶点数（attach_chain 前）
   if (chain_length > 1) {
-    puercgp_examples::attach_chain(graph, chain_length);
+    puercgp_examples::attach_chain(graph, chain_length, build_pull_adjacency);
   }
   const int V = graph.vertices;  // attach 后（主图 + 长链）
   auto graph_view = graph.view();

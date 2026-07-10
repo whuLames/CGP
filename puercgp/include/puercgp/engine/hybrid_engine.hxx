@@ -17,6 +17,7 @@
 #include <thrust/device_vector.h>
 
 #include <puercgp/algorithms/hybrid.hxx>
+#include <puercgp/backend/pull_graph_access.hxx>
 #include <puercgp/core/query_descriptor.hxx>
 #include <puercgp/core/reduce_ops.hxx>
 #include <puercgp/core/types.hxx>
@@ -35,6 +36,9 @@ using puercgp::detail::mark_next_shared_frontier;
 using puercgp::detail::mark_next_shared_frontier_with_signal;
 using puercgp::detail::mask_ffs;
 using puercgp::detail::mask_popcount;
+using puercgp::detail::get_pull_edge_weight;
+using puercgp::detail::get_pull_neighbor_vertex;
+using puercgp::detail::get_pull_starting_edge;
 using puercgp::detail::query_bit;
 using puercgp::detail::throw_if_cuda_error;
 using puercgp::detail::timed_gpu;
@@ -359,16 +363,16 @@ __global__ void fused_pull_hybrid_simple_kernel(
   if (vertex < vertex_count && query_id < query_count) {
     algorithms::algo_kind_t kind = slot_kinds[query_id];
     algorithms::unified_value_t acc = algorithms::unified_infinity();
-    auto begin = graph.get_starting_edge(static_cast<int>(vertex));
-    auto end = graph.get_starting_edge(static_cast<int>(vertex + 1));
+    auto begin = get_pull_starting_edge(graph, static_cast<int>(vertex));
+    auto end = get_pull_starting_edge(graph, static_cast<int>(vertex + 1));
     for (auto edge = begin; edge < end; ++edge) {
-      int neighbor = graph.get_destination_vertex(edge);
+      int neighbor = get_pull_neighbor_vertex(graph, edge);
       algorithms::unified_value_t nb_val = values[value_index(
           static_cast<std::size_t>(neighbor),
           static_cast<std::size_t>(query_id), query_stride)];
       if (nb_val != algorithms::unified_infinity()) {
         algorithms::unified_value_t candidate = compute_candidate_pull(
-            kind, nb_val, graph.get_edge_weight(edge));
+            kind, nb_val, get_pull_edge_weight(graph, edge));
         if (candidate < acc) {
           acc = candidate;
         }
@@ -444,11 +448,11 @@ __global__ void fused_pull_hybrid_smem_kernel(
   algorithms::unified_value_t acc0 = algorithms::unified_infinity();
   algorithms::unified_value_t acc1 = algorithms::unified_infinity();
 
-  decltype(graph.get_starting_edge(static_cast<vertex_t>(0))) begin = 0;
+  decltype(get_pull_starting_edge(graph, static_cast<vertex_t>(0))) begin = 0;
   decltype(begin) end = 0;
   if (row_valid) {
-    begin = graph.get_starting_edge(static_cast<vertex_t>(vertex));
-    end = graph.get_starting_edge(static_cast<vertex_t>(vertex + 1));
+    begin = get_pull_starting_edge(graph, static_cast<vertex_t>(vertex));
+    end = get_pull_starting_edge(graph, static_cast<vertex_t>(vertex + 1));
   }
   for (auto tile = begin; tile < end; tile += warp_size) {
     auto remaining = end - tile;
@@ -456,13 +460,13 @@ __global__ void fused_pull_hybrid_smem_kernel(
         remaining < warp_size ? static_cast<int>(remaining) : warp_size;
     if (lane < tile_count) {
       neighbor_tile[threadIdx.y][lane] =
-          graph.get_destination_vertex(tile + lane);
+          get_pull_neighbor_vertex(graph, tile + lane);
     }
     __syncthreads();
 
     for (int i = 0; i < tile_count; ++i) {
       vertex_t neighbor = neighbor_tile[threadIdx.y][i];
-      auto weight = graph.get_edge_weight(tile + i);
+      auto weight = get_pull_edge_weight(graph, tile + i);
       if (query0 < query_count) {
         algorithms::unified_value_t nb_val = values[value_index(
             static_cast<std::size_t>(neighbor),
@@ -900,7 +904,7 @@ class hybrid_frontier_engine {
     std::size_t current_unique = static_cast<std::size_t>(h_uc);
 
     // ===== 预算 pull 阈值（参照同质引擎 frontier_engine.hxx:2197-2201）=====
-    // hybrid 无 bitmap capacity 概念，用 V 作 capacity；
+    // hybrid 无 list/bitmap capacity 概念，用 V 作 shared-frontier capacity；
     // hybrid batch 内 query 种类异构，无法用单一 edge_count 阈值精确刻画，
     // 用 current_unique（unique frontier 顶点数）作主要判据
     const double pull_frontier_threshold =
@@ -910,6 +914,12 @@ class hybrid_frontier_engine {
     const double pull_edge_threshold =
         options.pull_edge_ratio * static_cast<double>(Q) *
         static_cast<double>(total_edges_static);
+    const bool has_pull_adjacency = detail::graph_has_pull_adjacency(graph);
+    if (options.traversal_mode == traversal_mode_t::pull &&
+        !has_pull_adjacency) {
+      throw std::invalid_argument(
+          "hybrid fused pull requires a graph view with incoming adjacency");
+    }
 
     // ===== 主循环（push/pull/hybrid 三态分派）=====
     result_t result;
@@ -932,7 +942,7 @@ class hybrid_frontier_engine {
       if (options.traversal_mode == traversal_mode_t::pull) {
         use_pull = true;
       } else if (options.traversal_mode == traversal_mode_t::hybrid) {
-        use_pull =
+        use_pull = has_pull_adjacency &&
             static_cast<double>(current_unique) >= pull_frontier_threshold;
       }
       // traversal_mode_t::push 时 use_pull = false（保持现有 push 路径）

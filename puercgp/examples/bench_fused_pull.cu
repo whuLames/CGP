@@ -413,7 +413,7 @@ int main(int argc, char** argv) {
     }
   }
 
-  auto graph = puercgp_examples::load_graph_auto(csr_dir);
+  auto graph = puercgp_examples::load_graph_auto(csr_dir, true);
   auto graph_view = graph.view();
   auto sources = puercgp_examples::parse_sources(sources_csv);
   int query_count = static_cast<int>(sources.size());
