@@ -201,7 +201,8 @@ __global__ void expand_shared_node_hybrid_kernel(
             algorithms::unified_value_t src_val = values[src_pos];
             if (src_val != algorithms::unified_infinity()) {
               algorithms::unified_value_t cand =
-                  compute_candidate(kind, src_val, weight, level);
+                  algorithms::dispatch_candidate_push(kind, src_val, weight,
+                                                      level);
               std::size_t nb_pos = value_index(
                   static_cast<std::size_t>(neighbor),
                   static_cast<std::size_t>(q),
@@ -310,7 +311,8 @@ __global__ void expand_shared_node_warp_hybrid_kernel(
             algorithms::unified_value_t src_val = values[src_pos];
             if (src_val != algorithms::unified_infinity()) {
               algorithms::unified_value_t cand =
-                  compute_candidate(kind, src_val, weight, level);
+                  algorithms::dispatch_candidate_push(kind, src_val, weight,
+                                                      level);
               std::size_t nb_pos = value_index(
                   static_cast<std::size_t>(neighbor),
                   static_cast<std::size_t>(q),
@@ -338,7 +340,7 @@ __global__ void expand_shared_node_warp_hybrid_kernel(
 // ============================================================
 // Step 6: fused pull hybrid kernel
 // pull 模式下 BFS 退化为 unweighted SSSP（nb_val+1），
-// 所以全部 slot 走 compute_candidate_pull，无双路
+// 所以全部 slot 走 algorithms::dispatch_candidate_pull，无双路
 // ============================================================
 template <typename graph_t>
 __global__ void fused_pull_hybrid_simple_kernel(
@@ -371,8 +373,9 @@ __global__ void fused_pull_hybrid_simple_kernel(
           static_cast<std::size_t>(neighbor),
           static_cast<std::size_t>(query_id), query_stride)];
       if (nb_val != algorithms::unified_infinity()) {
-        algorithms::unified_value_t candidate = compute_candidate_pull(
-            kind, nb_val, get_pull_edge_weight(graph, edge));
+        algorithms::unified_value_t candidate =
+            algorithms::dispatch_candidate_pull(
+                kind, nb_val, get_pull_edge_weight(graph, edge));
         if (candidate < acc) {
           acc = candidate;
         }
@@ -409,7 +412,7 @@ __global__ void fused_pull_hybrid_simple_kernel(
 // 参照同质 fused_pull_smem_kernel(frontier_engine.hxx:1779-1879)，
 // 核心差异：
 //   - Policy::infinity() → algorithms::unified_infinity()
-//   - Policy::relax(nb, w) → compute_candidate_pull(kind, nb, w)
+//   - Policy::relax(nb, w) → algorithms::dispatch_candidate_pull(kind, nb, w)
 //   - 每 thread 读 slot_kinds[query0/1] 取自己的 kind
 //   - should_update 统一为 acc < cur（min-reduce 语义）
 // 每 thread 处理 2 条 query（query0=lane, query1=lane+32）覆盖 64 query
@@ -473,7 +476,7 @@ __global__ void fused_pull_hybrid_smem_kernel(
             static_cast<std::size_t>(query0), query_stride)];
         if (nb_val != algorithms::unified_infinity()) {
           algorithms::unified_value_t candidate =
-              compute_candidate_pull(kind0, nb_val, weight);
+              algorithms::dispatch_candidate_pull(kind0, nb_val, weight);
           if (candidate < acc0) acc0 = candidate;
         }
       }
@@ -483,7 +486,7 @@ __global__ void fused_pull_hybrid_smem_kernel(
             static_cast<std::size_t>(query1), query_stride)];
         if (nb_val != algorithms::unified_infinity()) {
           algorithms::unified_value_t candidate =
-              compute_candidate_pull(kind1, nb_val, weight);
+              algorithms::dispatch_candidate_pull(kind1, nb_val, weight);
           if (candidate < acc1) acc1 = candidate;
         }
       }

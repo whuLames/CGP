@@ -2,6 +2,7 @@
 
 #include <limits>
 
+#include <puercgp/algorithms/algorithm_traits.hxx>
 #include <puercgp/core/types.hxx>
 
 namespace puercgp {
@@ -14,12 +15,15 @@ struct bfs_policy {
 
   static constexpr execution_model_t execution_model =
       execution_model_t::frontier;
+  static constexpr algo_kind_t algorithm_kind = algo_kind_t::bfs;
+  static constexpr init_mode_t init_mode =
+      algorithm_traits<algorithm_kind>::init_mode;
 
   static constexpr value_type infinity() {
     return std::numeric_limits<value_type>::max();
   }
 
-  static constexpr value_type source_value() { return 0; } // 感觉这样的抽象完全不需要s
+  static constexpr value_type source_value() { return 0; }
 
   template <typename weight_t>
   static constexpr value_type relax(value_type source_distance,  // 这个名字叫 relax 可能不太合适？

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <puercgp/algorithms/algorithm_traits.hxx>
+#include <puercgp/algorithms/dispatcher.hxx>
 #include <puercgp/core/algorithm_id.hxx>
 
 namespace puercgp {

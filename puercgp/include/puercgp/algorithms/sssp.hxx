@@ -2,6 +2,7 @@
 
 #include <limits>
 
+#include <puercgp/algorithms/algorithm_traits.hxx>
 #include <puercgp/core/types.hxx>
 
 namespace puercgp {
@@ -13,6 +14,9 @@ struct sssp_policy {
 
   static constexpr execution_model_t execution_model =
       execution_model_t::frontier;
+  static constexpr algo_kind_t algorithm_kind = algo_kind_t::sssp;
+  static constexpr init_mode_t init_mode =
+      algorithm_traits<algorithm_kind>::init_mode;
   static constexpr bool assumes_nonnegative_weights = true;
 
   static constexpr value_type infinity() {

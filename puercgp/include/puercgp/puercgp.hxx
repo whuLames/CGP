@@ -24,5 +24,8 @@
 #include <puercgp/algorithms/pagerank.hxx>
 #include <puercgp/algorithms/wcc.hxx>
 #include <puercgp/algorithms/hybrid.hxx>
+#include <puercgp/algorithms/algorithm_traits.hxx>
+#include <puercgp/algorithms/dispatcher.hxx>
+#include <puercgp/algorithms/init_traits.hxx>
 
 #include <puercgp/run.hxx>
