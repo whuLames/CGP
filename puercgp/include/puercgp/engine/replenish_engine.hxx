@@ -15,7 +15,7 @@
 //   - WCC 分流：WCC 全部进首批 slot（不进 pending）；WCC slot 收敛后可复用给 BFS/SSSP
 //   - result.values 是 row-major [N*V]（values[q*V+v]），与 hybrid 的 vertex-major 不同
 //
-// 复用 hybrid_detail 的 init/push/pull kernel + reinit/snapshot helper（DRY）
+// 复用 hybrid_detail 的 init/push/pull kernel，slot I/O 通过 slot_io_manager 统一入口
 
 #include <algorithm>
 #include <chrono>
@@ -33,6 +33,7 @@
 #include <puercgp/core/types.hxx>
 #include <puercgp/engine/frontier_engine.hxx>  // detail:: helper
 #include <puercgp/engine/hybrid_engine.hxx>    // hybrid_detail:: helper + kernel
+#include <puercgp/engine/slot_io_manager.hxx>
 
 namespace puercgp {
 
@@ -385,7 +386,7 @@ class replenish_frontier_engine {
         bits &= (bits - 1);
         int orig = slot_orig_id[s];
         if (final_buffer_raw != nullptr) {
-          hd::launch_snapshot_slot_values(
+          slot_io_manager::snapshot_slot(
               s, Qi, V,
               thrust::raw_pointer_cast(values.data()),
               final_buffer_raw + static_cast<std::size_t>(orig) * V,
@@ -494,7 +495,7 @@ class replenish_frontier_engine {
     const query_mask_t clear_mask = ~clear_bits;  // 清所有收敛 bit，保留其他 slot
 
     // ===== launch 1: snapshot_and_clear_multi（一趟 O(V) 处理所有收敛 slot）=====
-    hd::launch_snapshot_and_clear_multi_slot(
+    slot_io_manager::snapshot_and_reset(
         thrust::raw_pointer_cast(conv_slots_dev.data()),
         thrust::raw_pointer_cast(conv_final_ids_dev.data()),
         k_conv, Qi, V,
@@ -520,7 +521,7 @@ class replenish_frontier_engine {
       new_sources_dev = h_srcs;
       new_sv_dev = h_sv;
 
-      hd::launch_set_sources_multi(
+      slot_io_manager::reinit_slots(
           thrust::raw_pointer_cast(new_slots_dev.data()),
           thrust::raw_pointer_cast(new_kinds_dev.data()),
           thrust::raw_pointer_cast(new_sources_dev.data()),
