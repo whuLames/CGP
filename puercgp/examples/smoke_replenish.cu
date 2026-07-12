@@ -218,10 +218,14 @@ static void run_stage3() {
       2.0f, INF   // v3
   };
   thrust::device_vector<unified_value_t> values(h_init);
+  thrust::device_vector<query_mask_t> visited_mask(
+      V, query_mask_t{1});
   thrust::device_vector<unified_value_t> final_row(V, INF);
 
-  launch_snapshot_slot_values(/*slot=*/0, Q, static_cast<std::size_t>(V),
+  launch_snapshot_slot_values(/*slot=*/0, algo_kind_t::bfs, Q,
+      static_cast<std::size_t>(V),
       thrust::raw_pointer_cast(values.data()),
+      thrust::raw_pointer_cast(visited_mask.data()),
       thrust::raw_pointer_cast(final_row.data()), /*stream=*/0);
   cudaDeviceSynchronize();
 

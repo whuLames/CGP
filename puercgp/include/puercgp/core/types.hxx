@@ -36,6 +36,9 @@ struct run_options {
   //   true          → 走 run_replenish_pipeline，slot 收敛后从 pending 队列注入新 query
   // active_union 收敛信号的记录始终开启（与开关无关），开销可忽略，便于观测。
   bool enable_replenishment = false;
+  // Minimum number of free slots accumulated before injecting a new cohort.
+  // 0 selects an engine default; 1 preserves immediate per-slot replenishment.
+  std::size_t replenish_batch_size = 0;
   // 是否丢弃完整结果（不分配 final_buffer N*V）：
   //   false（默认）→ 维护 final_buffer，slot 复用时 snapshot 存档，result.values 可用
   //   true          → 不分配 final_buffer，snapshot 的写结果跳过（clear 仍做），省 N*V 显存

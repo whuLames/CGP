@@ -136,7 +136,7 @@ __global__ void init_wcc_all_vertices_kernel(
 // bfs_slot_mask / nonbfs_slot_mask 由 host 端预算（hybrid_query_batch），
 // 作为 kernel 参数传入，O(1) 寄存器常量，避免 inner loop 查表
 // ============================================================
-template <typename graph_t>
+template <typename graph_t, bool use_start_levels = false>
 __global__ void expand_shared_node_hybrid_kernel(
     graph_t graph,
     const int* frontier_vertices,
@@ -153,6 +153,7 @@ __global__ void expand_shared_node_hybrid_kernel(
     int level,
     query_mask_t bfs_slot_mask,
     query_mask_t nonbfs_slot_mask,
+    const int* bfs_start_levels,
     query_mask_t* active_union) {
   for (std::size_t i = blockIdx.x; i < unique_count; i += gridDim.x) {
     int source = frontier_vertices[i];
@@ -176,10 +177,14 @@ __global__ void expand_shared_node_hybrid_kernel(
           while (bits != 0) {
             int q = mask_ffs(bits) - 1;
             if (q < query_count) {
+              int local_level = level + 1;
+              if constexpr (use_start_levels) {
+                local_level = level - bfs_start_levels[q] + 1;
+              }
               values[value_index(static_cast<std::size_t>(neighbor),
                                  static_cast<std::size_t>(q),
                                  static_cast<std::size_t>(query_count))] =
-                  static_cast<algorithms::unified_value_t>(level + 1);
+                  static_cast<algorithms::unified_value_t>(local_level);
             }
             bits &= (bits - 1);
           }
@@ -235,7 +240,7 @@ __global__ void expand_shared_node_hybrid_kernel(
 // update 段套用 hybrid 双路：路径 A BFS 批量 atomicOr + 路径 B 非 BFS 逐 query min-reduce
 // 相比 block 版（1 block/vertex）：高出度顶点的并行度从 1 block → 32 lane/warp
 // ============================================================
-template <typename graph_t>
+template <typename graph_t, bool use_start_levels = false>
 __global__ void expand_shared_node_warp_hybrid_kernel(
     graph_t graph,
     const int* frontier_vertices,
@@ -252,6 +257,7 @@ __global__ void expand_shared_node_warp_hybrid_kernel(
     int level,
     query_mask_t bfs_slot_mask,
     query_mask_t nonbfs_slot_mask,
+    const int* bfs_start_levels,
     query_mask_t* active_union) {
   constexpr int warp_size = 32;
   int lane = threadIdx.x & (warp_size - 1);
@@ -286,10 +292,14 @@ __global__ void expand_shared_node_warp_hybrid_kernel(
           while (bits != 0) {
             int q = mask_ffs(bits) - 1;
             if (q < query_count) {
+              int local_level = level + 1;
+              if constexpr (use_start_levels) {
+                local_level = level - bfs_start_levels[q] + 1;
+              }
               values[value_index(static_cast<std::size_t>(neighbor),
                                  static_cast<std::size_t>(q),
                                  static_cast<std::size_t>(query_count))] =
-                  static_cast<algorithms::unified_value_t>(level + 1);
+                  static_cast<algorithms::unified_value_t>(local_level);
             }
             bits &= (bits - 1);
           }
@@ -820,7 +830,7 @@ class hybrid_frontier_engine {
                     thrust::raw_pointer_cast(next_unique_count_dev.data()),
                     thrust::raw_pointer_cast(next_pair_count_dev.data()),
                     thrust::raw_pointer_cast(values.data()), views.kinds, Q,
-                    level, bfs_mask, nonbfs_mask,
+                    level, bfs_mask, nonbfs_mask, nullptr,
                     thrust::raw_pointer_cast(active_union_dev.data()));
           } else {
             hybrid_detail::expand_shared_node_hybrid_kernel<graph_t>
@@ -836,7 +846,7 @@ class hybrid_frontier_engine {
                     thrust::raw_pointer_cast(next_unique_count_dev.data()),
                     thrust::raw_pointer_cast(next_pair_count_dev.data()),
                     thrust::raw_pointer_cast(values.data()), views.kinds, Q,
-                    level, bfs_mask, nonbfs_mask,
+                    level, bfs_mask, nonbfs_mask, nullptr,
                     thrust::raw_pointer_cast(active_union_dev.data()));
           }
           push_gpu_ms = kt.end(stream);
@@ -855,7 +865,7 @@ class hybrid_frontier_engine {
                     thrust::raw_pointer_cast(next_unique_count_dev.data()),
                     thrust::raw_pointer_cast(next_pair_count_dev.data()),
                     thrust::raw_pointer_cast(values.data()), views.kinds, Q,
-                    level, bfs_mask, nonbfs_mask,
+                    level, bfs_mask, nonbfs_mask, nullptr,
                     thrust::raw_pointer_cast(active_union_dev.data()));
           } else {
             hybrid_detail::expand_shared_node_hybrid_kernel<graph_t>
@@ -871,7 +881,7 @@ class hybrid_frontier_engine {
                     thrust::raw_pointer_cast(next_unique_count_dev.data()),
                     thrust::raw_pointer_cast(next_pair_count_dev.data()),
                     thrust::raw_pointer_cast(values.data()), views.kinds, Q,
-                    level, bfs_mask, nonbfs_mask,
+                    level, bfs_mask, nonbfs_mask, nullptr,
                     thrust::raw_pointer_cast(active_union_dev.data()));
           }
         }

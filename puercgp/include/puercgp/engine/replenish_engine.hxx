@@ -53,9 +53,16 @@ class replenish_frontier_engine {
     if (N == 0) {
       throw std::invalid_argument("replenish: query list must be non-empty");
     }
-    const std::size_t Q = std::min(N, std::size_t{64});
+    const std::size_t slot_capacity =
+        options.max_queries == 0
+            ? std::size_t{64}
+            : std::min(options.max_queries, std::size_t{64});
+    if (slot_capacity == 0) {
+      throw std::invalid_argument("replenish: max_queries must be positive");
+    }
+    const std::size_t Q = std::min(N, slot_capacity);
     const auto V = static_cast<std::size_t>(graph.get_number_of_vertices());
-    const int Qi = static_cast<int>(Q);
+    int active_query_count = static_cast<int>(Q);
 
     // ===== WCC 分流：WCC 进首批 slot（不进 pending），非 WCC 填剩余 slot + pending =====
     std::vector<std::size_t> wcc_idx, nonwcc_idx;
@@ -115,6 +122,7 @@ class replenish_frontier_engine {
     thrust::device_vector<unsigned long long> next_unique_count_dev(1);
     thrust::device_vector<unsigned long long> next_pair_count_dev(1);
     thrust::device_vector<query_mask_t> active_union_dev(1);
+    thrust::device_vector<int> slot_start_levels(Q, 0);
     thrust::device_vector<unsigned long long> unique_flags(V);
     thrust::device_vector<unsigned long long> pair_counts_buf(V);
     thrust::device_vector<unsigned long long> unique_offsets(V);
@@ -130,7 +138,9 @@ class replenish_frontier_engine {
     // replenishment 批量调度 device buffer（优化1+2+3）
     thrust::device_vector<int> conv_slots_dev(Q);        // 本轮收敛 slot 列表
     thrust::device_vector<int> conv_final_ids_dev(Q);    // 每个 slot 的 orig query id
+    thrust::device_vector<algorithms::algo_kind_t> conv_kinds_dev(Q);
     thrust::device_vector<int> new_slots_dev(Q);         // 要注入的 slot
+    thrust::device_vector<int> value_reset_slots_dev(Q);
     thrust::device_vector<algorithms::algo_kind_t> new_kinds_dev(Q);
     thrust::device_vector<int> new_sources_dev(Q);
     thrust::device_vector<algorithms::unified_value_t> new_sv_dev(Q);
@@ -164,7 +174,7 @@ class replenish_frontier_engine {
 
     hd::init_hybrid_sources_kernel<<<hd::grid_for(Q, threads), threads, 0,
                                      stream>>>(
-        views.sources, views.kinds, views.source_values, Qi,
+        views.sources, views.kinds, views.source_values, active_query_count,
         thrust::raw_pointer_cast(values.data()),
         thrust::raw_pointer_cast(visited_mask.data()),
         thrust::raw_pointer_cast(frontier_mask.data()),
@@ -175,7 +185,7 @@ class replenish_frontier_engine {
     if (batch.has_wcc()) {
       hd::init_wcc_all_vertices_kernel<<<hd::grid_for(V * Q, threads), threads,
                                          0, stream>>>(
-          graph, views.kinds, Qi,
+          graph, views.kinds, active_query_count,
           thrust::raw_pointer_cast(values.data()),
           thrust::raw_pointer_cast(frontier_mask.data()),
           thrust::raw_pointer_cast(frontier_vertices.data()),
@@ -214,6 +224,12 @@ class replenish_frontier_engine {
     std::vector<int> completion_level(N, -1);   // per original query
     std::vector<float> completion_wall(N, -1.0f);  // per query 完成时刻（latency，相对 latency_start）
     std::size_t pending_head = 0;               // pending FIFO 出队指针
+    std::vector<int> reusable_slots;
+    reusable_slots.reserve(Q);
+    const std::size_t replenish_batch_size =
+        options.replenish_batch_size == 0
+            ? std::max<std::size_t>(1, Q - wcc_idx.size())
+            : std::min(options.replenish_batch_size, Q);
 
     // ===== 主循环（slot 复用调度）=====
     result_t result;
@@ -252,7 +268,7 @@ class replenish_frontier_engine {
         reset_counter_kernel<<<1, 1, 0, stream>>>(
             thrust::raw_pointer_cast(next_unique_count_dev.data()));
         hd::launch_fused_pull_hybrid(
-            graph, Qi, thrust::raw_pointer_cast(values.data()), views.kinds,
+            graph, active_query_count, thrust::raw_pointer_cast(values.data()), views.kinds,
             thrust::raw_pointer_cast(visited_mask.data()),
             thrust::raw_pointer_cast(next_frontier_mask.data()),
             thrust::raw_pointer_cast(unique_flags.data()),
@@ -293,14 +309,18 @@ class replenish_frontier_engine {
 
         // 调度段
         h_active_slot_mask = dispatch_converged(
-            h_active_slot_mask, h_union, level, Q, V, graph, stream, context,
+            h_active_slot_mask, h_union, level, active_query_count, V, graph,
+            stream, context,
             views, batch, bfs_mask, nonbfs_mask, values, visited_mask,
             frontier_mask, next_frontier_mask, frontier_vertices,
             next_unique_count_dev, active_union_dev, final_buffer_raw, slot_orig_id,
             pending, pending_orig_id, pending_head, completion_level,
             completion_wall, latency_start, current_unique,
             conv_slots_dev, conv_final_ids_dev, new_slots_dev,
-            new_kinds_dev, new_sources_dev, new_sv_dev);
+            value_reset_slots_dev, conv_kinds_dev, new_kinds_dev,
+            new_sources_dev, new_sv_dev,
+            options.traversal_mode != traversal_mode_t::push,
+            reusable_slots, replenish_batch_size, slot_start_levels);
       } else {
         reset_counter_kernel<<<1, 1, 0, stream>>>(
             thrust::raw_pointer_cast(next_unique_count_dev.data()));
@@ -310,7 +330,7 @@ class replenish_frontier_engine {
         const bool use_warp =
             options.push_strategy == push_strategy_t::shared_node_warp;
         if (use_warp) {
-          hd::expand_shared_node_warp_hybrid_kernel<graph_t>
+          hd::expand_shared_node_warp_hybrid_kernel<graph_t, true>
               <<<hd::grid_for(current_unique * 32, threads), threads, 0,
                  stream>>>(
                   graph,
@@ -321,11 +341,13 @@ class replenish_frontier_engine {
                   thrust::raw_pointer_cast(next_frontier_vertices.data()),
                   thrust::raw_pointer_cast(next_unique_count_dev.data()),
                   thrust::raw_pointer_cast(next_pair_count_dev.data()),
-                  thrust::raw_pointer_cast(values.data()), views.kinds, Qi,
+                  thrust::raw_pointer_cast(values.data()), views.kinds,
+                  active_query_count,
                   level, bfs_mask, nonbfs_mask,
+                  thrust::raw_pointer_cast(slot_start_levels.data()),
                   thrust::raw_pointer_cast(active_union_dev.data()));
         } else {
-          hd::expand_shared_node_hybrid_kernel<graph_t>
+          hd::expand_shared_node_hybrid_kernel<graph_t, true>
               <<<hd::grid_for(current_unique, threads), threads, 0, stream>>>(
                   graph,
                   thrust::raw_pointer_cast(frontier_vertices.data()),
@@ -335,8 +357,10 @@ class replenish_frontier_engine {
                   thrust::raw_pointer_cast(next_frontier_vertices.data()),
                   thrust::raw_pointer_cast(next_unique_count_dev.data()),
                   thrust::raw_pointer_cast(next_pair_count_dev.data()),
-                  thrust::raw_pointer_cast(values.data()), views.kinds, Qi,
+                  thrust::raw_pointer_cast(values.data()), views.kinds,
+                  active_query_count,
                   level, bfs_mask, nonbfs_mask,
+                  thrust::raw_pointer_cast(slot_start_levels.data()),
                   thrust::raw_pointer_cast(active_union_dev.data()));
         }
         hd::throw_if_cuda_error(cudaGetLastError(), "expand_hybrid");
@@ -362,14 +386,18 @@ class replenish_frontier_engine {
         current_unique = static_cast<std::size_t>(h_next_uc);
 
         h_active_slot_mask = dispatch_converged(
-            h_active_slot_mask, h_union, level, Q, V, graph, stream, context,
+            h_active_slot_mask, h_union, level, active_query_count, V, graph,
+            stream, context,
             views, batch, bfs_mask, nonbfs_mask, values, visited_mask,
             frontier_mask, next_frontier_mask, frontier_vertices,
             next_unique_count_dev, active_union_dev, final_buffer_raw, slot_orig_id,
             pending, pending_orig_id, pending_head, completion_level,
             completion_wall, latency_start, current_unique,
             conv_slots_dev, conv_final_ids_dev, new_slots_dev,
-            new_kinds_dev, new_sources_dev, new_sv_dev);
+            value_reset_slots_dev, conv_kinds_dev, new_kinds_dev,
+            new_sources_dev, new_sv_dev,
+            options.traversal_mode != traversal_mode_t::push,
+            reusable_slots, replenish_batch_size, slot_start_levels);
       }
 
       if (options.profile_iterations) {
@@ -387,8 +415,9 @@ class replenish_frontier_engine {
         int orig = slot_orig_id[s];
         if (final_buffer_raw != nullptr) {
           slot_io_manager::snapshot_slot(
-              s, Qi, V,
+              s, batch[static_cast<std::size_t>(s)].kind, active_query_count, V,
               thrust::raw_pointer_cast(values.data()),
+              thrust::raw_pointer_cast(visited_mask.data()),
               final_buffer_raw + static_cast<std::size_t>(orig) * V,
               stream);
         }
@@ -423,7 +452,8 @@ class replenish_frontier_engine {
   template <typename graph_t>
   static query_mask_t dispatch_converged(
       query_mask_t h_active_slot_mask, query_mask_t h_union, int level,
-      std::size_t Q, std::size_t V, graph_t& graph, cudaStream_t stream,
+      int& active_query_count, std::size_t V, graph_t& graph,
+      cudaStream_t stream,
       execution_context& context,
       hybrid_query_batch::device_views& views, hybrid_query_batch& batch,
       query_mask_t& bfs_mask, query_mask_t& nonbfs_mask,
@@ -445,12 +475,17 @@ class replenish_frontier_engine {
       thrust::device_vector<int>& conv_slots_dev,
       thrust::device_vector<int>& conv_final_ids_dev,
       thrust::device_vector<int>& new_slots_dev,
+      thrust::device_vector<int>& value_reset_slots_dev,
+      thrust::device_vector<algorithms::algo_kind_t>& conv_kinds_dev,
       thrust::device_vector<algorithms::algo_kind_t>& new_kinds_dev,
       thrust::device_vector<int>& new_sources_dev,
-      thrust::device_vector<algorithms::unified_value_t>& new_sv_dev) {
-    (void)graph;  // 批量 kernel 不依赖图结构
+      thrust::device_vector<algorithms::unified_value_t>& new_sv_dev,
+      bool reset_all_values,
+      std::vector<int>& reusable_slots,
+      std::size_t replenish_batch_size,
+      thrust::device_vector<int>& slot_start_levels) {
     namespace hd = puercgp::hybrid_detail;
-    const int Qi = static_cast<int>(Q);
+    const int Qi = active_query_count;
 
     query_mask_t converged = h_active_slot_mask & ~h_union;
     if (converged == 0) {
@@ -460,24 +495,117 @@ class replenish_frontier_engine {
     // ===== host 收集本轮收敛 slot + 决定注入哪些 pending（一趟遍历 mask）=====
     std::vector<int> h_conv_slots;
     std::vector<int> h_conv_ids;        // snapshot 目标 orig query id
+    std::vector<algorithms::algo_kind_t> h_conv_kinds;
     std::vector<int> h_new_slots;       // 要 reinit 的 slot
     std::vector<query_descriptor_t> h_new_descs;
     std::vector<int> h_new_orig_ids;
-    query_mask_t clear_bits = 0;        // 所有收敛 slot 的 bit 并集
     query_mask_t bits = converged;
     while (bits != 0) {
       int s = __builtin_ffsll(static_cast<long long>(bits)) - 1;
       bits &= (bits - 1);
       h_conv_slots.push_back(s);
       h_conv_ids.push_back(slot_orig_id[s]);
+      h_conv_kinds.push_back(batch[static_cast<std::size_t>(s)].kind);
       int orig_id = slot_orig_id[s];
       completion_level[orig_id] = level + 1;
       completion_wall[orig_id] = std::chrono::duration<float, std::milli>(
           std::chrono::high_resolution_clock::now() - latency_start).count();
       h_active_slot_mask &= ~(query_mask_t{1} << s);
-      clear_bits |= (query_mask_t{1} << s);  // host 端位运算（query_bit 是 device 函数）
-      if (pending_head < pending.size()) {
-        query_descriptor_t nd = pending[pending_head];
+      reusable_slots.push_back(s);
+    }
+
+    const int k_conv = static_cast<int>(h_conv_slots.size());
+
+    // Snapshot all completed queries, but reset only slots that will be reused.
+    if (final_buffer_raw != nullptr) {
+      conv_slots_dev = h_conv_slots;
+      conv_final_ids_dev = h_conv_ids;
+      conv_kinds_dev = h_conv_kinds;
+      slot_io_manager::snapshot_slots(
+          thrust::raw_pointer_cast(conv_slots_dev.data()),
+          thrust::raw_pointer_cast(conv_final_ids_dev.data()),
+          thrust::raw_pointer_cast(conv_kinds_dev.data()),
+          k_conv, Qi, V,
+          thrust::raw_pointer_cast(values.data()),
+          thrust::raw_pointer_cast(visited_mask.data()),
+          final_buffer_raw, V, stream);
+    }
+
+    const std::size_t pending_count = pending.size() - pending_head;
+    if (h_active_slot_mask == 0 && pending_count > 0 &&
+        pending_count < static_cast<std::size_t>(active_query_count)) {
+      std::vector<query_descriptor_t> tail_descs;
+      tail_descs.reserve(pending_count);
+      for (std::size_t i = 0; i < pending_count; ++i) {
+        tail_descs.push_back(pending[pending_head + i]);
+        slot_orig_id[i] = pending_orig_id[pending_head + i];
+      }
+      pending_head += pending_count;
+      active_query_count = static_cast<int>(pending_count);
+      batch = hybrid_query_batch(std::move(tail_descs));
+      batch.validate();
+      views = batch.upload_to_device();
+      bfs_mask = batch.bfs_slot_mask();
+      nonbfs_mask = batch.nonbfs_slot_mask();
+      reusable_slots.clear();
+      thrust::fill(thrust::cuda::par.on(stream), slot_start_levels.begin(),
+                   slot_start_levels.begin() + active_query_count, level + 1);
+
+      constexpr int tail_threads = 256;
+      const std::size_t tail_value_count =
+          V * static_cast<std::size_t>(active_query_count);
+      hd::fill_unified_kernel<<<hd::grid_for(tail_value_count, tail_threads),
+                                tail_threads, 0, stream>>>(
+          thrust::raw_pointer_cast(values.data()), tail_value_count);
+      const std::size_t mask_bytes = V * sizeof(query_mask_t);
+      hd::throw_if_cuda_error(
+          cudaMemsetAsync(thrust::raw_pointer_cast(visited_mask.data()), 0,
+                          mask_bytes, stream),
+          "memset visited (tail compact)");
+      hd::throw_if_cuda_error(
+          cudaMemsetAsync(thrust::raw_pointer_cast(frontier_mask.data()), 0,
+                          mask_bytes, stream),
+          "memset frontier (tail compact)");
+      hd::throw_if_cuda_error(
+          cudaMemsetAsync(thrust::raw_pointer_cast(next_frontier_mask.data()), 0,
+                          mask_bytes, stream),
+          "memset next frontier (tail compact)");
+      detail::reset_counter_kernel<<<1, 1, 0, stream>>>(
+          thrust::raw_pointer_cast(unique_count_dev.data()));
+      hd::init_hybrid_sources_kernel
+          <<<hd::grid_for(static_cast<std::size_t>(active_query_count),
+                          tail_threads),
+             tail_threads, 0, stream>>>(
+              views.sources, views.kinds, views.source_values,
+              active_query_count, thrust::raw_pointer_cast(values.data()),
+              thrust::raw_pointer_cast(visited_mask.data()),
+              thrust::raw_pointer_cast(frontier_mask.data()),
+              thrust::raw_pointer_cast(frontier_vertices.data()),
+              thrust::raw_pointer_cast(unique_count_dev.data()));
+      hd::throw_if_cuda_error(cudaGetLastError(), "init tail cohort");
+
+      unsigned long long h_uc = 0;
+      hd::throw_if_cuda_error(
+          cudaMemcpyAsync(&h_uc,
+                          thrust::raw_pointer_cast(unique_count_dev.data()),
+                          sizeof(unsigned long long), cudaMemcpyDeviceToHost,
+                          stream),
+          "memcpy unique_count (tail compact)");
+      context.synchronize();
+      current_unique = static_cast<std::size_t>(h_uc);
+      return active_query_count == 64
+                 ? ~query_mask_t{0}
+                 : ((query_mask_t{1} << active_query_count) - 1);
+    }
+    const bool launch_cohort =
+        reusable_slots.size() >= replenish_batch_size ||
+        h_active_slot_mask == 0;
+    if (launch_cohort && pending_count > 0) {
+      const std::size_t cohort_size =
+          std::min(reusable_slots.size(), pending_count);
+      for (std::size_t i = 0; i < cohort_size; ++i) {
+        int s = reusable_slots[i];
+        const query_descriptor_t& nd = pending[pending_head];
         if (nd.kind == algorithms::algo_kind_t::wcc) {
           throw std::logic_error("WCC must not enter pending queue");
         }
@@ -486,24 +614,9 @@ class replenish_frontier_engine {
         h_new_orig_ids.push_back(pending_orig_id[pending_head]);
         ++pending_head;
       }
+      reusable_slots.erase(reusable_slots.begin(),
+                           reusable_slots.begin() + cohort_size);
     }
-
-    // upload 收敛 slot 列表 + final 目标行
-    conv_slots_dev = h_conv_slots;
-    conv_final_ids_dev = h_conv_ids;
-    const int k_conv = static_cast<int>(h_conv_slots.size());
-    const query_mask_t clear_mask = ~clear_bits;  // 清所有收敛 bit，保留其他 slot
-
-    // ===== launch 1: snapshot_and_clear_multi（一趟 O(V) 处理所有收敛 slot）=====
-    slot_io_manager::snapshot_and_reset(
-        thrust::raw_pointer_cast(conv_slots_dev.data()),
-        thrust::raw_pointer_cast(conv_final_ids_dev.data()),
-        k_conv, Qi, V,
-        thrust::raw_pointer_cast(values.data()),
-        thrust::raw_pointer_cast(visited_mask.data()),
-        thrust::raw_pointer_cast(frontier_mask.data()),
-        thrust::raw_pointer_cast(next_frontier_mask.data()),
-        final_buffer_raw, V, clear_mask, stream);
 
     // ===== launch 2: set_sources_multi（仅对要注入的 slot）=====
     const int k_new = static_cast<int>(h_new_slots.size());
@@ -511,15 +624,45 @@ class replenish_frontier_engine {
       std::vector<int> h_srcs(k_new);
       std::vector<algorithms::algo_kind_t> h_kinds(k_new);
       std::vector<algorithms::unified_value_t> h_sv(k_new);
+      std::vector<int> h_value_reset_slots;
+      query_mask_t visited_clear_bits = 0;
       for (int i = 0; i < k_new; ++i) {
         h_srcs[i] = h_new_descs[i].source;
         h_kinds[i] = h_new_descs[i].kind;
         h_sv[i] = h_new_descs[i].source_value;
+        const int slot = h_new_slots[i];
+        if (reset_all_values || h_new_descs[i].kind != algorithms::algo_kind_t::bfs) {
+          h_value_reset_slots.push_back(slot);
+        }
+        if (h_new_descs[i].kind == algorithms::algo_kind_t::bfs) {
+          visited_clear_bits |= (query_mask_t{1} << slot);
+        }
       }
       new_slots_dev = h_new_slots;
+      value_reset_slots_dev = h_value_reset_slots;
       new_kinds_dev = h_kinds;
       new_sources_dev = h_srcs;
       new_sv_dev = h_sv;
+
+      const bool reset_full_cohort =
+          k_new == Qi && h_active_slot_mask == 0;
+      if (reset_full_cohort) {
+        constexpr int reset_threads = 256;
+        const std::size_t value_count = V * static_cast<std::size_t>(Qi);
+        hd::fill_unified_kernel
+            <<<hd::grid_for(value_count, reset_threads), reset_threads, 0,
+               stream>>>(thrust::raw_pointer_cast(values.data()), value_count);
+        hd::throw_if_cuda_error(
+            cudaMemsetAsync(thrust::raw_pointer_cast(visited_mask.data()), 0,
+                            V * sizeof(query_mask_t), stream),
+            "memset visited (full replenish cohort)");
+      } else {
+        slot_io_manager::reset_reused_slots(
+            thrust::raw_pointer_cast(value_reset_slots_dev.data()),
+            static_cast<int>(h_value_reset_slots.size()), visited_clear_bits,
+            Qi, V, thrust::raw_pointer_cast(values.data()),
+            thrust::raw_pointer_cast(visited_mask.data()), stream);
+      }
 
       slot_io_manager::reinit_slots(
           thrust::raw_pointer_cast(new_slots_dev.data()),
@@ -531,15 +674,17 @@ class replenish_frontier_engine {
           thrust::raw_pointer_cast(visited_mask.data()),
           thrust::raw_pointer_cast(frontier_mask.data()),
           thrust::raw_pointer_cast(frontier_vertices.data()),
-          thrust::raw_pointer_cast(unique_count_dev.data()), stream);
+          thrust::raw_pointer_cast(unique_count_dev.data()),
+          thrust::raw_pointer_cast(slot_start_levels.data()), level + 1,
+          stream);
 
       // host 端更新 slot 元数据 + active mask + device slot_kinds
       for (int i = 0; i < k_new; ++i) {
         int s = h_new_slots[i];
         slot_orig_id[s] = h_new_orig_ids[i];
         h_active_slot_mask |= (query_mask_t{1} << s);
-        views = batch.update_slot(s, h_new_descs[i]);
       }
+      views = batch.update_slots(h_new_slots, h_new_descs);
       bfs_mask = batch.bfs_slot_mask();
       nonbfs_mask = batch.nonbfs_slot_mask();
 
@@ -554,8 +699,8 @@ class replenish_frontier_engine {
       context.synchronize();
       current_unique = static_cast<std::size_t>(h_uc);
     } else {
-      // 无注入，仅等 snapshot_and_clear 完成
-      context.synchronize();
+      // Only a result snapshot may be pending; discard mode has no device work.
+      if (final_buffer_raw != nullptr) context.synchronize();
     }
 
     return h_active_slot_mask;

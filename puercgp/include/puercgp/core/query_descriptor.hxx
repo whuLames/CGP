@@ -123,6 +123,20 @@ class hybrid_query_batch {
     return upload_to_device();
   }
 
+  device_views update_slots(const std::vector<int>& slots,
+                            const std::vector<query_descriptor_t>& descs) {
+    if (slots.size() != descs.size()) {
+      throw std::invalid_argument("update_slots: size mismatch");
+    }
+    for (std::size_t i = 0; i < slots.size(); ++i) {
+      if (slots[i] < 0 || static_cast<std::size_t>(slots[i]) >= descs_.size()) {
+        throw std::out_of_range("update_slots: slot index out of range");
+      }
+      descs_[static_cast<std::size_t>(slots[i])] = descs[i];
+    }
+    return upload_to_device();
+  }
+
   bool has_bfs() const {
     for (const auto& d : descs_) {
       if (d.kind == algorithms::algo_kind_t::bfs) return true;

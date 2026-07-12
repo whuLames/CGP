@@ -100,7 +100,9 @@ void launch_reinit_single_slot(graph_t graph,
 
 __global__ void snapshot_slot_values_kernel(
     const algorithms::unified_value_t* values,
+    const query_mask_t* visited_mask,
     int slot,
+    algorithms::algo_kind_t kind,
     int query_count,
     std::size_t vertex_count,
     algorithms::unified_value_t* final_row) {
@@ -108,57 +110,84 @@ __global__ void snapshot_slot_values_kernel(
   std::size_t stride = blockDim.x * gridDim.x;
   std::size_t q_stride = static_cast<std::size_t>(query_count);
   for (std::size_t v = tid; v < vertex_count; v += stride) {
-    final_row[v] = values[value_index(v, static_cast<std::size_t>(slot),
-                                      q_stride)];
+    const bool bfs_unvisited =
+        kind == algorithms::algo_kind_t::bfs &&
+        (visited_mask[v] & query_bit(slot)) == 0;
+    final_row[v] = bfs_unvisited
+                       ? algorithms::unified_infinity()
+                       : values[value_index(v, static_cast<std::size_t>(slot),
+                                            q_stride)];
   }
 }
 
 inline void launch_snapshot_slot_values(
     int slot,
+    algorithms::algo_kind_t kind,
     int query_count,
     std::size_t vertex_count,
     const algorithms::unified_value_t* values,
+    const query_mask_t* visited_mask,
     algorithms::unified_value_t* final_row,
     cudaStream_t stream) {
   constexpr int threads = 256;
   snapshot_slot_values_kernel<<<grid_for(vertex_count, threads), threads, 0,
                                 stream>>>(
-      values, slot, query_count, vertex_count, final_row);
+      values, visited_mask, slot, kind, query_count, vertex_count, final_row);
   throw_if_cuda_error(cudaGetLastError(), "snapshot_slot_values");
 }
 
-__global__ void snapshot_and_clear_multi_slot_kernel(
+__global__ void snapshot_multi_slot_kernel(
     const int* converged_slots,
     const int* final_query_ids,
+    const algorithms::algo_kind_t* converged_kinds,
     int num_converged,
     int query_count,
     std::size_t vertex_count,
-    algorithms::unified_value_t* values,
-    query_mask_t* visited_mask,
-    query_mask_t* frontier_mask,
-    query_mask_t* next_frontier_mask,
+    const algorithms::unified_value_t* values,
+    const query_mask_t* visited_mask,
     algorithms::unified_value_t* final_buffer,
-    std::size_t final_row_stride,
-    query_mask_t clear_mask) {
+    std::size_t final_row_stride) {
   std::size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
   std::size_t stride = blockDim.x * gridDim.x;
   std::size_t q_stride = static_cast<std::size_t>(query_count);
-  unsigned long long clear_ll = static_cast<unsigned long long>(clear_mask);
   for (std::size_t v = tid; v < vertex_count; v += stride) {
     for (int i = 0; i < num_converged; ++i) {
       int s = converged_slots[i];
       std::size_t pos = value_index(v, static_cast<std::size_t>(s), q_stride);
       std::size_t final_pos =
           static_cast<std::size_t>(final_query_ids[i]) * final_row_stride + v;
-      if (final_buffer != nullptr) final_buffer[final_pos] = values[pos];
-      values[pos] = algorithms::unified_infinity();
+      const bool bfs_unvisited =
+          converged_kinds[i] == algorithms::algo_kind_t::bfs &&
+          (visited_mask[v] & query_bit(s)) == 0;
+      final_buffer[final_pos] =
+          bfs_unvisited ? algorithms::unified_infinity() : values[pos];
     }
-    atomicAnd(reinterpret_cast<unsigned long long*>(visited_mask + v),
-              clear_ll);
-    atomicAnd(reinterpret_cast<unsigned long long*>(frontier_mask + v),
-              clear_ll);
-    atomicAnd(reinterpret_cast<unsigned long long*>(next_frontier_mask + v),
-              clear_ll);
+  }
+}
+
+__global__ void reset_reused_slots_kernel(
+    const int* value_reset_slots,
+    int num_value_reset_slots,
+    int query_count,
+    std::size_t vertex_count,
+    algorithms::unified_value_t* values,
+    query_mask_t* visited_mask,
+    query_mask_t visited_keep_mask) {
+  std::size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+  std::size_t stride = blockDim.x * gridDim.x;
+  std::size_t q_stride = static_cast<std::size_t>(query_count);
+  const unsigned long long keep_ll =
+      static_cast<unsigned long long>(visited_keep_mask);
+  for (std::size_t v = tid; v < vertex_count; v += stride) {
+    for (int i = 0; i < num_value_reset_slots; ++i) {
+      int s = value_reset_slots[i];
+      values[value_index(v, static_cast<std::size_t>(s), q_stride)] =
+          algorithms::unified_infinity();
+    }
+    if (visited_keep_mask != ~query_mask_t{0}) {
+      atomicAnd(reinterpret_cast<unsigned long long*>(visited_mask + v),
+                keep_ll);
+    }
   }
 }
 
@@ -173,12 +202,15 @@ __global__ void set_sources_multi_kernel(
     query_mask_t* visited_mask,
     query_mask_t* frontier_mask,
     int* frontier_vertices,
-    unsigned long long* unique_count) {
+    unsigned long long* unique_count,
+    int* slot_start_levels,
+    int start_level) {
   std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= static_cast<std::size_t>(num_slots)) return;
   int s = slots[i];
   int src = sources[i];
   query_mask_t bit = query_bit(s);
+  slot_start_levels[s] = start_level;
   std::size_t q_stride = static_cast<std::size_t>(query_count);
   values[value_index(static_cast<std::size_t>(src),
                      static_cast<std::size_t>(s), q_stride)] = source_values[i];
@@ -192,22 +224,34 @@ __global__ void set_sources_multi_kernel(
   }
 }
 
-inline void launch_snapshot_and_clear_multi_slot(
+inline void launch_snapshot_multi_slot(
     const int* converged_slots, const int* final_query_ids, int num_converged,
+    const algorithms::algo_kind_t* converged_kinds,
     int query_count, std::size_t vertex_count,
-    algorithms::unified_value_t* values,
-    query_mask_t* visited_mask, query_mask_t* frontier_mask,
-    query_mask_t* next_frontier_mask,
-    algorithms::unified_value_t* final_buffer, std::size_t final_row_stride,
-    query_mask_t clear_mask, cudaStream_t stream) {
-  if (num_converged <= 0) return;
+    const algorithms::unified_value_t* values,
+    const query_mask_t* visited_mask, algorithms::unified_value_t* final_buffer,
+    std::size_t final_row_stride, cudaStream_t stream) {
+  if (num_converged <= 0 || final_buffer == nullptr) return;
   constexpr int threads = 256;
-  snapshot_and_clear_multi_slot_kernel<<<grid_for(vertex_count, threads),
-                                         threads, 0, stream>>>(
-      converged_slots, final_query_ids, num_converged, query_count, vertex_count,
-      values, visited_mask, frontier_mask, next_frontier_mask, final_buffer,
-      final_row_stride, clear_mask);
-  throw_if_cuda_error(cudaGetLastError(), "snapshot_and_clear_multi_slot");
+  snapshot_multi_slot_kernel<<<grid_for(vertex_count, threads), threads, 0,
+                               stream>>>(
+      converged_slots, final_query_ids, converged_kinds, num_converged, query_count,
+      vertex_count, values, visited_mask, final_buffer, final_row_stride);
+  throw_if_cuda_error(cudaGetLastError(), "snapshot_multi_slot");
+}
+
+inline void launch_reset_reused_slots(
+    const int* value_reset_slots, int num_value_reset_slots,
+    query_mask_t visited_clear_bits, int query_count,
+    std::size_t vertex_count, algorithms::unified_value_t* values,
+    query_mask_t* visited_mask, cudaStream_t stream) {
+  if (num_value_reset_slots <= 0 && visited_clear_bits == 0) return;
+  constexpr int threads = 256;
+  reset_reused_slots_kernel<<<grid_for(vertex_count, threads), threads, 0,
+                              stream>>>(
+      value_reset_slots, num_value_reset_slots, query_count, vertex_count,
+      values, visited_mask, ~visited_clear_bits);
+  throw_if_cuda_error(cudaGetLastError(), "reset_reused_slots");
 }
 
 inline void launch_set_sources_multi(
@@ -217,13 +261,15 @@ inline void launch_set_sources_multi(
     algorithms::unified_value_t* values,
     query_mask_t* visited_mask, query_mask_t* frontier_mask,
     int* frontier_vertices, unsigned long long* unique_count,
+    int* slot_start_levels, int start_level,
     cudaStream_t stream) {
   if (num_slots <= 0) return;
   constexpr int threads = 64;
   set_sources_multi_kernel<<<grid_for(num_slots, threads), threads, 0,
                              stream>>>(
       slots, kinds, sources, source_values, num_slots, query_count, values,
-      visited_mask, frontier_mask, frontier_vertices, unique_count);
+      visited_mask, frontier_mask, frontier_vertices, unique_count,
+      slot_start_levels, start_level);
   throw_if_cuda_error(cudaGetLastError(), "set_sources_multi");
 }
 

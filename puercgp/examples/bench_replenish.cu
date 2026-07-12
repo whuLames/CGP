@@ -106,8 +106,9 @@ int main(int argc, char** argv) {
   }
   const std::string matrix = argv[1];
   int bfs_count = 100, sssp_count = 96, wcc_count = 0, seed = 42;
-  int chain_length = 0, batch_size = 32, repeats = 5, warmup = 1;
-  std::string mode_text = "push", push_text = "warp";
+  int chain_length = 0, batch_size = 32, replenish_chunk = 0;
+  int repeats = 5, warmup = 1;
+  std::string mode_text = "push", push_text = "warp", run_text = "both";
   bool discard = true;
   for (int i = 2; i < argc; ++i) {
     std::string a = argv[i];
@@ -120,14 +121,23 @@ int main(int argc, char** argv) {
     else if (a.rfind("--seed=", 0) == 0) seed = getv("--seed=");
     else if (a.rfind("--chain-length=", 0) == 0) chain_length = getv("--chain-length=");
     else if (a.rfind("--batch-size=", 0) == 0) batch_size = getv("--batch-size=");
+    else if (a.rfind("--replenish-chunk=", 0) == 0)
+      replenish_chunk = getv("--replenish-chunk=");
     else if (a.rfind("--repeats=", 0) == 0) repeats = getv("--repeats=");
     else if (a.rfind("--warmup=", 0) == 0) warmup = getv("--warmup=");
     else if (a.rfind("--mode=", 0) == 0) mode_text = a.substr(7);
     else if (a.rfind("--push=", 0) == 0) push_text = a.substr(7);
+    else if (a.rfind("--run=", 0) == 0) run_text = a.substr(6);
     else if (a == "--discard-results") discard = true;
     else if (a == "--no-discard") discard = false;
   }
   const int total = bfs_count + sssp_count + wcc_count;
+  if (run_text != "both" && run_text != "sequential" &&
+      run_text != "replenish") {
+    throw std::invalid_argument("run must be both/sequential/replenish");
+  }
+  const bool run_seq = run_text != "replenish";
+  const bool run_repl = run_text != "sequential";
 
   const bool build_pull_adjacency = mode_text != "push";
   auto graph =
@@ -157,7 +167,8 @@ int main(int argc, char** argv) {
   std::cout << "total=" << total << " (bfs=" << bfs_count << " sssp=" << sssp_count
             << " wcc=" << wcc_count << ") batch_size=" << batch_size
             << " seed=" << seed << " discard=" << (discard ? "on" : "off")
-            << " mode=" << mode_text << " push=" << push_text << "\n";
+            << " mode=" << mode_text << " push=" << push_text
+            << " run=" << run_text << "\n";
   std::cout << "sequential batches: " << (total + batch_size - 1) / batch_size
             << "\n\n";
 
@@ -170,11 +181,16 @@ int main(int argc, char** argv) {
   run_options opt_repl = opt;
   opt_repl.enable_replenishment = true;
   opt_repl.discard_results = discard;
+  opt_repl.max_queries = static_cast<std::size_t>(batch_size);
+  opt_repl.replenish_batch_size =
+      replenish_chunk > 0 ? static_cast<std::size_t>(replenish_chunk) : 0;
 
   // warmup
   for (int w = 0; w < warmup; ++w) {
-    (void)run_sequential(graph, total, all_descs, batch_size, ctx, opt);
-    (void)run_replenish_pipeline(graph_view, all_descs, ctx, opt_repl);
+    if (run_seq)
+      (void)run_sequential(graph, total, all_descs, batch_size, ctx, opt);
+    if (run_repl)
+      (void)run_replenish_pipeline(graph_view, all_descs, ctx, opt_repl);
   }
 
   // repeats：记录每次 wall + 最后一次 latency 分布 + WCC 收敛轮次
@@ -183,27 +199,35 @@ int main(int argc, char** argv) {
   int last_repl_iterations = 0;
   std::vector<int> last_wcc_levels;
   for (int r = 0; r < repeats; ++r) {
-    auto [slat, sw] = run_sequential(graph, total, all_descs, batch_size, ctx, opt);
-    seq_walls.push_back(sw);
-    last_seq_lat = std::move(slat);
-    auto rr = run_replenish_pipeline(graph_view, all_descs, ctx, opt_repl);
-    repl_walls.push_back(rr.wall_time_ms);
-    last_repl_iterations = rr.iterations;
-    last_repl_lat.clear();
-    for (std::size_t i = 0; i < static_cast<std::size_t>(total); ++i)
-      last_repl_lat.push_back(rr.queries[i].completion_wall_time_ms);
-    last_wcc_levels.clear();
-    for (int i = 0; i < wcc_count; ++i) {
-      std::size_t idx = static_cast<std::size_t>(bfs_count + sssp_count + i);
-      last_wcc_levels.push_back(rr.queries[idx].completion_level);
+    if (run_seq) {
+      auto [slat, sw] =
+          run_sequential(graph, total, all_descs, batch_size, ctx, opt);
+      seq_walls.push_back(sw);
+      last_seq_lat = std::move(slat);
+    }
+    if (run_repl) {
+      auto rr = run_replenish_pipeline(graph_view, all_descs, ctx, opt_repl);
+      repl_walls.push_back(rr.wall_time_ms);
+      last_repl_iterations = rr.iterations;
+      last_repl_lat.clear();
+      for (std::size_t i = 0; i < static_cast<std::size_t>(total); ++i)
+        last_repl_lat.push_back(rr.queries[i].completion_wall_time_ms);
+      last_wcc_levels.clear();
+      for (int i = 0; i < wcc_count; ++i) {
+        std::size_t idx = static_cast<std::size_t>(bfs_count + sssp_count + i);
+        last_wcc_levels.push_back(rr.queries[idx].completion_level);
+      }
     }
   }
 
   // ===== Throughput =====
   const float seq_tw = medianf(seq_walls), repl_tw = medianf(repl_walls);
   std::cout << "=== Throughput (median over " << repeats << ") ===\n";
-  std::cout << "sequential_total_ms=" << seq_tw << " replenish_total_ms=" << repl_tw
-            << " speedup=" << (repl_tw > 0 ? seq_tw / repl_tw : 0.0f) << "x\n\n";
+  if (run_seq) std::cout << "sequential_total_ms=" << seq_tw << " ";
+  if (run_repl) std::cout << "replenish_total_ms=" << repl_tw << " ";
+  if (run_seq && run_repl)
+    std::cout << "speedup=" << (repl_tw > 0 ? seq_tw / repl_tw : 0.0f) << "x";
+  std::cout << "\n\n";
 
   // ===== Latency distribution（最后一次 run）=====
   std::cout << "=== Latency distribution (ms, last run) ===\n";
@@ -215,8 +239,8 @@ int main(int argc, char** argv) {
               << percentilef(v, 0.90f) << "," << percentilef(v, 0.99f) << ","
               << maxf(v) << "," << meanf(v) << "\n";
   };
-  row("sequential", last_seq_lat);
-  row("replenish ", last_repl_lat);
+  if (run_seq) row("sequential", last_seq_lat);
+  if (run_repl) row("replenish ", last_repl_lat);
   std::cout << "\n注：sequential latency 含每批 init（每批重新分配 buffer 的悲观估计）；"
             << "replenish latency 不含 init（从第一轮 push 起算）\n";
   if (wcc_count > 0) {

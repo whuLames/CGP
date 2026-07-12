@@ -3,7 +3,7 @@
  * 阶段4 端到端验证：replenish_frontier_engine slot 复用主循环
  *
  * toy graph: 0->1(w=2), 0->2(w=5), 1->3(w=1)（单向 CSR，push 模式）
- * N=4 query, Q=2 slot：[BFS src=0, SSSP src=0] 进 slot，[BFS src=1, SSSP src=1] 进 pending
+ * N=5 query, Q=2 slot：覆盖两次 slot 复用和最终 Q=1 尾批压缩。
  *
  * 期望（pipeline 结果 row-major values[q*V+v]）：
  *   q0 BFS  src=0: [0,1,1,2]
@@ -11,7 +11,7 @@
  *   q2 BFS  src=1: [INF,0,INF,1]   (1->3)
  *   q3 SSSP src=1: [INF,0,INF,1]   (1->3, w=1)
  *
- * 验证：4 个 query 结果正确 + 全部 completed + slot 复用确实发生（pending 被消耗）
+ * 验证：5 个 query 结果正确 + 全部 completed + slot 复用确实发生。
  */
 #include <cstdio>
 #include <cstdlib>
@@ -63,29 +63,31 @@ int main() {
   all_queries.push_back({0, algo_kind_t::sssp, unified_value_t(0)});
   all_queries.push_back({1, algo_kind_t::bfs, unified_value_t(0)});
   all_queries.push_back({1, algo_kind_t::sssp, unified_value_t(0)});
+  all_queries.push_back({2, algo_kind_t::bfs, unified_value_t(0)});
 
   execution_context context;
   run_options options;
   options.enable_replenishment = true;
   options.traversal_mode = traversal_mode_t::push;  // toy 单向 CSR
   options.max_iterations = 100;
+  options.max_queries = 2;
 
   auto result = run_replenish_pipeline(graph, all_queries, context, options);
 
   const auto INF = unified_infinity();
   printf("replenish pipeline: iterations=%d, N=%d, V=%d\n",
          result.iterations, static_cast<int>(all_queries.size()), V);
-  check("effective_query_dim == N (4)", result.effective_query_dim == 4);
-  check("queries.size() == 4",
-        result.queries.size() == 4);
-  check("values.size() == N*V (16)", result.values.size() == 16);
+  check("effective_query_dim == N (5)", result.effective_query_dim == 5);
+  check("queries.size() == 5",
+        result.queries.size() == 5);
+  check("values.size() == N*V (20)", result.values.size() == 20);
   // slot 复用由 q2/q3 结果正确证明（它们必须经 pending 注入），iterations 值依赖图结构
   check("iterations >= 3 (BFS0/SSSP0 convergence rounds)", result.iterations >= 3);
 
   std::vector<unified_value_t> h_values(result.values.size());
   thrust::copy(result.values.begin(), result.values.end(), h_values.begin());
 
-  const int N = 4;
+  const int N = 5;
   printf("q0 BFS src=0 (expect [0,1,1,2]):\n");
   check("values[0*V+0]=0", h_values[0 * V + 0] == 0.0f);
   check("values[0*V+1]=1", h_values[0 * V + 1] == 1.0f);
@@ -110,12 +112,18 @@ int main() {
   check("values[3*V+2]=INF", h_values[3 * V + 2] == INF);
   check("values[3*V+3]=3 (1->3 w3)", h_values[3 * V + 3] == 3.0f);
 
+  printf("q4 BFS src=2 tail cohort (expect [INF,INF,0,INF]):\n");
+  check("values[4*V+0]=INF", h_values[4 * V + 0] == INF);
+  check("values[4*V+1]=INF", h_values[4 * V + 1] == INF);
+  check("values[4*V+2]=0", h_values[4 * V + 2] == 0.0f);
+  check("values[4*V+3]=INF", h_values[4 * V + 3] == INF);
+
   printf("completion status:\n");
   bool all_completed = true;
   for (int q = 0; q < N; ++q) {
     if (result.queries[q].completion_level <= 0) all_completed = false;
   }
-  check("all 4 queries completed (completion_level > 0)", all_completed);
+  check("all 5 queries completed (completion_level > 0)", all_completed);
   (void)N;
 
   if (failures == 0) {
