@@ -410,7 +410,7 @@ __global__ void fused_pull_hybrid_simple_kernel(
       improved_mask |= thread_masks[row_base + q];
     }
     next_frontier_mask[vertex] = improved_mask;
-    visited_mask[vertex] |= improved_mask;
+    atomic_or_query_mask(visited_mask + vertex, improved_mask);
     unique_flags[vertex] = improved_mask != 0 ? 1ULL : 0ULL;
     pair_counts[vertex] =
         static_cast<unsigned long long>(mask_popcount(improved_mask));
@@ -531,7 +531,7 @@ __global__ void fused_pull_hybrid_smem_kernel(
       improved_mask |= lane_masks[threadIdx.y][i];
     }
     next_frontier_mask[vertex] = improved_mask;
-    visited_mask[vertex] |= improved_mask;
+    atomic_or_query_mask(visited_mask + vertex, improved_mask);
     unique_flags[vertex] = improved_mask != 0 ? 1ULL : 0ULL;
     pair_counts[vertex] =
         static_cast<unsigned long long>(mask_popcount(improved_mask));

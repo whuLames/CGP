@@ -20,10 +20,11 @@ void launch_fused_pull_compute(graph_t graph,
                                query_mask_t* next_frontier_mask,
                                unsigned long long* unique_flags,
                                unsigned long long* pair_counts,
+                               query_mask_t active_slots,
                                cudaStream_t stream) {
   launch_fused_pull<Policy, graph_t, vertex_t>(
       graph, query_count, values, visited_mask, next_frontier_mask,
-      unique_flags, pair_counts, stream);
+      unique_flags, pair_counts, active_slots, stream);
 }
 
 template <typename vertex_t>

@@ -22,7 +22,8 @@ __global__ void fused_pull_simple_kernel(
     query_mask_t* visited_mask,
     query_mask_t* next_frontier_mask,
     unsigned long long* unique_flags,
-    unsigned long long* pair_counts) {
+    unsigned long long* pair_counts,
+    query_mask_t active_slots) {
   using value_t = typename Policy::value_type;
   __shared__ query_mask_t thread_masks[128];
 
@@ -33,7 +34,8 @@ __global__ void fused_pull_simple_kernel(
   int shared_index = threadIdx.y * blockDim.x + threadIdx.x;
   query_mask_t local_mask = 0;
 
-  if (vertex < vertex_count && query_id < query_count) {
+  if (vertex < vertex_count && query_id < query_count &&
+      (active_slots & query_bit(query_id)) != 0) {
     value_t acc = Policy::infinity();
     auto begin =
         get_pull_starting_edge(graph, static_cast<vertex_t>(vertex));
@@ -71,7 +73,7 @@ __global__ void fused_pull_simple_kernel(
       improved_mask |= thread_masks[row_base + q];
     }
     next_frontier_mask[vertex] = improved_mask;
-    visited_mask[vertex] |= improved_mask;
+    atomic_or_query_mask(visited_mask + vertex, improved_mask);
     unique_flags[vertex] = improved_mask != 0 ? 1ULL : 0ULL;
     pair_counts[vertex] =
         static_cast<unsigned long long>(mask_popcount(improved_mask));
@@ -86,7 +88,8 @@ __global__ void fused_pull_smem_kernel(
     query_mask_t* visited_mask,
     query_mask_t* next_frontier_mask,
     unsigned long long* unique_flags,
-    unsigned long long* pair_counts) {
+    unsigned long long* pair_counts,
+    query_mask_t active_slots) {
   using value_t = typename Policy::value_type;
   constexpr int warp_size = 32;
   __shared__ vertex_t neighbor_tile[TILE_ROW][warp_size];
@@ -99,6 +102,10 @@ __global__ void fused_pull_smem_kernel(
   int lane = threadIdx.x & (warp_size - 1);
   int query0 = lane;
   int query1 = lane + warp_size;
+  bool query0_active = query0 < query_count &&
+      (active_slots & query_bit(query0)) != 0;
+  bool query1_active = query1 < query_count &&
+      (active_slots & query_bit(query1)) != 0;
   bool row_valid = vertex < vertex_count;
   value_t acc0 = Policy::infinity();
   value_t acc1 = Policy::infinity();
@@ -122,7 +129,7 @@ __global__ void fused_pull_smem_kernel(
     for (int i = 0; i < tile_count; ++i) {
       vertex_t neighbor = neighbor_tile[threadIdx.y][i];
       auto weight = get_pull_edge_weight(graph, tile + i);
-      if (query0 < query_count) {
+      if (query0_active) {
         value_t nb_val =
             values[value_index(static_cast<std::size_t>(neighbor),
                                static_cast<std::size_t>(query0),
@@ -134,7 +141,7 @@ __global__ void fused_pull_smem_kernel(
           }
         }
       }
-      if (query1 < query_count) {
+      if (query1_active) {
         value_t nb_val =
             values[value_index(static_cast<std::size_t>(neighbor),
                                static_cast<std::size_t>(query1),
@@ -151,7 +158,7 @@ __global__ void fused_pull_smem_kernel(
   }
 
   query_mask_t local_mask = 0;
-  if (row_valid && query0 < query_count) {
+  if (row_valid && query0_active) {
     std::size_t value_pos =
         value_index(vertex, static_cast<std::size_t>(query0), query_stride);
     if (Policy::should_update(acc0, values[value_pos])) {
@@ -159,7 +166,7 @@ __global__ void fused_pull_smem_kernel(
       local_mask |= query_bit(query0);
     }
   }
-  if (row_valid && query1 < query_count) {
+  if (row_valid && query1_active) {
     std::size_t value_pos =
         value_index(vertex, static_cast<std::size_t>(query1), query_stride);
     if (Policy::should_update(acc1, values[value_pos])) {
@@ -176,7 +183,7 @@ __global__ void fused_pull_smem_kernel(
       improved_mask |= lane_masks[threadIdx.y][i];
     }
     next_frontier_mask[vertex] = improved_mask;
-    visited_mask[vertex] |= improved_mask;
+    atomic_or_query_mask(visited_mask + vertex, improved_mask);
     unique_flags[vertex] = improved_mask != 0 ? 1ULL : 0ULL;
     pair_counts[vertex] =
         static_cast<unsigned long long>(mask_popcount(improved_mask));
@@ -191,6 +198,7 @@ void launch_fused_pull(graph_t graph,
                        query_mask_t* next_frontier_mask,
                        unsigned long long* unique_flags,
                        unsigned long long* pair_counts,
+                       query_mask_t active_slots,
                        cudaStream_t stream) {
   int vertex_count = static_cast<int>(graph.get_number_of_vertices());
   if (query_count <= 64) {
@@ -202,7 +210,7 @@ void launch_fused_pull(graph_t graph,
     fused_pull_simple_kernel<Policy, graph_t, vertex_t>
         <<<grid_x, dim3(query_count, tile_row), 0, stream>>>(
             graph, query_count, values, visited_mask, next_frontier_mask,
-            unique_flags, pair_counts);
+            unique_flags, pair_counts, active_slots);
   } else {
     throw std::invalid_argument("fused pull supports at most 64 queries");
   }

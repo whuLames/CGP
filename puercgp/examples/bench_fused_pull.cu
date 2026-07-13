@@ -127,6 +127,7 @@ float run_old_kernel_iteration(
       thrust::raw_pointer_cast(next_frontier_mask.data()),
       thrust::raw_pointer_cast(actual_degrees.data()),
       thrust::raw_pointer_cast(virtual_degrees.data()),
+      puercgp::query_slots_mask(query_count),
       stream);
 
   CUDA_CHECK(cudaEventRecord(stop, stream));

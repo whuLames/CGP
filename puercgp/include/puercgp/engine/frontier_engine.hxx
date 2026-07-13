@@ -341,7 +341,8 @@ class frontier_engine {
                   thrust::raw_pointer_cast(visited_mask.data()),
                   thrust::raw_pointer_cast(next_frontier_mask.data()),
                   thrust::raw_pointer_cast(unique_flags.data()),
-                  thrust::raw_pointer_cast(pair_counts.data()), stream);
+                  thrust::raw_pointer_cast(pair_counts.data()),
+                  partition.active_slots, stream);
             });
         detail::throw_if_cuda_error(cudaGetLastError(), "launch_fused_pull");
 

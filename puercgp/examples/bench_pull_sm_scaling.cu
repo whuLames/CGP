@@ -124,7 +124,7 @@ float prepare_and_measure(graph_t graph, const std::vector<int>& sources,
         thrust::raw_pointer_cast(visited_mask.data()),
         thrust::raw_pointer_cast(next_frontier_mask.data()),
         thrust::raw_pointer_cast(unique_flags.data()),
-        thrust::raw_pointer_cast(pair_counts.data()), stream);
+        thrust::raw_pointer_cast(pair_counts.data()), valid_mask(), stream);
     float elapsed = timer.end(stream);
     if (iteration >= warmup) times.push_back(elapsed);
   }

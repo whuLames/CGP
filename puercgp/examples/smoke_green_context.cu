@@ -21,5 +21,11 @@ int main(int argc, char** argv) {
               << " value=" << *value << '\n';
   }
   cudaFree(value);
+  if (argc > 2 && std::string(argv[2]) == "pair") {
+    puercgp::detail::green_context_pair pair(0, requested);
+    std::cout << "pair_first_sms=" << pair.first_sm_count()
+              << " pair_second_sms=" << pair.second_sm_count() << '\n';
+    if (pair.first_sm_count() + pair.second_sm_count() != 80) return 2;
+  }
   return 0;
 }
