@@ -59,7 +59,7 @@ target_include_directories(puercgp
 target_link_libraries(puercgp INTERFACE CUDA::cudart)
 
 if(PUERCGP_BUILD_EXAMPLES)
-  foreach(_puercgp_example smoke_frontier validate_bfs validate_sssp smoke_reduce_ops smoke_hybrid_init smoke_hybrid_push validate_hybrid validate_wcc validate_hybrid_real bench_hybrid smoke_replenish validate_replenish bench_replenish bench_phase_schedule bench_phase_schedule_n128 smoke_green_context bench_push_sm_scaling bench_pull_sm_scaling validate_query_partition_kernels trace_hybrid_q64 trace_query_work_q64 bench_query_partition_replay_q64)
+  foreach(_puercgp_example smoke_frontier validate_bfs validate_sssp smoke_reduce_ops smoke_hybrid_init smoke_hybrid_push validate_hybrid validate_wcc validate_hybrid_real bench_hybrid smoke_replenish validate_replenish bench_replenish bench_phase_schedule bench_phase_schedule_n128 smoke_green_context bench_push_sm_scaling bench_pull_sm_scaling validate_query_partition_kernels trace_hybrid_q64 trace_query_work_q64 bench_query_partition_replay_q64 validate_roadnet_replenish)
     add_executable(${_puercgp_example} examples/${_puercgp_example}.cu)
     target_link_libraries(${_puercgp_example} PRIVATE puercgp::puercgp)
     set_target_properties(${_puercgp_example}
@@ -75,4 +75,11 @@ if(PUERCGP_BUILD_EXAMPLES)
   target_link_libraries(bench_push_sm_scaling PRIVATE CUDA::cuda_driver)
   target_link_libraries(bench_pull_sm_scaling PRIVATE CUDA::cuda_driver)
   target_link_libraries(bench_query_partition_replay_q64 PRIVATE CUDA::cuda_driver)
+
+  add_executable(select_bfs_level_sources tools/select_bfs_level_sources.cpp)
+  set_target_properties(select_bfs_level_sources
+    PROPERTIES
+      CXX_STANDARD 17
+      CXX_STANDARD_REQUIRED ON
+  )
 endif()

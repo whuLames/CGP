@@ -16,6 +16,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <random>
 #include <string>
@@ -74,6 +75,28 @@ inline float meanf(const std::vector<float>& v) {
   return s / static_cast<float>(v.size());
 }
 
+static std::vector<int> load_source_csv(const std::string& path) {
+  std::ifstream file(path);
+  if (!file) throw std::runtime_error("cannot open sources file: " + path);
+  std::vector<int> sources;
+  std::string line;
+  while (std::getline(file, line)) {
+    if (line.empty() || line.rfind("query_id", 0) == 0) continue;
+    std::size_t first = line.find(',');
+    if (first == std::string::npos) {
+      sources.push_back(std::stoi(line));
+      continue;
+    }
+    std::size_t second = line.find(',', first + 1);
+    sources.push_back(std::stoi(line.substr(
+        first + 1, second == std::string::npos ? std::string::npos
+                                                : second - first - 1)));
+  }
+  if (sources.empty())
+    throw std::runtime_error("sources file is empty: " + path);
+  return sources;
+}
+
 // 一次 sequential 分批跑：返回 per-query latency（累积 wall）+ 总 wall
 static std::pair<std::vector<float>, float> run_sequential(
     const puercgp_examples::host_csr_graph& graph, int N,
@@ -101,14 +124,16 @@ int main(int argc, char** argv) {
     std::cerr << "Usage: " << argv[0]
               << " <graph> [--bfs=100] [--sssp=96] [--wcc=0] [--seed=42]"
               << " [--chain-length=0] [--batch-size=32] [--discard-results]"
+              << " [--sources-file=path] [--max-iterations=1000]"
               << " [--repeats=5] [--warmup=1] [--mode=push] [--push=warp]\n";
     return 2;
   }
   const std::string matrix = argv[1];
   int bfs_count = 100, sssp_count = 96, wcc_count = 0, seed = 42;
   int chain_length = 0, batch_size = 32, replenish_chunk = 0;
-  int repeats = 5, warmup = 1;
+  int repeats = 5, warmup = 1, max_iterations = 1000;
   std::string mode_text = "push", push_text = "warp", run_text = "both";
+  std::string sources_file;
   bool discard = true;
   for (int i = 2; i < argc; ++i) {
     std::string a = argv[i];
@@ -125,11 +150,23 @@ int main(int argc, char** argv) {
       replenish_chunk = getv("--replenish-chunk=");
     else if (a.rfind("--repeats=", 0) == 0) repeats = getv("--repeats=");
     else if (a.rfind("--warmup=", 0) == 0) warmup = getv("--warmup=");
+    else if (a.rfind("--max-iterations=", 0) == 0)
+      max_iterations = getv("--max-iterations=");
+    else if (a.rfind("--sources-file=", 0) == 0)
+      sources_file = a.substr(15);
     else if (a.rfind("--mode=", 0) == 0) mode_text = a.substr(7);
     else if (a.rfind("--push=", 0) == 0) push_text = a.substr(7);
     else if (a.rfind("--run=", 0) == 0) run_text = a.substr(6);
     else if (a == "--discard-results") discard = true;
     else if (a == "--no-discard") discard = false;
+  }
+  std::vector<int> fixed_sources;
+  if (!sources_file.empty()) {
+    if (sssp_count != 0 || wcc_count != 0)
+      throw std::invalid_argument(
+          "sources-file workload currently supports BFS-only; set --sssp=0 --wcc=0");
+    fixed_sources = load_source_csv(sources_file);
+    bfs_count = static_cast<int>(fixed_sources.size());
   }
   const int total = bfs_count + sssp_count + wcc_count;
   if (run_text != "both" && run_text != "sequential" &&
@@ -155,8 +192,14 @@ int main(int argc, char** argv) {
   std::mt19937 rng(static_cast<unsigned>(seed));
   std::vector<query_descriptor_t> all_descs;
   all_descs.reserve(static_cast<std::size_t>(total));
-  for (int i = 0; i < bfs_count; ++i)
-    all_descs.push_back({static_cast<int>(rng() % V_main), algo_kind_t::bfs, 0.0f});
+  for (int i = 0; i < bfs_count; ++i) {
+    int source = fixed_sources.empty()
+        ? static_cast<int>(rng() % V_main)
+        : fixed_sources[static_cast<std::size_t>(i)];
+    if (source < 0 || source >= V_main)
+      throw std::out_of_range("BFS source outside graph vertex range");
+    all_descs.push_back({source, algo_kind_t::bfs, 0.0f});
+  }
   for (int i = 0; i < sssp_count; ++i)
     all_descs.push_back({static_cast<int>(rng() % V_main), algo_kind_t::sssp, 0.0f});
   for (int i = 0; i < wcc_count; ++i)
@@ -168,13 +211,16 @@ int main(int argc, char** argv) {
             << " wcc=" << wcc_count << ") batch_size=" << batch_size
             << " seed=" << seed << " discard=" << (discard ? "on" : "off")
             << " mode=" << mode_text << " push=" << push_text
-            << " run=" << run_text << "\n";
+            << " run=" << run_text
+            << " sources_file=" << (sources_file.empty() ? "random" : sources_file)
+            << " max_iterations=" << max_iterations << "\n";
   std::cout << "sequential batches: " << (total + batch_size - 1) / batch_size
             << "\n\n";
 
   execution_context ctx;
   run_options opt;
-  opt.max_iterations = (chain_length > 1) ? (chain_length + 200) : 1000;
+  opt.max_iterations = (chain_length > 1) ? (chain_length + 200)
+                                          : max_iterations;
   opt.traversal_mode = parse_mode(mode_text);
   opt.push_strategy = parse_push(push_text);
   opt.profile_iterations = false;
@@ -198,6 +244,7 @@ int main(int argc, char** argv) {
   std::vector<float> last_seq_lat, last_repl_lat;
   int last_repl_iterations = 0;
   std::vector<int> last_wcc_levels;
+  std::vector<int> last_bfs_levels;
   for (int r = 0; r < repeats; ++r) {
     if (run_seq) {
       auto [slat, sw] =
@@ -213,6 +260,10 @@ int main(int argc, char** argv) {
       for (std::size_t i = 0; i < static_cast<std::size_t>(total); ++i)
         last_repl_lat.push_back(rr.queries[i].completion_wall_time_ms);
       last_wcc_levels.clear();
+      last_bfs_levels.clear();
+      for (int i = 0; i < bfs_count; ++i)
+        last_bfs_levels.push_back(rr.queries[static_cast<std::size_t>(i)]
+                                      .completion_level);
       for (int i = 0; i < wcc_count; ++i) {
         std::size_t idx = static_cast<std::size_t>(bfs_count + sssp_count + i);
         last_wcc_levels.push_back(rr.queries[idx].completion_level);
@@ -251,6 +302,14 @@ int main(int argc, char** argv) {
       std::cout << "  wcc_q" << i << ": completion_level=" << last_wcc_levels[i]
                 << " (chain_length=" << chain_length << ")\n";
     }
+  }
+  if (!last_bfs_levels.empty()) {
+    std::sort(last_bfs_levels.begin(), last_bfs_levels.end());
+    std::cout << "\n=== BFS completion levels (global replenish timeline) ===\n";
+    std::cout << "min=" << last_bfs_levels.front()
+              << " median=" << last_bfs_levels[last_bfs_levels.size() / 2]
+              << " max=" << last_bfs_levels.back()
+              << " replenish_total_iterations=" << last_repl_iterations << "\n";
   }
   return 0;
 }
