@@ -1,0 +1,1247 @@
+                 iBFS: Concurrent Breadth-First Search on GPUs
+
+                                                Hang Liu       H. Howie Huang     Yang Hu
+                                             Department of Electrical and Computer Engineering
+                                                       George Washington University
+                                                    {asherliu, howie, huyang}@gwu.edu
+
+
+
+ABSTRACT                                                                                               Depending on the value of i, iBFS actually becomes a
+Breadth-First Search (BFS) is a key graph algorithm with                                            number of different problems. Formally, in a graph with |V |
+many important applications. In this work, we focus on a                                            vertices, iBFS is
+special class of graph traversal algorithm - concurrent BFS                                             • single source shortest path (SSSP) if i = 1 [6];
+- where multiple breadth-first traversals are performed si-                                             • multi-source shortest path (MSSP) if i ∈ (1, |V |) [7,8];
+multaneously on the same graph. We have designed and                                                    • all-pairs shortest path (APSP) if i = |V | [9, 10].
+developed a new approach called iBFS that is able to run i
+                                                                                                    Moreover, iBFS can be utilized in many other graph algo-
+concurrent BFSes from i distinct source vertices, very effi-
+                                                                                                    rithms such as betweenness centrality [11, 12] and closeness
+ciently on Graphics Processing Units (GPUs). iBFS consists
+                                                                                                    centrality [13]. For example, one can leverage iBFS to con-
+of three novel designs. First, iBFS develops a single GPU
+                                                                                                    struct the index for answering graph reachability queries,
+kernel for joint traversal of concurrent BFS to take advan-
+                                                                                                    that is, whether there exists a path from vertex s to t with
+tage of shared frontiers across different instances. Second,
+                                                                                                    the number of edges in-between less than k [14–16]. We will
+outdegree-based GroupBy rules enables iBFS to selectively
+                                                                                                    show in this paper this step can be an order of magnitude
+run a group of BFS instances which further maximizes the
+                                                                                                    faster with iBFS. In all, a wide variety of applications, e.g.,
+frontier sharing within such a group. Third, iBFS brings ad-
+                                                                                                    network routing [17–19], network attack detection [20], route
+ditional performance benefit by utilizing highly optimized
+                                                                                                    planning [21–23], web crawling [24,25], etc., can benefit from
+bitwise operations on GPUs, which allows a single GPU
+                                                                                                    high-performance iBFS.
+thread to inspect a vertex for concurrent BFS instances. The
+                                                                                                       This work proposes a new approach for running iBFS on
+evaluation on a wide spectrum of graph benchmarks shows
+                                                                                                    GPUs that consists of three novel techniques: joint traver-
+that iBFS on one GPU runs up to 30× faster than executing
+                                                                                                    sal, GroupBy, and bitwise optimization. Prior work has pro-
+BFS instances sequentially, and on 112 GPUs achieves near
+                                                                                                    posed to combine the execution of different BFS instances
+linear speedup with the maximum performance of 57,267
+                                                                                                    mostly on multi-core CPUs [26–28]. The performance im-
+billion traversed edges per second (TEPS).
+                                                                                                    provement, however, is limited. For one, none of early projects
+                                                                                                    has attempted to group the BFS instances to improve the
+1.     INTRODUCTION                                                                                 frontier sharing during the traversal. Further, bottom-up
+   Graph-based representations are ubiquitous in many ap-                                           BFS provides new additional challenges. For example, while
+plications such as social networks [1–3], metabolic networks [4],                                   MS-BFS [26] supports bottom-up, it does not provide early
+and computer networking [5]. As a result, graph algorithms                                          termination which iBFS leverages for faster traversal. In
+have been an vital research topic in the era of big data,                                           essence, BFS is a memory-intensive workload that matches
+among which Breadth-First Search (BFS) draws a signifi-                                             well with thousands of lightweight threads provided by GPUs.
+cant amount of interests due to its importance.                                                     Prior work such as [6,29–31] has shown great success of using
+   In this work, we focus on a special class of BFS algorithm -                                     GPUs for single-source BFS. To the best of our knowledge,
+concurrent BFS - where multiple breadth-first traversals are                                        this is the first work that supports concurrent BFS on GPUs.
+performed simultaneously on the same graph. We refer to                                                The first technique of iBFS is motivated by the observa-
+our solution to this problem as iBFS that is able to perform                                        tion that a naive implementation that simply runs multi-
+i multiple breadth-first traversals in parallel on GPUs, each                                       ple BFS instances sequentially or in parallel would not be
+from a distinct source vertex. Here i is between 1 and |V |,                                        able to achieve high parallelism on GPUs. To address this
+i.e., the total number of vertices in the graph.                                                    challenge, iBFS proposes the technique of joint traversal to
+                                                                                                    leverage the shared frontiers among different concurrent BFS
+                                                                                                    instances, as they can account for as high as 48.6% of the
+Permission to make digital or hard copies of all or part of this work for personal or
+classroom use is granted without fee provided that copies are not made or distributed               vertices in some of the graphs we have evaluated. In partic-
+for profit or commercial advantage and that copies bear this notice and the full cita-              ular, iBFS executes different traversals within a single GPU
+tion on the first page. Copyrights for components of this work owned by others than                 kernel. That is, all concurrent BFS instances share a joint
+ACM must be honored. Abstracting with credit is permitted. To copy otherwise, or re-
+publish, to post on servers or to redistribute to lists, requires prior specific permission         frontier queue and a joint status array.
+and/or a fee. Request permissions from permissions@acm.org.                                            Second, to achieve the maximum benefit of joint traversal,
+SIGMOD’16, June 26-July 01, 2016, San Francisco, CA, USA                                            iBFS shall execute all BFS instances together. However, this
+c 2016 ACM. ISBN 978-1-4503-3531-7/16/06. . . $15.00                                                is impossible due to limited hardware resources, e.g., global
+DOI: http://dx.doi.org/10.1145/2882903.2882959                                                      memory size and thread count, on GPUs. Fortunately, we
+
+
+
+
+                                                                                              403
+                                                                                              BFS-0                   BFS-1                   BFS-2                   BFS-3
+                                 0                       3
+                                                                          Private FQ3        1 4                      4 6                      3 7                     5 7
+                             1       4               4       6
+     0    1    2                                                     Level 3 (top-down)
+                         2       5       3       0       1       7
+                                                                          Private SA3 1 2 F F 2 F U U U       F F U 1 2 U 2 F U       UUU 2 F F 1 2 F         U F F UU 2 F 2 1
+     3    4    5             7       8 6             2       5 8          Vertex id   0 1 2 3 4 5 6 7 8       0 1 2 3 4 5 6 7 8       0 1 2 3 4 5 6 7 8       0 1 2 3 4 5 6 7 8
+     6    7    8                 6                       8
+                             3       7               5       7             Private FQ4        6 7 8                 2 5 8                    0 1 2                    0 3 4
+                        4        5       8       1       2       6   Level 4 (boGom-up)
+                                                                           Private SA4 1 2 3 3 2 3 4 4 4      3 3 4 1 2 4 2 3 4       4 4 4 2 3 3 1 2 3       4 3 3 4 4 2 3 2 1
+                       0 1 2                 0       4           3
+                                                                           Vertex id   0 1 2 3 4 5 6 7 8      0 1 2 3 4 5 6 7 8       0 1 2 3 4 5 6 7 8       0 1 2 3 4 5 6 7 8
+(a) An example graph (b) Four BFS traversal trees                                      (c) Source vertex: 0    (d) Source vertex: 3    (e) Source vertex: 6    (f) Source vertex: 8
+Figure 1: (a) An example graph used throughout this paper (b) Four valid BFS traversal trees from different source vertices, i.e.,
+BFS-0, BFS-1, BFS-2, and BFS-3 starting from vertices 0, 3, 6, and 8, respectively. (c), (d), (e) and (f) are two levels traversal of the
+corresponding four valid trees, where the top half represents top-down traversal and the bottom half bottom-up. In all examples, FQ and
+SA stand for frontier queue and status array, respectively. The frontier queue stores frontiers while the status array indicates the status
+of each frontier in the current level where ”F”, ”U” and numbers represent ”Frontier”, ”Unvisited” and its depth (visited), respectively.
+The dotted circles indicate the updated depth for each frontier.
+
+
+discover that grouping BFS instances can be optimized to                                                       cluster. To the best of our knowledge, this is the first in
+ensure a high ratio of frontier sharing among different in-                                                    both running GPU-based concurrent BFS on joint data
+stances. Guided by a theorem on inter-group sharing ratio,                                                     structures, i.e., joint frontier queue and bitwise status
+iBFS develops the second technique of GroupBy that selec-                                                      array, and scaling to O(100) GPUs with unprecedented
+tively combines BFS instances into optimized batches, which                                                    traversal rate, i.e., delivering 57,267 billion traversed
+results in 2× speedup of the overall performance.                                                              edges per second (TEPS) on 112 GPUs.
+   A typical BFS algorithm starts from the source vertex in                                                The rest of the paper is organized as follows: Section 2 in-
+a top-down fashion, inspects the frontiers at each level, and                                            troduces the background on BFS, concurrent BFS, and the
+switches to bottom-up to avoid inspect too many edges un-                                                motivations. Section 4 presents the design of single-kernel
+necessarily. GroupBy improves iBFS performance in both                                                   and joint traversal. Section 5 discusses our GroupBy tech-
+top-down and bottom-up, although in different fashions. In                                               nique. Section 6 presents the bitwise optimization. Section 8
+top-down, higher sharing ratio directly reduces the number                                               presents the evaluations on our iBFS system. Section 9 dis-
+of memory access for inspection and expansion. In contrast,                                              cusses the related work and Section 10 concludes.
+through sharing, GroupBy allows bottom-up traversals to
+complete in approximately the same amount of time, mini-
+mizing workload imbalance across multiple BFSes.                                                         2.   BACKGROUND
+   Third, iBFS would need to inspect a considerable amount                                               BFS typically starts the traversal in top-down and switches
+of frontiers at multiple levels, in some case, upto 15× more                                             to bottom-up in a later stage [32, 33]. Both directions per-
+than a single BFS. Although for each individual BFS not                                                  form three tasks at each level, namely, expansion, inspection,
+every vertex is a frontier at every level, concurrent BFS sig-                                           and frontier queue generation. To start, frontier queue (FQ)
+nificantly increases the number of frontiers at each level.                                              is initialized with the source vertex and will always contain
+While GPUs offer thousands of hardware threads, travers-                                                 the vertices (frontiers) to be expanded from at the next level.
+ing millions of the vertices of large graphs in parallel remains                                         From the frontiers, expansion explores their edges to the ad-
+challenging. To this end, iBFS utilizes a bitwise status array                                           jacent vertices, and inspection updates the statuses of those
+that uses one bit to represent the status of the vertex for                                              neighbors in the status array (SA) which maintains a record
+each BFS instance. This reduces the size of data fetched                                                 (unvisited, frontier, or visited) for each vertex.
+during inspection, and more importantly through bitwise                                                     In top-down BFS, expansion and inspection aim to iden-
+operations reduces the number of threads needed for inspec-                                              tify unvisited neighbors of each frontier. Figure 1 presents an
+tion, together accelerating the graph traversal by 11×.                                                  example of breadth-first traversal. Given the graph in Fig-
+   In summary, the contributions of this paper are:                                                      ure 1(a), at level 3, a top-down BFS shown in the top half of
+                                                                                                         Figure 1(c) (BFS-0 starting from vertex 0) will expand from
+   • iBFS combines joint traversal and GroupBy to allow                                                  the queue {1, 4} and mark their unvisited neighbors{2, 3,
+     both top-down and bottom-up BFS to run very effi-                                                   5} as frontiers in the status array. Although vertices {0, 1,
+     ciently within each group. This is achieved via uti-                                                4} have been visited before, they will still be inspected at
+     lizing a set of outdegree-based GroupBy rules to form                                               this level, but their statuses will not be updated.
+     good groups of concurrent BFS instances that are able                                                  In contrast, bottom-up BFS tries to find a parent for un-
+     to enjoy a high sharing ratio of frontiers among them.                                              visited vertices in expansion and inspection, and in this case,
+     A theoretical study on frontier sharing and GroupBy                                                 stores unvisited vertices in the frontier queue. In the bottom
+     is also presented.                                                                                  half of Figure 1(c), BFS-0 at level 4, {6, 7, 8} are unvisited
+   • iBFS also develops bitwise-operations based inspection                                              vertices, i.e., treated as frontiers here. For vertex 6, since
+     and frontier identification, which further simplifies the                                           its first neighbor 3 is visited, bottom-up BFS will mark the
+     traversal on GPUs and delivers another key benefit of                                               depth of vertex 6 as 4, and there is no need to check ad-
+     allowing early termination for bottom-up BFS. As a                                                  ditional neighbors. This is what we refer to as early ter-
+     result, iBFS achieves up to 2.6× speedup compared to                                                mination in bottom-up BFS, which can potentially lead to
+     the state of the art [26].                                                                          significant performance gains. The newly proposed bitwise
+   • We have implemented and evaluated iBFS on a wide                                                    optimization in iBFS can further expedite this process for
+     range of graphs, as well as on both a single GPU and a                                              concurrent traversals and lead to even higher performance.
+
+
+
+
+                                                                                                   404
+Frontier sharing percentage (log scale)
+                                      256                                                                                                                      GroupBy	  
+                                                                                Top-down   Bottom-up
+                                          64                                                                                Expansion	                   Joint	  Expansion	  
+
+                                          16
+                                                                                                                            Inspec-on	                 Bitwise	  Inspec2on	  	  
+                                          4
+                                                                                                                          Status	  Array	           Bitwise	  Status	  Array	  	  
+                                          1                                                                                                              Bitwise	  Fron2er	  	  
+                                                                                                                         FQ	  Genera-on	  
+                                                                                                                                                          Iden2ﬁca2on	  	  
+
+                                                                                                                         Fron-er	  Queue	           Joint	  Fron2er	  Queue	  
+                                               FB   FR HW KG0 KG1 KG2 LJ   OR   PK   RD RM TW WK                     (a) A Single BFS                       (b) iBFS
+Figure 2: Average frontier sharing percentage between two differ-
+ent BFS instances.                                                                                                   Figure 3: The flow charts of (a) BFS, (b) iBFS.
+
+
+                                                                                                             expansion. (3). Memory accesses to the statuses of those
+   Among three tasks at each level, inspecting adjacent ver-                                                 neighbors for different BFSes can be coalesced. It is impor-
+tices of the frontiers involves a lot of random memory ac-                                                   tant to note that each BFS still has to inspect the statuses
+cesses (pointer-chasing), accounting for most of the runtime.                                                independently, because not all BFSes will have the same sta-
+This can be observed on four BFS traversals for both top-                                                    tuses for their neighbors. In other words, shared frontiers
+down and bottom-up in Figure 1.                                                                              do not reduce the overall workload. Nevertheless, this work
+Concurrent BFS executes multiple BFS instances from                                                          proposes that shared frontiers can be utilized to offer faster
+different source vertices. Using the example in Figure 1, four                                               data access and saving in memory usage, both of which are
+BFS instances start from vertex 0, 3, 6, and 8, respectively.                                                critical on GPUs. This is achieved through a combination
+A naive implementation of concurrent BFS will run all BFS                                                    of bitwise, joint traversals and GroupBy rules that guide the
+instances separately and keep its own private frontier queue                                                 selection of groups of BFSes for parallel execution.
+and status array. On a GPU device, each individual subrou-
+tine is defined as a Kernel. Therefore, in the aforementioned
+example, four kernels will run four BFS instances in parallel
+                                                                                                             3.   iBFS OVERVIEW
+from four source vertices. NVIDIA Kepler provides Hyper-Q                                                       In a nutshell, iBFS as shown in Figure 3, consists of three
+to support concurrent execution of multiple kernels, which                                                   unique techniques, namely, joint traversal, GroupBy, and
+dramatically increases the GPU utilization especially when                                                   bitwise optimization, which will be discussed in Section 4,
+a single kernel cannot fully utilize the GPU [34].                                                           5, and 6, respectively.
+   Unfortunately, this naive implementation of concurrent                                                       Ideally the best performance for iBFS would be achieved
+BFS takes approximately the same amount of time as run-                                                      by running all i BFS instances together without GroupBy.
+ning these BFS instances sequentially, as we will show later                                                 Unfortunately, ever-growing graph sizes, combined with lim-
+in Section 8. For example, for all the graphs evaluated                                                      ited GPU hardware resources, puts a cap on the number of
+in this paper, sequential and naive implementation of con-                                                   concurrent BFS instances. In particular, we have found that
+current BFS take average 52 ms and 48 ms, respectively,                                                      GPU global memory is the dominant factor, e.g., 12GB on
+with a difference in traversal rate of 500 million TEPS. The                                                 K40 GPUs compared to many TB-scale graphs.
+main reason for such a small benefit is because simply run-                                                     Let M be GPU memory size and N the maximum number
+ning multiple BFS instances in parallel would overwhelm the                                                  of concurrent BFS instances in one group (i.e., the group
+GPU, especially at the direction-switching level when a BFS                                                  size). If the whole graph requires S storage, a single BFS
+goes from top-down to bottom-up. At that moment each                                                         instance needs |SA| to store its data structures (e.g., the
+individual BFS would require a large number of threads for                                                   status array for all the vertices), and for a joint traversal
+their workloads. As a result, such a naive implementation                                                    each group requires at least |JF Q| for joint data structures
+may even underperform a sequential execution of all BFS                                                      (e.g., the joint frontier queue), then N ⩽ M −S−|JF  |SA|
+                                                                                                                                                                        Q|
+                                                                                                                                                                           . In
+instances.                                                                                                   most cases N satisfies 1 < N  i ⩽ |V |. In this paper, we
+Opportunity of Frontier Sharing: iBFS aims to address                                                        use a value of 128 for N by default.
+this problem by leveraging the existence of frontiers shared                                                    Unfortunately, randomly grouping N different BFS in-
+among different BFS instances. Figure 2 presents the av-                                                     stances is unlikely to produce the optimal performance. Care
+erage percentage of shared frontiers per level between two                                                   has to be taken to ensure a good grouping strategy. To il-
+instances. The graphs used in this paper are presented in                                                    lustrate this problem, for a group A with two BFS instances
+Section 8. Top-down levels have smaller number of shared                                                     BFS-s and BFS-t, let JF QA (k) be the joint frontier queue of
+frontiers (close to 4% on average) whereas bottom-up levels                                                  group A at level k, F Qs (k) the individual frontier queue for
+have much more as high as 48.6%. This is because bottom-                                                     BFS-s, and F Qt for BFS-t. Thus, |JF QA (k)| = |F Qs (k)| ∪
+up traversals often start from a large number of unvisited                                                   |F Qt (k)| − |F Qs (k)| ∩ |F Qt (k)|, where |F Qs (k)| ∩ |F Qt (k)|
+vertices (frontiers in this case) and search for their parents.                                              represents the shared frontiers between two BFS instances.
+The proposed GroupBy technique can improve the sharing                                                       Clearly, the more shared frontiers each group has, the higher
+for both directions to 10× and 1.7×, respectively.                                                           performance iBFS will be able to achieve. Before we describe
+   Potentially, the shared frontiers can yield three benefits in                                             the GroupBy technique in Section 5 that aims to maximize
+concurrent BFS: (1). These frontiers need to be enqueued                                                     such sharing within each group, we will first introduce how
+only once into the frontier queue. (2). The neighbors of                                                     iBFS achieves joint traversal in the next section which makes
+shared frontiers need to be loaded in-core only once during                                                  parallel execution possible.
+
+
+
+
+                                                                                                       405
+ JSA2                                            …               U U U F U F 1 U U U F F U U U 1                                                                                                                                            JSA3    … 3 F 3 2 F 2 1 3 F 3 2 2 F F 3 1
+                                      Vertex id                     5       6       7       8                                                                                                                                                                5         6        7                   8
+ JFQ3                                                                   1 3 4 5 6 7                                                                                                                                                         JFQ4                   0 1 2 3 4 5 6 7 8
+
+ Cache                                                                                                             5 6 8                                                                                                                    Cache                            5 6 8
+
+
+ JSA3                                           …                 3 U F 2 U 2 1 F U 3 2 2 U U F 1                                                                                                                                           JSA4    … 3 F 3 2 F 2 1 3 4 3 2 2 F F 3 1
+                                    Vertex id                        5             6           7        8                                                                                                                                                    5             6          7             8
+                                                                       (a) Level 3 — Top-down traversal                                                                                                                                                          (b) Level 4 — Bo1om-up traversal
+Figure 5: iBFS traversal on joint status array (a) Level 3 – top-down traversal and (b) Level 4 – bottom-up traversal using the example
+graph and four BFS instances from Figure 1, here i=4 and black threads are active while gray are not. While this figure only presents
+the inspection of one vertex 7, we keep JSA updated with the latest depth represented as dotted circles. Note that JSA3 is different
+between (a) top-down and (b) bottom-up as frontiers are identified differently.
+
+
+4.                JOINT TRAVERSAL                                                                                                                                                                                                         It is worthy to note that iBFS uses a CUDA vote instruc-
+  In this work, we propose to implement iBFS in a single                                                                                                                                                                               tion, i.e., __any(), to communicate among different threads
+GPU kernel, different from prior GPU-based work [35]. This                                                                                                                                                                             in the same warp and schedules one thread to enqueue the
+way, iBFS will be able to exploit the sharing across different                                                                                                                                                                         frontier. Furthermore, iBFS uses another CUDA feature
+BFS instances, e.g., if two threads of the same kernel are                                                                                                                                                                             __ballot(parameter) to generate a separate variable to in-
+scheduled to work on a shared frontier, iBFS only needs                                                                                                                                                                                dicate which BFS instances share this frontier. This is im-
+to load adjacent vertices from global memory once. This                                                                                                                                                                                portant for shared frontiers, e.g., while vertex 7 is a fron-
+benefit would be, otherwise, not possible on GPUs with a                                                                                                                                                                               tier in BFS-2 and BFS-3, it would appear once in the joint
+multi-kernel implementation which would be used for the                                                                                                                                                                                frontier queue. Removing such redundant frontiers from
+aforementioned naive implementation.                                                                                                                                                                                                   the queue substantially reduces the number of costly global
+                                                                                                                                                                                                                                       memory updates, which contributes partly to performance
+Vertex	  id	         0	                     1	                   2	                    3	                    4	                     5	                   6	                    7	                    8	                     gains obtained by iBFS.
+JSA2	           1	  U	   U	   U	   F	   U	  U	  U	   U	   U	  U	   U	   U	  1	   F	   U	   F	   F	   U	  U	   U	   U	  U	   F	   U	   F	   1	   U	  U	   U	   F	   F	   U	  U	  U	   1	  
+Warps	  
+                                                                                                                                                                                                                                          iBFS’s joint traversal introduces two unique memory op-
+                                                                                                                                                                                                                                       timizations to reduce the number of expensive global mem-
+Warp	  vote	  
+                                                                                                                                                                                                                                       ory transactions: (1) during expansion, iBFS uses a new
+                                   ✗	                  ✓	                   ✗	                   ✓	                  ✓	                   ✓	                  ✓	                   ✓	                   ✗	  
+                                                                                                                                                                                                                                       cache presented in Figure 5 to load the adjacent vertices of
+                                                                                                                                                                                                                                       a frontier from GPU’s global memory to its shared mem-
+  JFQ3	                     1	   3	   4	   5	   6	   7	                                                                                                                                                                         ory to feed all BFS instances. This way the neighbors from
+Figure 4: Generate joint frontier queue (JFQ3 ) from joint status                                                                                                                                                                      each frontier will only be loaded from global memory once,
+array (JSA2 ). Assuming we are executing the four BFS traversals                                                                                                                                                                       although numerous requests may come from multiple BFS
+of Figure 1 in a single kernel.
+                                                                                                                                                                                                                                       instances. This benefit is not limited just to shared fron-
+                                                                                                                                                                                                                                       tiers, rather every frontier in the queue. And (2) during
+   The joint traversal of iBFS uses two joint data structures
+                                                                                                                                                                                                                                       inspection, iBFS schedules multiple threads with contigu-
+for all concurrent BFS instances: (1) Joint Status Array
+                                                                                                                                                                                                                                       ous thread IDs to work on each frontier. Here the number
+(JSA) is used to keep the status of each vertex for all in-
+                                                                                                                                                                                                                                       of threads is the same as the that of concurrently executed
+stances. For each vertex, iBFS puts its statuses for different
+                                                                                                                                                                                                                                       BFS instances. This is because on GPUs one global mem-
+BFS instances sequentially. For example, in Figure 4, as
+                                                                                                                                                                                                                                       ory transaction typically fetches 16 contiguous data entries
+we run four concurrent BFSes, four bytes are used for each
+                                                                                                                                                                                                                                       from an array and only continuous threads can share the
+vertex. For vertex 0, the first byte of 1 indicates that ver-
+                                                                                                                                                                                                                                       retrieved data. On the other hand, if continuous threads
+tex 0 has been visited with the depth of 1 in BFS-0, and
+                                                                                                                                                                                                                                       write to the same memory block, such writes are coalesced
+the next three bytes of U indicate that the same vertex 0
+                                                                                                                                                                                                                                       into one global memory transaction as well.
+has yet been visited for all three other BFS instances. (2)
+                                                                                                                                                                                                                                          Now we will use an example to show how iBFS utilizes
+Joint Frontier Queue (JFQ) is a set of all the frontiers
+                                                                                                                                                                                                                                       these new structures in both top-down and bottom-up traver-
+from concurrent BFS instances, where any shared frontier
+                                                                                                                                                                                                                                       sal. Figure 5(a) exhibits the top-down traversal of vertex 7
+appears only once. Thus, this queue requires the maximum
+                                                                                                                                                                                                                                       which is a frontier in the proceeding level (i.e., level 2). Dur-
+size of |V | to store the frontiers for all i BFS instances. In
+                                                                                                                                                                                                                                       ing expansion, the neighbors {5, 6, 8} of vertex 7 are loaded
+comparison, using a private frontier queue would require a
+                                                                                                                                                                                                                                       in the cache. During inspection, BFS instances that do not
+much bigger queue with the size of i×|V |.
+                                                                                                                                                                                                                                       have this frontier will not inspect the neighbors, specifically,
+   A GPU uses single instruction multiple thread (SIMT)
+                                                                                                                                                                                                                                       the first and second threads in this figure. On the other
+model and schedules threads in a warp that consists of 32
+                                                                                                                                                                                                                                       hand, when the third and fourth threads access the statuses
+threads [36]. Several warps can form a thread block called
+                                                                                                                                                                                                                                       of three neighbors, it is performed in a single global memory
+Cooperative Thread Array (CTA). The threads within a block
+                                                                                                                                                                                                                                       transaction since these statuses are stored side by side and
+can communicate with each other quickly with shared mem-
+                                                                                                                                                                                                                                       accessed by contiguous threads. At this level, vertex 7 will
+ory and built-in primitives.
+                                                                                                                                                                                                                                       also have its status updated with the depth of 2.
+   To generate the JFQ, iBFS assigns one warp to scan the
+                                                                                                                                                                                                                                          The bottom-up traversal is performed in a different man-
+status of each vertex as in Figure 4. If this vertex happens to
+                                                                                                                                                                                                                                       ner as shown in Figure 5(b). For the frontier vertex 7, iBFS
+be a frontier for any BFS instance, iBFS needs to store it in
+                                                                                                                                                                                                                                       will similarly load its adjacent vertices {5, 6, 8} into the
+the joint frontier queue, e.g., vertex 1 is put in JFQ3 because
+                                                                                                                                                                                                                                       cache. The difference here is that iBFS will check if {5, 6,
+it is a frontier for BFS-0 at level 3. In contrast, vertex 0 is
+                                                                                                                                                                                                                                       8} are already visited, if so, mark the depth of 7 as 4.
+not considered a frontier for all four BFS instances.
+
+
+
+
+                                                                                                                                                                                                                                 406
+  Note that a vertex can be a frontier at both top-down                       Lemma 1. For any BFS group, say group A, its sharing
+and bottom-up levels, for example, vertex 7 in Figure 5. In                ratio is equal to the expected value of SpeedupA , that is,
+Figure 5(a), vertex 7 is a frontier for top-down traversal of
+the third and fourth BFSes, and in Figure 5(b) bottom-up                                        SDA = E[SpeedupA ]                      (5)
+of the first BFS. Clearly, as long as one BFS considers a                    Proof. Because for the j-th BFS every vertex will be-
+vertex as a frontier at a particular level, this vertex shall be           come a frontier at one of the levels, the sum of |F Qj (k)|
+enqueued in iBFS.                                                          across all
+                                                                                    Plevels is equal to the total number of the vertices,
+                                                                           that is,   |F Qj (k)| = |V |.
+5.    GROUPBY                                                                       k
+                                                                                                 N                         N
+                                                                                               P P                         P
+  In this section, we will introduce the concept of sharing                                            |F Qj (k)|               |V |
+                                                                                               k j=1                      j=1
+ratio, and propose several outdegree-based GroupBy rules.                               SDA = P                     = P                  (6)
+We will first use top-down traversal for the discussion of                                          |JF QA (k)|           |JF QA (k)|
+                                                                                                k                    k
+GroupBy and later present the impacts on bottom-up BFS.
+                                                                                            = E[SpeedupA ]
+5.1    Frontier Sharing Degree and Ratio
+   To a great extent, the performance of iBFS is determined
+by how many frontiers are shared at each level during the                    Lemma 1 demonstrates that the sharing ratio reflects the
+joint traversal of each group. This is because if multiple BFS             performance of the joint execution when it is compared to
+instances have a common frontier in one level, all its edges               the sequential execution of such a group. However, for any
+will be checked only once, thus leading to overall perfor-                 group, since the size of JFQ at each level is not known until
+mance improvement. In this work we define for any group,                   runtime, we will not able to calculate a priori the sharing
+say group A with the size N, the Sharing Degree (SDA ) as                  ratio as well as the expected performance. Fortunately, we
+the degree of sharing that exists in the joint frontier queue:             discover that the sharing ratios at the first few levels can be
+                                                                           used as a good metric, and there also exists an important
+                                N
+                               PP
+                                         |F Qj (k)|                        correlation for sharing ratios at consecutive levels.
+                               k j=1
+                    SDA = P                                    (1)            Theorem 1. Given any two BFS groups A and B with
+                                    |JF QA (k)|
+                                k                                          the same number of BFS instances, if at the level k their
+where j ∈ [1, N] and represents the j-th BFS instance in                   sharing ratios obeys SDA (k) > SDB (k), at the level k + 1
+the group A, and k represents the level (or depth) for the                 the following relationship, E[SDA (k + 1)] > E[SDB (k + 1)],
+traversal. In essence, SDA shows on average each joint fron-               will hold.
+tier is shared by how many BFS instances in a group. Thus,                    Proof. Let us start with one group A. At the level k,
+the Sharing Ratio can be easily calculated as SD divided by                the j-th BFS performs two main tasks for a frontier vertex
+the total number of instances in the group.                                v, i.e., expansion and inspection. In the first task, the j-th
+   Traditionally, the time complexity of a BFS is calculated               BFS fetches the neighbor list of frontier v, and in the second
+by the number of inspections performed, that is, the edge                  task, it checks all neighbors. The number of inspections is
+count |E|. Thus the time of a sequential execution of group                equal to the outdegree of v.
+A will be N · |E|.                                                           We define null inspections as those that do not lead to an
+   In this work, We use TA (k) to represent the time of the                increase in the size of the frontier queue at a particular level.
+joint execution of group A at the level k, that is,                        Note that as vertices are shared, null inspections do not nec-
+                           X                                               essarily mean such inspections have not found a frontier at
+               TA (k) =          outdegree(v)
+                                                                           the next level. There are three cases that render a neighbor
+                         v∈JF QA (k)
+                                                                           check as a null inspection. The first two cases are relevant
+where v stands for each frontier in the JFQ at the level k.                to a single BFS, while all three are applicable to iBFS. For
+And the total runtime TA for group A can be calculated by                  a neighbor w of the frontier v,
+summarizing the runtime of each level, which is:
+               X               X         X                                 Case 1 : the neighbor w is visited.
+        TA =        TA (k) =                    outdegree(v)   (2)         Case 2 : the neighbor w has already been marked as a
+                k              k v∈JF QA (k)
+                                                                               new frontier by other inspections at the level k. This
+                                                                               check will be discarded, and will not increase the size
+   According to the Amdahl’s Law, the speedup SpeedupA                         of the frontier queue. This happens because w may
+of joint traversal for group A over sequential execution is:                   have additional parents other than v.
+                                         N · |E|                           Case 3 : the neighbor w has already been marked as a new
+                      SpeedupA =                               (3)
+                                          TA                                   frontier by other concurrent BFS instances. Similarly,
+                                                                               in joint traversal, this check will be discarded, and will
+  Let d¯ be the average outdegree, we can obtain the ex-
+pected value of SpeedupA using equations (2) and (3). Thus,                    not increase the size of the frontier queue, because w
+                                                                               may be shared by concurrent BFS instances.
+                                   N · d¯ · |V |
+               E[SpeedupA ] = E[ ¯ P             ]                            We use three values to represent the occurring percentages
+                                d·   |JF QA (k)|
+                                          k                                of three cases: α accounts for case 1 and 2 for a single BFS,
+                                                               (4)
+                                          N · |V |                         β for case 1 and 2 for iBFS, and γ for case 3 for iBFS alone.
+                               = E[ P                ]                     Thus, the probability of the complement of case 1 and 2 for
+                                         |JF QA (k)|
+                                     k                                     a single BFS can be represented by (1 − α), and so on.
+
+
+
+
+                                                                     407
+                                                                                                                                                      Source	  Vertex	  1	                           Source	  Vertex	  2	  
+  120           Group A                                                                                                                                                              High	  	  
+                Group B                                                                                                                   Rule	  1	                              Outdegree	  	                                    Rule	  1	  
+                                                                                                                                                                                    Vertex	  
+  100           Random group
+
+     80
+                                                                                                                                                                                            …	         Rule	  2	  
+SD
+
+
+
+
+     60
+
+     40                                                                                                                                                            :	  Not	  shared	                             :	  Shared	  
+
+     20
+                                                                                                                                          Figure 7: An illustration of a power-law graph.
+
+     0
+            2       3        4            5           6           7        8         9
+                                              Level
+                                                                                                     levels. Combining Lemma 1 and Theorem 1, we can see that
+      Figure 6: Sharing ratio trend of Facebook graph (FB).                                          a GroupBy strategy can achieve good speedup by focusing
+                                                                                                     on the first several levels as described in Lemma 2.
+                                                                                                       Lemma 2. For two BFS groups A and B, for a small
+   Now for the level k +1, the size of JFQ is equal to the sum                                       number k, if their initial sharing ratios obey SDA (k) >
+of the number of frontiers shared by different BFS instances
+within group A, from one to N instances. Thus, let sj (k)                                            SDB (k) at the level k, the expected values for the speedups
+be the number of vertices that are shared by exactly j BFS                                           will follow E[speedupA ] > E[speedupB ].
+instances, we have
+                            N
+                            P                                 N
+                                                              P                                      5.2                                 Outdegree-based GroupBy Rules
+                                  |F Qj (k + 1)|                    j · sj (k + 1)                      Lemma 2 states that a good GroupBy rule can be obtained
+                            j=1                               j=1
+          SDA (k + 1) =                                   =                                          by focusing on increasing the BFS sharing in the first several
+                             |JF QA (k + 1)|                   N
+                                                               P
+                                                                      sj (k + 1)                     levels. Fortunately, an easy analysis on the outdegrees of the
+                                                               j=1
+                                                                                         (7)         frontiers at these levels, coupled with a quick determination
+                             N
+                             P                                                                       on the connectivity to high-outdegree vertices, can lead to
+                                   j · sj (k) · dj · (1 − αj )
+                             j=1                                                                     two simple yet powerful outdegree-based rules:
+                        =
+                            N
+                            P
+                                  sj (k) · dj · (1 − βj − γj )                                       Rule 1 The out-degrees of these two source vertices are less
+                            j=1                                                                          than p.
+                                                                                                     Rule 2 Two source vertices connect to at least one common
+ where dj denotes the average out-degree of these frontiers.                                             vertex whose outdegree is greater than q.
+  Since we do not know a priori the values for dj , αj , βj ,
+                                               ¯ ᾱ(k), β̄(k),
+and γj , if replacing them with average values d,                                                       Both rules are complementary to each other. Since the
+and γ̄(k), the expected value of SDA (k + 1) is                                                      first rule ensures small outdegrees of the source vertices,
+                                       N
+                                                                                                     other non-shared neighbors will not amortize the sharing
+                                           j · sj (k) · d¯ · (1 − ᾱ(k))                             ratio contributed by the shared vertex with high outdegrees
+                                       P
+                                     j=1                                                             from the second rule. With these two GroupBy rules, two
+          E[SDA (k + 1)] =                                                               (8)
+                                 N
+                                 P
+                                       sj (k) · d¯ · (1 − (β̄(k)) − γ̄(k))
+                                                                                                     BFS instances will likely get high sharing ratio.
+                                 j=1                                                                    Figure 7 shows an example of a power-law graph which is
+                                                                                                     the focus of this work. In this example, many vertices are
+ We assume that each single BFS has the same probability                                             connected to a high-outdegree vertex, and the source vertices
+ᾱ(k), so for iBFS, we have β̄(k) = ᾱj (k), and                                                     for different BFSes are not exception. When they share
+                                       N                                                             a common high-outdegree vertex, high sharing ratio across
+                                              j · sj (k) · d¯ · (1 − ᾱ(k))
+                                       P
+                                                                                                     multiple BFSes can be easily achieved. It is not required
+                                     j=1
+          E[SDA (k + 1)] =                                                                           that the source vertex directly connects to a high-outdegree
+                                 N
+                                 P
+                                       sj (k) · d¯ · (1 − (ᾱj (k)) − γ̄(k))             (9)         vertex, as long as within the first several levels. Simply
+                               j=1                                                                   put, for two BFSes, it is beneficial to group them together
+                                                1 − ᾱ(k)                                            if their source vertices have relatively small number of edges
+                            ≈ SDA (k) ·                                                              and also connect to high-outdegree vertices.
+                                                1 − γ̄(k)
+
+  Now we consider two groups A and B. If SDA (k) >                                                                          100
+                                                                                                     Relative performance (%)
+
+
+
+
+SDB (k), as ᾱ(k) and γ̄(k) are independent of groups, we
+get E[SDA (k + 1)] > E[SDB (k + 1)] from equation (9).                                                                          80
+
+                                                                                                                                60
+   Figure 6 exhibits average sharing ratios for three different
+groups. We start from the second level as no BFS instances                                                                      40
+                                                                                                                                                                                                                                                         HW
+share the source vertices, and the maximum SD is equal to                                                                                                                                                                                                KG0
+N , that is, 128. Since group A has a higher SD at the                                                                          20                                                                                                                       LJ
+second level than group B, it always has higher ratios in                                                                                                                                                                                                OR
+                                                                                                                                0
+the following levels. Similarly, group B has higher ratios                                                                           1                    4             16                  64               256               1024                   4096
+than random. Clearly, as shown in Figure 6, sharing ratios                                                                                                                                          q
+would not increase monotonically for a group, which tend                                                                                 Figure 8: Performance of GroupBy for different q.
+to peak at the first several bottom-up levels. Nevertheless,
+Theorem 1 implies that a higher sharing ratio of the initial                                           Selection of p and q. Figure 8 plots the GroupBy
+levels can lead to a higher expected sharing ratio in later                                          performance for different q values. One can see that the
+
+
+
+
+                                                                                               408
+performance rises initially and reaches the peak, typically                                                                           I            Figure 10: The circle represents all the ver-
+                                                                                                                                       y           tices in a graph. There are two instances
+around the range of 128 – 1024. The lower performance is
+                                                                                                                                  x           z    BFS-s and BFS-t. Area I and II repre-
+observed for both smaller and larger q. For smaller q, the                                                            IV                        II sent the visited vertices for BFS-s (fron-
+groups would likely have small sharing ratios. On the other                                                                                        tiers at top-down), and Area III and IV the
+hand, for larger q, very few BFS instances would satisfy the                                                                          w
+                                                                                                                                                   unvisited vertices for BFS-s (frontiers at
+GroupBy rules. In this paper q is 128 by default. Once q is                                                                                        bottom-up). Similarly, Area I and IV rep-
+decided, p is selected in the ascending order from a sequence                                                                         III          resent the visited vertices for BFS-t, and
+                                                                                                                                                   Area II and III the unvisited vertices for
+of numbers that are the power of 2. Here we select p from a                                                                                        BFS-t.
+sequence of 4, 16, 64, and 128.
+   The rules are applied as follows. First, iBFS selects all
+groups that satisfy both rule 1 and 2 with pre-determined p
+                                                                                                           top-down, that is, bigger Area I, they share more frontiers
+and q. iBFS will run such groups directly when their sizes
+                                                                                                           at bottom-up, that is, bigger Area III. From Figure 9(b), one
+are larger than N , the maximum group size described in Sec-
+                                                                                                           can see that for bottom-up, all the graphs still achieve 66.1%
+tion 3. Otherwise, several small groups, likely using different
+                                                                                                           on average, close to 2 times improvement. This is significant
+values of p, will be combined and run together. Second, iBFS
+                                                                                                           because in bottom-up frontier sharing ratio is already high
+will try to combine the groups with different high-outdegree
+                                                                                                           (38.7%) to begin with.
+vertices. Last, when no BFS satisfies both rules, iBFS will
+                                                                                                              The most significant benefit of GroupBy when it comes to
+group the remaining them in a random manner.
+                                                                                                           bottom up lies on the fact that it helps balance the work-
+   Sharing ratio improvement. Figure 9 plots the im-
+                                                                                                           load. For a shared vertex w in Area III shown in Figure 10,
+provement on the sharing ratio using outdegree-based rules
+                                                                                                           depending on which BFS it belongs to and who is its par-
+for both top-down and bottom-up. Specifically, for top-
+                                                                                                           ent, it may need to search all three other areas. Again,
+down, our GroupBy rules improves the sharing ratio by 10×,
+                                                                                                           When BFS-s and BFS-t share more frontiers at top-down,
+which increases from average 3.9% to 39.3% for 128 BFS in-
+                                                                                                           that is, bigger Area I, this also increases the likelihood that
+stances. For bottom-up, although the relative improvement
+                                                                                                           both BFS instances discover the shared parent y in Area
+is smaller, the sharing ratio is greatly improved to average
+                                                                                                           I. As bottom-up inspection terminates as soon as a parent
+66.1% which we will discuss shortly.
+                                                                                                           is found, such sharing will further lead to similar runtimes
+                                  100
+                                                                                                           across different BFSes, that is, reducing the variance in run-
+                                                                                 Random grouping           times. To demonstrate this, Figure 11 shows the standard
+Frontier sharing ratio (percentage)
+
+
+
+
+                                      75                                         GroupBy                   deviation for the number of inspections during bottom-up
+                                      50                                                                   before and after GroupBy. Since GroupBy combines the
+                                      25                                                                   BFS instances that would find their parent with a similar
+                                       0                                                                   runtime, it lowers the standard deviation by 13×. Among
+                                                                  (a) Top-down
+                                                                                                           all the graphs, it helps the TW graph the most – by 66×, re-
+                               100
+                                                                                                           ducing the number of inspections from 744 to 11.3. Clearly,
+                                      75
+                                                                                                           GroupBy helps to transform a highly imbalanced workload
+                                      50
+                                      25
+                                                                                                           to a much more balanced one.
+                                      0
+                                                                                                                                              309                                  744 275
+                                            FB   FR HW KG0 KG1 KG2 LJ OR          PK   RD RM TW WK
+                                                                (b) Bottom-up                                                   150                 Random grouping
+Figure 9: Frontier sharing ratio comparison between random and                                                                                      GroupBy
+                                                                                                           Standard deviation
+
+
+
+
+GroupBy.                                                                                                                        120
+
+                                                                                                                                90
+  For random graph that has a relatively uniform outdegree
+distribution, iBFS can adopt a slightly different rule. Since                                                                   60
+Theorem 1 and Lemma 2 still apply, iBFS can select a group
+of BFS instances if they share some common vertices from                                                                        30
+the sources. Our evaluation shows that such a rule may ob-
+                                                                                                                                 0
+tain 3.5× and 5% improvement in top-down and bottom-up                                                                                FB    FR HW KG0 KG1 KG2 LJ      OR PK RD RM TW WK
+respectively on a random graph, albeit much smaller com-                                                   Figure 11: Standard deviation of the distribution for number of
+pared to other graphs in our test suite.                                                                   inspections during bottom-up before and after GroupBy.
+
+5.3                                        GroupBy on Bottom-Up BFS
+   So far we have focused on GroupBy during the top-down                                                   6.                     GPU-BASED BITWISE OPERATIONS
+stage of BFS. Surprisingly, good GroupBy rules for top-down                                                   Although joint status array removes random inspections
+will lend themselves to achieving great speedups during the                                                on shared frontiers, assigning a warp of threads to work on
+bottom-up stage. Together, GroupBy further accelerates                                                     each frontier is not feasible when a graph has millions of
+iBFS performance by increasing frontier sharing and more                                                   frontiers. While modern GPUs like NVIDIA K40 provide
+importantly balancing the workload across various BFS in-                                                  thousands of hardware threads, clearly we still need to find
+stances. These two effects can be best explained using an                                                  a smart way to utilize threads effectively when dealing with
+example of two BFS instances, say BFS-s and BFS-t, within                                                  several millions of vertices in a graph. To this end, we pro-
+a group. In Figure 10, Area I represents shared, visited ver-                                              pose a novel concept of Bitwise Status Array (BSA) in
+tices between two BFSes whereas Area III shared, unvisited                                                 iBFS that uses a single bit to represent the status of each
+vertices. When BFS-s and BFS-t share more frontiers at                                                     vertex for different BFS instances. And all bits of one vertex
+
+
+
+
+                                                                                                     409
+Algorithm 1 Bitwise iBFS at Level k + 1                                                                 Algorithm 2 Frontier Identification at Level k + 1
+1: BSAk+1 ← BSAk                                                                                        1: forall vertex v in parallel do
+2: forall frontier f in parallel do                                                                     2:    if Top-down then
+3:    foreach neighbor v of f do                                                                        3:        if BSAk+1 [v] XOR BSAk [v] then
+4:        if Top-Down then                                                                              4:            JFQ.enqueue(v)
+5:            BSAk+1 [v] = BSAk+1 [v] ORatomic BSAk [f]                                                 5:        end if
+6:        else // Bottom-up                                                                             6:    else // Bottom-up
+7:            if BSAk+1 [f]==0xff...f then                                                              7:        if NOT BSAk+1 [v] then
+8:                break; // Early termination                                                           8:            JFQ.enqueue(v)
+9:            end if                                                                                    9:        end if
+10:            BSAk+1 [f] = BSAk+1 [f] OR BSAk [v]                                                      10:    end if
+11:        end if                                                                                       11: end for
+12:    end for
+13: end for
+                                                                                                        rently, iBFS needs atomic operations to avoid overwrites of
+                                                                                                        the updates to BSAk+1 , another difference from [26].
+are kept in a single variable. If this vertex is visited, we set
+                                                                                                           Bottom-up traversal, similarly assigns a single thread to
+it as 1, otherwise 0.
+                                                                                                        work on each frontier. However, the frontier’s status is
+   Figure 12 presents the mapping between joint and bitwise
+                                                                                                        updated by the neighbors’ statuses, that is, iBFS uses OR
+status array. Here for any vertex, while JSA uses the first
+                                                                                                        between BSAk+1 [f] and BSAk [v] and stores the result into
+four variables (3, U, 3, 2) to store the status for four BFS
+                                                                                                        BSAk+1 [f]. Using frontier 7 of Figure 13(b) as an example,
+instances, BSA only needs a single variable (1011).
+                                                                                                        its neighbors are {5, 6, 8}. iBFS executes OR between vertex
+                                                    Four	  variables	                                 5’s and 7’s statuses and stores the result in BSA4 [7].
+                                                                                                           Early Termination. During bottom-up traversal for
+                  JSA	     	  	  …	  	  	   3	   U	   3	   2	   	  	  …	  	  	           some frontiers, like frontier 7 in Figure 13(b), iBFS does
+                                                                                                        not necessarily need to check all its neighbors because it is
+                  BSA	     	  	  …	  	  	       1 0 1 1	   	  	  …	  	  	                   possible that some of its neighbors (e.g., vertex 5 for frontier
+                                                                                                        7) can set all bits of this frontier in the bitwise status array.
+                                                    Single	  variable	                                When this happens, iBFS will terminate the inspection on
+Figure 12: Mapping from joint status array (JSA) to bitwise sta-                                        this frontier, eliminating the need to further examine other
+tus array (BSA) for one vertex.                                                                         neighbors (e.g., vertices 6 and 8), which we call early termi-
+                                                                                                        nation in this work. This newly freed-up thread will then
+   With the bitwise status array, iBFS only needs one ex-                                               be scheduled to work on other frontiers. This is not possi-
+pansion thread to fetch the statuses of each vertex for all                                             ble unless the bitwise operations already record all visited
+concurrent BFS. In addition, the inspection of concurrent                                               vertices as ‘1’ in BSA, in this case before this level BSA4 [7]
+BFS that will be described shortly can be executed by a                                                 already has three bits set. In short, the early termination
+single bitwise operation, which can be easily done with a                                               allows a great reduction in the traversal time compared to
+single thread. In summary, this design frees up a substan-                                              prior work such as [26].
+tial number of threads and further reduces the number of                                                   Bitwise Frontier Identification. iBFS also needs a
+global memory access.                                                                                   different approach for frontier identification that works effi-
+   Bitwise Inspection. At level k + 1, iBFS keeps a copy                                                ciently with the bitwise status array. Algorithm 2 shows the
+of bitwise status array – BSAk . During traversal, the sta-                                             pseudocode for bitwise frontier identification.
+tuses for the most recently visited vertices are also marked                                               Top-down traversal executes the XOR operation between
+as 1 in BSAk+1 . At the end of each level, the differences                                              BSAk [v] and BSAk+1 [v]. If true is returned, it means some
+between BSAk and BSAk+1 are used to identify the just                                                   BFS instances have just changed the corresponding bit of
+visited vertices. Algorithm 1 shows the pseudo-code.                                                    v and stored in BSAk+1 [v]. Since top-down treats most re-
+   For top-down traversal, iBFS assigns a single thread to                                              cently visited vertices as frontiers, iBFS hence stores the
+work on frontier f . This thread loads frontier’s status (i.e.,                                         identified frontiers in the joint frontier queue. In contrast,
+BSAk [f]) from BSAk and subsequently sets all neighbors’                                                bottom-up traversal, is much easier since it treats unvisited
+status in BSAk+1 [v] via a bitwise OR operation. For each                                               vertices as frontiers. Therefore, iBFS simply performs a NOT
+neighbor, this OR operation only affects the bits for the cor-                                          operation on BSAk+1 [v]. If it is evaluated as true, that is,
+responding BFS instances that share this frontier, because                                              some bits of BSAk+1 [v] are not set, then this vertex is a
+only these bits in BSAk [f ] are recently updated as 1.                                                 frontier and iBFS puts it in the joint frontier queue.
+   Using frontier 7 in Figure 13(a) as an example, vertex 7 is                                             Vector data types on GPUs are also leveraged in iBFS.
+a frontier shared by the third and fourth BFS instances in                                              Clearly, the number of bits in each variable affects the num-
+Figure 1. During the inspection of vertex 7’s neighbor – {5,                                            ber of concurrent BFS, e.g., if BSA is implemented with int
+6, 8}, iBFS uses the bitwise OR operation between 7’s status                                            type, one variable can represent the statuses for 32 BFS in-
+and each neighbor’s status. Specifically, for vertex 5, it sets                                         stances. In CUDA, the basic data are char, int and long,
+the third bit in BSA3 [5], and for vertex 6, the fourth bit in                                          and on the other hand vector packs multiple basic types into
+BSA3 [6]. One may also notice that, the OR operation does                                               one, e.g., int4 contains four ints, similarly char4, long4
+not affect the already set bits, like the fourth bit of vertex 5                                        etc. Using the vector data type in iBFS can further reduce
+in BSA3 [5]. The reason is that the fourth BFS instance has                                             the memory access time as it fetches four basic data elements
+already visited vertex 5 in prior levels.                                                               together at one time.
+   Because multiple BFS instances may want to set different                                                Summary. Our bit-wise approach is novel in a number of
+bits of the same vertex in the bitwise status array concur-                                             ways, which leads to upto 2.6× speedup over [26]. First, [26]
+
+
+
+
+                                                                                                  410
+            Vertex id      5          6        7          8                                                            5              6            7           8
+     BSA3               1 0 0 1   0 1 1 0   0 1 1 1    0 0 0 1                                       BSA4           1 0 1 1       0 1 1 1       0 1 1 1     0 0 1 1
+                                                                                                                                                     BSA3[6] BSA3[8]
+  BSA2[7]   0 0 1 1                                                                                                 BSA3[5]     1 0 1 1             ✗       ✗
+                                                          OR                                                                                   OR early terminaJon
+                          OR        OR
+     BSA3            1 0 1 1      0 1 1 1      0 1 1 1      0 0 1 1         BSA4        1 0 1 1      0 1 1 1     01 1 1 1      0 0 1 1
+            Vertex id    5             6          7            8                            5             6          7            8
+                           (a) Level 3 — Top-down traversal                                   (b) Level 4 — Bo/om-up traversal
+Figure 13: Traversing four BFS instances of the example graph from Figure 1 with bitwise status array: (a) Level 3 – Top-down traversal.
+(b) Level 4 – Bottom-up traversal. Shadow bits stand for updated status.
+
+
+resets the bitwise status array at each level and only records          our local cluster with Intel Xeon E5-2683 CPUs, and later
+the current level frontiers as 1. In comparison, iBFS records           on the Stampede supercomputer on NSF Extreme Science
+every visited vertex as 1 regardless of which level it is vis-          and Engineering Discovery Environment (XSEDE) program,
+ited. This way our bitwise status array remembers all visited           where iBFS runs from 1 to 112 machines each of which is
+vertices, for which we also introduce a new frontier identi-            equipped with one NVIDIA Kepler K20 GPU.
+fication technique and early termination during bottom-up                  We measure the execution time from when all the data are
+traversal as described earlier. Second, [26] is based on sin-           loaded in GPU memory to the traversal is completed and the
+gle thread BFS implementation, that is, each thread works               results are stored in GPU memory. All the execution uses
+on one BFS instance. In contrast, iBFS supports multi-                  uint64 data type. We use the metric of traversed edges per
+threaded bitwise operation, that is, all available threads will         second (TEPS) to measure the performance, which is calcu-
+work on a group of BFS instances. Inter-thread synchro-                 lated by the ratio of the number of directed edges traversed
+nization shall be carefully managed, because in iBFS mul-               by the search, counting any multiple edges and self-loops,
+tiple threads will need to update different bits of the same            and the time elapsed during iBFS execution. In the tests,
+vertex simultaneously. In top-down, iBFS uses (manually                 iBFS performs breadth-first search from all the vertices.
+controllable) shared memory on GPUs to cache and merge
+the updates in the same CTA (typically 256 threads), which              8.1                          Graph Benchmarks
+avoids the overhead of atomic operations at this step. Next,
+iBFS has to rely on atomic operations to push the combined                                 1200
+                                                                                                         KG0                                                      KG2
+updates to the global memory. In bottom-up, iBFS performs                                  1000
+                                                                        Edge Count (million)
+
+
+
+
+multi-step tree-based merging of the updates within threads
+in a warp or CTA, again avoiding atomic operations.                                            800
+                                                                                                                                     KG1
+                                                                                               600
+7.   iBFS ON CPUS                                                                                                                                                    FR
+                                                                                               400                                                                   FB
+   In principal iBFS can be implemented on CPUs. Specifi-                                                     RM OR
+                                                                                                                                                   RD                TW
+cally, joint traversal and GroupBy can follow the same de-                                     200       HW
+                                                                                                               PK   WK LJ
+sign on GPUs. One notable difference is that iBFS would                                         0
+need atomic operation on CPUs for the multi-thread bit-                                              0         2      4       6       8      10       12   14   16        18
+wise operation. Note that [26] does not need atomic op-                                                                        Vertex Count (million)
+erations because it is based on single-thread BFS. Gener-                                                           Figure 14: Graph benchmarks.
+ally speaking, concurrent BFS is an I/O intensive applica-
+tion, as it always has many frontiers to be processed. As                  In this work we use total 13 graph benchmarks to eval-
+modern CPUs provide tens of cores and thousands of regis-               uate iBFS, which as summarized in Figure 14 have upto
+ters [37,38], issuing a large number of CPU threads may im-             17 million vertices and 1 billion edges. In particular, there
+prove memory throughput but inevitably would incur high                 are seven real-world graphs of well-known online social net-
+overhead of context switches. On the other hand, GPUs not               works. Facebook (FB) [39], a user to friend connection
+only provide a large quantity of small cores coupled with               graph, contains 16,777,216 vertices and 420,914,604 edges.
+huge register files, e.g., 2,880 cores and 983,040 registers on         Twitter (TW) [40] is a follower connection graph, that is,
+NVIDIA Kepler K40 GPUs, but also support zero-overhead                  if user v follows user u, (v, u) is considered as an edge. It
+context switch [36]. As we will present shortly, compared to            also has 16,777,216 vertices and 196,427,854 different edges.
+the CPU-based implementation, GPU-based iBFS runs 2×                    Wikipedia (WK) [41] is a inter-website hyper-link graph,
+faster on average on various graphs.                                    which consists of 3,566,908 vertices and 45,030,389 edges.
+                                                                        We also obtain four popular online social network graphs,
+8.   EXPERIMENTS                                                        i.e., LiveJournal (LJ), Orkut (OR), Friendster (FR), and
+  iBFS is implemented in 4,000 lines of CUDA and C++                    Pokec (PK), from Stanford Large Network Dataset Collec-
+codes, extending a GPU-based high-performance BFS im-                   tion [42]. Specifically, LJ contains 4,847,571 vertices and
+plementation – Enterprise [33]. Since it supports both top-             137,987,546 edges. OR has 3,072,627 vertices with an aver-
+down and bottom-up BFS, our iBFS can be easily config-                  age outdegree of 75.27. FR contains 16,777,212 vertices and
+ured to support conventional top-down BFS and traverse                  439,147,122 edges. PK is the smallest graph with 1,632,804
+weighted graphs. iBFS is compiled using g++ 4.4.7, MPI                  vertices and 30,622,564 edges.
+(MVAPICH2) and NVIDIA CUDA 6.0 with the -O3 flag.                          In addition, we generate three types of synthetic graphs
+Our system is evaluated on NVIDIA Kepler K40 GPUs on                    with Graph 500 generator [43–45], namely, KG0, KG1 and
+
+
+
+
+                                                                  411
+                                                         729                                                                              832
+                                                  506                                                                              640
+                   400   Sequential
+                         Naive
+  TEPS (billion)
+
+
+                   300   Joint traversal
+                         Bitwise operation
+                         GroupBy
+                   200
+
+                   100
+
+                     0
+                           FB         FR     HW    KG0         KG1   KG2         LJ                      OR     PK        RD         RM         TW        WK
+Figure 15: Traversal rate comparison between Sequential BFS, Concurrent BFS, Joint Traversal, Bitwise Optimization, and GroupBy.
+
+
+KG2. The default value of (A, B, C) parameter is (0.57,                          to 5.5 hours, where joint traversal helps to reduce to 87.8
+0.19, 0.19) per the requirement of Graph 500 [44]. Specifi-                      hours, bitwise optimization 11.2 hours, and GroupBy the
+cally, KG0 stands for the high average outdegree graphs, i.e.,                   rest. GroupBy incurs a minimal processing time of less than
+its average outdegree is 1024 and vertex count is 1,048,576.                     0.1 second on average.
+KG2 serves as the biggest graph in this paper, i.e., with
+both biggest vertex and edge count – 16,777,216 vertices                                           300
+                                                                                                              GroupBy
+and 1,073,741,824 edges. KG1 has 8,388,608 vertices and                                                       Random grouping
+                                                                                                   250
+603,979,776 edges. We also use the DIMACS graph gener-
+
+
+
+
+                                                                                  TEPS (billion)
+ator [46] to generate the RM and RD graphs in this paper.
+                                                                                                   200
+RM follows the same theory from Graph 500 [43–45] but
+with a different (A, B, C) set of (0.45, 0.15, 0.15). RM has
+                                                                                                   150
+2,097,152 vertices and 268,435,456 edges. RD [47] graph has
+uniform outdegree distribution, i.e., each vertex has roughly
+                                                                                                   100
+the same outdegree. RD contains 11,796,480 vertices and
+188,743,680 edges.
+                                                                                                         1      4       16         64        256       1024    4096
+   All these graphs are stored in the Compressed Sparse Row                                                             Number of groups (log scale)
+(CSR) format. For graphs that are provided in the edge list                      Figure 16: Traversal performance when running different number
+format, we translate them into CSR while preserving the                          of BFS groups on HW.
+edge sequence. For undirected graphs, each edge is consid-
+ered as two directed edges. For directed graphs, we also                            We further evaluate the traversal performance of iBFS as
+store the reversed edges to support the bottom-up traversal.                     the number of i varies, that is, running MSSP with varied
+The size of these graph ranges from 478 MB (PK) to 8.2                           number of source vertices. We observe similar performance
+GB (KG2) when using long integer (8 bytes) to represent                          on all the graph benchmarks. Figure 16 presents the TEPS
+the vertex id.                                                                   when running different number of BFS groups on the HW
+                                                                                 graph, where the total number of BFS instances equals to
+8.2                  iBFS Performance                                            the multiply of the number of groups and the group size.
+                                                                                 Clearly, as there are more BFS instances to run, the ben-
+  We evaluate three techniques, joint traversal, bitwise op-
+                                                                                 efit of GroupBy – the gap between GroupBy and random
+eration, and GroupBy, and compare against running all BFS
+                                                                                 grouping – increases because better groups can be formed.
+instances sequentially (sequential ) or in parallel without any
+                                                                                 Specifically, with randomly formed groups, the traversal rate
+optimization (naive), both of which are based on state-of-
+                                                                                 fluctuates in the range of 75 and 90 billion TEPS, which is
+the-art BFS implementation such as Enterprise [33]. In this
+                                                                                 raised to 288 billion TEPS with the help of GroupBy.
+test, we run APSP on all the graphs. As shown in Figure 15,
+sequential and naive implementation perform roughly the                          8.3                     iBFS Scalability
+same. On average, the later traverses 1.05× faster, but a
+                                                                                    In this test, we aim to evaluate the scalability of iBFS on
+worse performance is observed in HW, KG1, KG2 and RM
+                                                                                 a large number of distributed GPUs on the Stampede su-
+graphs, with only 78% of sequential performance on KG1.
+                                                                                 percomputer at TACC. Clearly, as long as different GPUs
+  In iBFS, joint traversal delivers 1.4× speedup compared
+                                                                                 work on independent BFSes, there is no need for inter-GPU
+to sequential implementation. The biggest performance gain
+                                                                                 communication. Therefore, the key challenge here is achiev-
+of 2.6× speedup comes for RD, from 4.4 to 11.3 billion
+                                                                                 ing workload balance on GPUs, especially when each indi-
+TEPS while the smallest is 1.03× speedup for PK . For
+                                                                                 vidual BFS may inspect different number of edges during
+other graphs, the performance improvement is more than
+                                                                                 bottom-up. The longest time consumption of all the GPUs
+10%. On the other hand, bitwise iBFS, on average speedup
+                                                                                 is reported in this test.
+the traversal by 11×. While the smallest improvement is
+                                                                                    For the five graphs tested, iBFS achieves good speedup
+6.4× on HW from 11.7 to 75 billion TEPS, the biggest im-
+                                                                                 from 1 to 112 GPUs (the total number of GPUs on Stam-
+provement is observed on RM – 18 × speedup from 36 to
+                                                                                 pede)1 . As shown in Figure 17, from one to two GPUs, the
+640 billion TEPS. Astoundingly, Groupby improves iBFS
+                                                                                 biggest speedup, as expected, is from RD of 1.97× because
+by additional 2× on average beyond bitwise optimization,
+                                                                                 RD graph has the most balanced workload. And even the
+with the highest traversal rate of 832 billion TEPS on RM.
+  In this test, iBFS greatly reduces the run time of APSP                        1
+                                                                                   As it took all the GPUs on Stampede, we were only given
+on all graphs from average 123 hours of sequential traversal                     a small time window to conduct this test.
+
+
+
+
+                                                                           412
+                                                                                                                                                                6
+
+
+
+
+                                                                                                                         Global load transactions per request
+                                           112              Ideal speedup                                                                                                                                    Naive
+                                                            RD                                                                                                                                               Joint traversal
+                                           96                                                                                                                   5
+                                                            FB
+                                           80               OR
+                                                                                                                                                                4
+Speedup
+
+
+
+
+                                                            TW
+                                           64               RM
+                                                            Average                                                                                             3
+                                           48
+                                           32                                                                                                                   2
+
+                                           16                                                                                                                   1
+                                               1
+                                                   1        16       32     48      64     80       96     112                                                  0
+                                                                              GPU count                                                                             FB   FR HW KG0 KG1 KG2 LJ    OR   PK   RD RM TW WK
+                                           Figure 17: Scalability of bitwise iBFS from 1 to 112 GPUs.                                                                Figure 19: Load transaction count per request.
+
+
+smallest speedup from OR is 1.9×. From one to four GPUs,                                                                 of iBFS always coalesces the inspections and updates from
+the average speedup is 3.8× with the smallest speedup from                                                               contiguous threads into a single global memory transaction,
+OR of 3.6× while the biggest from RD graph – 3.9×. As the                                                                our tests across 1,024 BFS instances show that we are able
+GPU count increases, workload imbalance slowly emerges                                                                   to reduce on average from four loads to a single load. The
+and begins to negatively affect the performance. Specifically,                                                           benefits add up quickly considering a large number of mem-
+iBFS achieves an average of 85× speedup for 112 GPUs.                                                                    ory operations in concurrent BFS. On average each BFS
+Again, RD gets the biggest speedup, i.e., 108×.                                                                          instance executes 50 million of global load transactions.
+   In all, iBFS achieves the average traversal rate of 16,509
+billion TEPS across all the tested graphs with the maximum                                                               8.5                                        Bitwise Operation
+57,267 billion TEPS on RM.                                                                                                                                      6
+
+8.4                                                    Joint Traversal and GroupBy                                                                                                                          Random grouping
+                                                                                                                                                                5                                           GroupBy
+   This section uses the NVIDIA profiler [48] to measure
+                                                                                                                                                                4
+the impact of joint traversal and GroupBy on memory ac-
+                                                                                                                         Speedup
+
+
+
+cesses. Having a joint frontier queue with only one copy                                                                                                        3
+of shared frontiers reduces the potentially large number of
+global memory writes, compared to having private frontier                                                                                                       2
+
+queues for each BFS instance. Figure 18 shows the number                                                                                                        1
+of global store transactions during the frontier queue gener-
+ation of 1,024 BFS instances. Using private frontier queue,                                                                                                     0
+i.e., private FQ, executes 4 billion transactions on average                                                                                                        FB   FR HW KG0 KG1 KG2 LJ    OR   PK   RD RM TW WK
+                                                                                                                                                                    Figure 20: The speedup of our bitwise operation.
+across all the graphs, while joint frontier queue with random
+groups, i.e. random FQ, only needs one fourth transactions.
+The biggest reduction of over 11× is observed in the KG2                                                                    We implement the bitwise operation as in [26] and use it
+graph, from 8.3 billion to 700 million, the smallest saving is                                                           as baseline running all the benchmarks in our paper. Fig-
+1.2× on HW, i.e., 720 million to 580 million. With GroupBy,                                                              ure 20 plots the speedup of our bitwise operation. Even with
+iBFS further saves the global stores by 2.6× with the largest                                                            random groups, we achieve 40% speedup, and our bitwise
+from HW of 4×.                                                                                                           operation enjoys a better speedup with the outdegree-based
+                                                                                                                         GroupBy rules, i.e., 2.6×. Specifically, in random grouping,
+                                                   13.1 8.0                 8.3
+Global store transaction count (billion)
+
+
+
+
+                                                                                                                         the maximum and minimum speedup is 2.5× of KG2 and 2%
+                                                                                                     Private FQ
+                                           4
+                                                                                                     Random JFQ
+                                                                                                                         of FR. In comparison, the maximum and minimum speedup
+                                                                                                     GroupBy JFQ         in GroupBy is 5.5× of KG1 and 15% of RD graph. Addi-
+                                           3                                                                             tional improvement from Groupby comes from the combined
+                                                                                                                         effect of high sharing ratio across grouped BFS instances and
+                                           2                                                                             early termination enabled by bitwise traversal, which as a
+                                                                                                                         result allows concurrent instances to complete together and
+                                           1
+                                                                                                                         as early as possible.
+                                                                                                                            In addition, we evaluate the impacts on the total number
+                                                                                                                         of global load transactions by bitwise traversal. Because bit-
+                                           0
+                                                       FB   FR HW KG0 KG1 KG2 LJ     OR   PK    RD RM TW WK              wise status array consolidates the statuses of multiple (128
+Figure 18: Global store transaction count during the generation of                                                       in our case) vertices into a single variable, we reduce the
+private frontier queue, random joint frontier queue and GroupBy                                                          global load transactions of 1,024 BFS instances by 40%, i.e.,
+joint frontier queue.                                                                                                    from 53 to 38 million on average presented in Figure 21.
+
+  Combining joint status array with careful thread schedul-                                                              8.6                                        Comparison of State of the Art
+ing introduces significant performance benefits, as iBFS min-                                                              We have implemented two CPU-based concurrent BFS,
+imizes costly memory operations. Figure 19 exhibits global                                                               namely MS-BFS [26] and our own iBFS, both of which run
+load transactions per request during traversal before and af-                                                            64 threads in total. In addition, we compare our GPU-based
+ter this optimization. Note that global store transactions                                                               iBFS with B40C [29] and SpMM-BC [27]. B40C runs a single
+per request exhibits similar trend. Since joint status array                                                             BFS instance on GPUs and has similar performance as the
+
+
+
+
+                                                                                                                   413
+                                     140
+Global load transactions (million)
+                                                                                    Joint traversal           9.    RELATED WORK
+                                     120                                            Bitwise operation            Our iBFS is closely related to CPU-based MS-BFS [26],
+                                     100                                                                      which runs concurrent BFS by extending a single-threaded
+                                      80
+                                                                                                              BFS, and compared to iBFS, underperforms on large graphs,
+                                                                                                              e.g., it only achieves 10 billion TEPS on a graph with a
+                                      60                                                                      billion of edges. In contrast, iBFS achieves more than 500
+                                      40                                                                      billion TEPS on a graph with billions of edges. Furthermore,
+                                                                                                              the bitwise operation from MS-BFS cannot support early
+                                      20
+                                                                                                              termination due to that it requires to reset the status array
+                                      0                                                                       at each level, which leads to a much slower performance.
+                                             FB    FR HW KG0 KG1 KG2 LJ    OR PK    RD RM TW WK
+                                                                                                              Most notably, iBFS introduces a novel GroupBy strategy
+                                             Figure 21: Total number of load transactions.
+                                                                                                              that improves the frontier sharing ratio dramatically and
+                                                                                                              increases the benefit of concurrent traversal by another 2×.
+sequential or naive implementation presented in Figure 15,                                                       Recent work has demonstrated that GPUs have great po-
+and SpMM-BC uses a simple GPU-based concurrent BFS                                                            tentials in delivering high-performance breadth-first graph
+to calculate betweenness centrality. Figure 22 presents the                                                   traversal [29,49]. One project SpMM-BC on regularized cen-
+performance of all five implementations when running APSP                                                     trality [27] also extends the GPU-based BFS to concurrent
+on six different graphs.                                                                                      BFS, but it does not support bottom-up BFS. On the other
+  CPU-based iBFS is significantly faster than MS-BFS thanks                                                   hand, the work [35] executes concurrent BFS to calculate
+to the techniques such as GroupBy and early termination.                                                      the betweenness centrality [11] of a graph. However, each
+The biggest speedup is achieved for the KG0 graph, where                                                      GPU in this work only executes a single BFS which is simi-
+MS-BFS obtains 120 billion TEPS while our CPU-based                                                           lar to the naive implementation in our work. In comparison,
+iBFS reaches 397 billion TEPS. iBFS also achieves an av-                                                      iBFS runs hundreds of BFS instances with one kernel and
+erage improvement of 45% on other five graphs. On GPUs,                                                       achieves on average 22× speedup compared to executing a
+iBFS traverses on average 2× faster than SpMM-BC, and                                                         single BFS on one GPU. Also, iBFS supports O(100) GPUs
+19.3× than B40C. For graphs KG0 and HW, iBFS delivers                                                         and achieves around 200 billion TEPS for graphs such as LJ
+about 700 and 300 TEPS respectively, greatly outperform-                                                      and OR, significantly outperforming prior work [27, 35].
+ing the other two implementations. Compared to the CPU-                                                          In addition, our work is related to three types of short-
+based implementation, GPU-based iBFS runs 2× faster on                                                        est path algorithms [50–56], namely, Dijkstra, Bellman-Ford
+average across six different graphs.                                                                          and Floyd-Warshall. The first two algorithms focus on SSSP
+                                                                                                              while the later APSP. Specifically, Dijkstra [57] applies to
+                                                                 500 729                                      weighted graph where weight must be positive, with the
+                                                                                                              complexity of O(|E| + |V | log |V |). Bellman-Ford [58] ex-
+                                     400                                                     MS-BFS
+                                                                                     CPU                      tends Dijkstra by allowing negative weighted edges but non-
+                                                                                             CPU iBFS
+                                                                                                              negative cycles. Floyd-Warshall [59] works for APSP [60]
+                                     300
+TEPS (billion)
+
+
+
+
+                                                                                             B40C             with the same constraint as Bellman-Ford algorithm. In
+                                                                                     GPU     SpMM-BC
+                                                                                             GPU iBFS         contrast, our iBFS applies to all types of shortest path prob-
+                                     200                                                                      lems on a unweighted graph with the time complexity of
+                                                                                                              O(i|V |) ∼ O(i|E|).
+                                     100                                                                         PHAST [61] runs multiple SSSP on GPU concurrently.
+                                                                                                              However, this work only applies to road network graphs and
+                                      0                                                                       suffers from small-world graphs which do not have good sep-
+                                              FB       HW        KG0       LJ       OR          TW            arators as mentioned in [62]. Two MSSP algorithms [63, 64]
+                                     Figure 22: Comparison of CPU and GPU implementations.                    mainly focus on special graphs, i.e., planar and embedded
+                                                                                                              graphs, respectively. In contrast, our iBFS applies to both
+                                                                                                              small-world and random graphs, and leverages the opportu-
+8.7                                        Application: Reachability Index                                    nity of frontier sharing to accelerate concurrent BFS.
+   To illustrate the broader application of iBFS on graph
+algorithms, in this paper we evaluate the benefits of using
+iBFS to construct the index for answering graph reachabil-
+                                                                                                              10.   CONCLUSION
+ity queries, which computes the first k levels BFS for a large                                                   In this work, we present iBFS, a new GPU-based concur-
+amount of selected vertices. Table 1 lists the runtimes of var-                                               rent BFS system which leverages a novel GroupBy strategy,
+ious implementations for constructing the index for 3-hop                                                     combined with joint frontier queue and bitwise operations,
+reachability. Clearly, GPU-based iBFS outperforms other                                                       to achieve high-performance concurrent breadth-first traver-
+concurrent BFS systems on four different graphs. Specifi-                                                     sals. iBFS achieves unprecedented performance of over 57,000
+cally, it is 21×, 3.3× and 2.2× faster than B40C, MS-BFS                                                      billion TEPS on over 100 GPUs. As part of future work, we
+and CPU-based iBFS, respectively.                                                                             plan to explore additional optimizations for iBFS and study
+                                                                                                              its application on a wide range of domains.
+                                                              CPU                   GPU
+                                           Dataset
+                                                     MS-BFS     CPU-iBFS    B40C     GPU-iBFS
+                                            FB
+                                            KG0
+                                                      19.2
+                                                      1.85
+                                                                  16.5
+                                                                  0.56
+                                                                            302.8
+                                                                             2.9
+                                                                                       14.3
+                                                                                       0.31
+                                                                                                              ACKNOWLEDGMENTS
+                                            OR         4.1        3.22       25.3       1.1                   We would like to thank the anonymous reviewers for their
+                                            TW         2.1        2.7        27.8       0.9
+                                                                                                              comments and suggestions. This work was supported by
+                                       Table 1: Runtime (hours) of 3-hop reachability index.                  NVIDIA and the National Science Foundation.
+
+
+
+
+                                                                                                        414
+11.   REFERENCES                                                    [17] Shlomi Dolev, Yuval Elovici, and Rami Puzis. Routing
+                                                                         betweenness centrality. Journal of the ACM (JACM),
+ [1] Stanley Milgram. The small world problem.                           57(4):25, 2010.
+     Psychology today, 2(1):60–67, 1967.                            [18] Shilpa Mahajan and Jyoteesh Malhotra. Energy
+ [2] David Knoke and Song Yang. Social network analysis,                 efficient path determination in wireless sensor network
+     volume 154. Sage, 2008.                                             using bfs approach. Wireless Sensor Network,
+ [3] Juanzi Li, Jie Tang, Jing Zhang, Qiong Luo, Yunhao                  3(11):351, 2011.
+     Liu, and Mingcai Hong. Eos: expertise oriented search          [19] Vladimir Ufimtsev and Sanjukta Bhowmick.
+     using social networks. In Proceedings of the 16th                   Application of group testing in identifying high
+     international conference on World Wide Web, pages                   betweenness centrality vertices in complex networks.
+     1271–1272. ACM, 2007.                                               In 11th Workshop on Machine Learning with Graphs,
+ [4] Hawoong Jeong, Bálint Tombor, Réka Albert,                        KDD, 2013.
+     Zoltan N Oltvai, and A-L Barabási. The large-scale            [20] Réka Albert, Hawoong Jeong, and Albert-László
+     organization of metabolic networks. Nature,                         Barabási. Error and attack tolerance of complex
+     407(6804):651–654, 2000.                                            networks. nature, 406(6794):378–382, 2000.
+ [5] David Easley and Jon Kleinberg. Networks, crowds,              [21] Michael Bosse, Paul Newman, John Leonard, and Seth
+     and markets: Reasoning about a highly connected                     Teller. Simultaneous localization and map building in
+     world. Cambridge University Press, 2010.                            large-scale cyclic environments using the atlas
+ [6] Pawan Harish and PJ Narayanan. Accelerating large                   framework. The International Journal of Robotics
+     graph algorithms on the gpu using cuda. In High                     Research, 23(12):1113–1139, 2004.
+     performance computing–HiPC, pages 197–208.                     [22] Shigeru Ichikawa. Navigation system and method for
+     Springer, 2007.                                                     calculating a guide route, February 26 2002. US
+ [7] Hiroki Yanagisawa. A multi-source label-correcting                  Patent 6,351,707.
+     algorithm for the all-pairs shortest paths problem. In         [23] Angela Bonifati, Radu Ciucanu, and Aurélien Lemay.
+     International Symposium on Parallel & Distributed                   Learning path queries on graph databases. In 18th
+     Processing (IPDPS), pages 1–10. IEEE, 2010.                         International Conference on Extending Database
+ [8] I-Lin Wang, Ellis L Johnson, and Joel S Sokol. A                    Technology (EDBT), 2014.
+     multiple pairs shortest path algorithm. Transportation         [24] Marc Najork and Janet L Wiener. Breadth-first
+     science, 39(4):465–476, 2005.                                       crawling yields high-quality pages. In Proceedings of
+ [9] Raimund Seidel. On the all-pairs-shortest-path                      the 10th international conference on World Wide Web,
+     problem in unweighted undirected graphs. Journal of                 pages 114–118. ACM, 2001.
+     computer and system sciences, 51(3):400–403, 1995.             [25] Xuesong Lu, Tuan Quang Phan, and Stéphane
+[10] Abhinav Sarje and Srinivas Aluru. All-pairs                         Bressan. Incremental algorithms for sampling dynamic
+     computations on many-core graphics processors.                      graphs. In Database and Expert Systems Applications,
+     Parallel Computing, 39(2):79–93, 2013.                              pages 327–341. Springer, 2013.
+[11] Ulrik Brandes. A faster algorithm for betweenness              [26] Manuel Then, Moritz Kaufmann, Fernando Chirigati,
+     centrality*. Journal of Mathematical Sociology,                     Tuan-Anh Hoang-Vu, Kien Pham, Alfons Kemper,
+     25(2):163–177, 2001.                                                Thomas Neumann, and Huy T Vo. The more the
+[12] Kamesh Madduri, David Ediger, Karl Jiang, David A                   merrier: Efficient multi-source graph traversal.
+     Bader, and Daniel Chavarria-Miranda. A faster                       Proceedings of the VLDB Endowment, 8(4), 2014.
+     parallel algorithm and efficient multithreaded                 [27] Ahmet Erdem Sarıyüce, Erik Saule, Kamer Kaya, and
+     implementations for evaluating betweenness centrality               Ümit V Çatalyürek. Regularizing graph centrality
+     on massive datasets. In International Symposium on                  computations. Journal of Parallel and Distributed
+     Parallel & Distributed Processing (IPDPS), pages 1–8.               Computing, 2014.
+     IEEE, 2009.                                                    [28] Ahmet Erdem Sariyuce, Erik Saule, Kamer Kaya, and
+[13] Paul W Olsen, Alan G Labouseur, and Jeong-Hyon                      Umit V Catalyurek. Hardware/software vectorization
+     Hwang. Efficient top-k closeness centrality search. In              for closeness centrality on multi-/many-core
+     International Conference on Data Engineering                        architectures. In International Parallel & Distributed
+     (ICDE), pages 196–207. IEEE, 2014.                                  Processing Symposium Workshops (IPDPSW), pages
+[14] Hilmi Yildirim, Vineet Chaoji, and Mohammed J                       1386–1395. IEEE, 2014.
+     Zaki. Grail: Scalable reachability index for large             [29] Duane Merrill, Michael Garland, and Andrew
+     graphs. Proceedings of the VLDB Endowment,                          Grimshaw. Scalable gpu graph traversal. In ACM
+     3(1-2):276–284, 2010.                                               PPoPP, 2012.
+[15] James Cheng, Zechao Shang, Hong Cheng, Haixun                  [30] Rupesh Nasre, Martin Burtscher, and Keshav Pingali.
+     Wang, and Jeffrey Xu Yu. K-reach: who is in your                    Data-driven versus topology-driven irregular
+     small world. Proceedings of the VLDB Endowment,                     computations on gpus. In 27th International
+     5(11):1292–1303, 2012.                                              Symposium on Parallel & Distributed Processing
+[16] Ruoming Jin, Yang Xiang, Ning Ruan, and David                       (IPDPS), pages 463–474. IEEE, 2013.
+     Fuhry. 3-hop: a high-compression indexing scheme for           [31] Sungpack Hong, Tayo Oguntebi, and Kunle Olukotun.
+     reachability query. In Proceedings of the SIGMOD                    Efficient parallel graph exploration on multi-core cpu
+     International Conference on Management of data,                     and gpu. In International Conference on Parallel
+     pages 813–826. ACM, 2009.
+
+
+
+
+                                                              415
+     Architectures and Compilation Techniques (PACT),                   of the 20th ACM international conference on
+     pages 78–88. IEEE, 2011.                                           Information and knowledge management, pages
+[32] S Beamer, K Asanovic, and D Patterson.                             1775–1784. ACM, 2011.
+     Direction-optimizing breadth-first search. In                 [52] Jun Gao, Jeffrey Xu Yu, Ruoming Jin, Jiashuai Zhou,
+     International Conference for High Performance                      Tengjiao Wang, and Dongqing Yang.
+     Computing, Networking, Storage and Analysis (SC),                  Neighborhood-privacy protected shortest distance
+     pages 1–10. IEEE, 2012.                                            computing in cloud. In Proceedings of the SIGMOD
+[33] Hang Liu and H. Howie Huang. Enterprise:                           International Conference on Management of data,
+     Breadth-first graph traversal on gpu servers. In                   pages 409–420. ACM, 2011.
+     International Conference for High Performance                 [53] Weimin Yu, XINGQIN LIN, Wensheng Zhang, Julie
+     Computing, Networking, Storage and Analysis (SC),                  McCann, et al. Fast all-pairs simrank assessment on
+     2015.                                                              large graphs and bipartite domains. 2014.
+[34] Nvidia. Nvidia kepler gk110 architecture whitepaper.          [54] Andy Diwen Zhu, Xiaokui Xiao, Sibo Wang, and
+     2013.                                                              Wenqing Lin. Efficient single-source shortest path and
+[35] Adam McLaughlin and David A Bader. Scalable and                    distance queries on large graphs. In Proceedings of the
+     high performance betweenness centrality on the gpu.                19th ACM SIGKDD international conference on
+     In International Conference for High Performance                   Knowledge discovery and data mining, pages
+     Computing, Networking, Storage and Analysis (SC),                  998–1006. ACM, 2013.
+     pages 572–583. IEEE, 2014.                                    [55] Jianlong Zhong and Bingsheng He. Parallel graph
+[36] Nvidia cuda c programming guide. NVIDIA                            processing on graphics processors made easy.
+     Corporation, 2011.                                                 Proceedings of the VLDB Endowment,
+[37] Intel Inc. Product brief intel xeon processor                      6(12):1270–1273, 2013.
+     e7-8800/4800/2800 v2 product families. 2014.                  [56] Jianlong Zhong and Bingsheng He. Medusa: A parallel
+[38] Intel Inc. Hpc code modernization workshop at lrz.                 graph processing system on graphics processors. ACM
+     2015.                                                              SIGMOD Record, 43(2):35–40, 2014.
+[39] Minas Gjoka, Maciej Kurant, Carter T. Butts, and              [57] Roger Pearce, Maya Gokhale, and Nancy M Amato.
+     Athina Markopoulou. Practical Recommendations on                   Multithreaded asynchronous graph traversal for
+     Crawling Online Social Networks. JSAC, 2011.                       in-memory and semi-external memory. In Proceedings
+[40] Haewoon Kwak, Changhyun Lee, Hosung Park, and                      of the International Conference for High Performance
+     Sue Moon. What is twitter, a social network or a news              Computing, Networking, Storage and Analysis (SC),
+     media? In WWW, 2010.                                               pages 1–11. IEEE Computer Society, 2010.
+[41] The University of Florida: Sparse Matrix Collection.          [58] Andrew Davidson, Sean Baxter, Michael Garland, and
+     http://www.cise.ufl.edu/research/                                  John D Owens. Work-efficient parallel gpu methods
+     sparse/matrices/.                                                  for single-source shortest paths. In 28th International
+[42] SNAP: Stanford Large Network Dataset Collection.                   Symposium on Parallel & Distributed Processing
+     http://snap.stanford.edu/data/.                                    (IPDPS), pages 349–359. IEEE, 2014.
+[43] Deepayan Chakrabarti, Yiping Zhan, and Christos               [59] Hristo Djidjev, Sunil Thulasidasan, Guillaume
+     Faloutsos. R-mat: A recursive model for graph                      Chapuis, Rumen Andonov, and Dominique Lavenier.
+     mining. In SDM, 2004.                                              Efficient multi-gpu computation of all-pairs shortest
+                                                                        paths. In 28th International Symposium on Parallel &
+[44] Graph500. http://www.graph500.org/.
+                                                                        Distributed Processing (IPDPS), pages 360–369. IEEE,
+[45] Green Graph500. http://green.graph500.org/.
+                                                                        2014.
+[46] GTgraph: A suite of synthetic random graph
+                                                                   [60] Foto Afrati and Jeffrey Ullman. Matching bounds for
+     generators. http://www.cse.psu.edu/˜madduri/
+                                                                        the all-pairs mapreduce problem. In Proceedings of the
+     software/gtgraph/.
+                                                                        17th International Database Engineering &
+[47] Stéphane Bressan, Alfredo Cuzzocrea, Panagiotis                   Applications Symposium, pages 3–4. ACM, 2013.
+     Karras, Xuesong Lu, and Sadegh Heyrani Nobari. An
+                                                                   [61] Daniel Delling, Andrew V Goldberg, Andreas
+     effective and efficient parallel approach for random
+                                                                        Nowatzyk, and Renato F Werneck. Phast:
+     graph generation over gpus. Journal of Parallel and
+                                                                        Hardware-accelerated shortest path trees. Journal of
+     Distributed Computing, 73(3):303–316, 2013.
+                                                                        Parallel and Distributed Computing, 73(7):940–952,
+[48] Nvidia Profiler Tools.                                             2013.
+     http://docs.nvidia.com/cuda/profiler-users-guide/.
+                                                                   [62] Edgar Solomonik, Aydin Buluc, and James Demmel.
+[49] Sungpack Hong, Sang Kyun Kim, Tayo Oguntebi, and                   Minimizing communication in all-pairs shortest paths.
+     Kunle Olukotun. Accelerating cuda graph algorithms                 In 27th International Symposium on Parallel &
+     at maximum warp. In PPoPP, 2011.                                   Distributed Processing (IPDPS), pages 548–559. IEEE,
+[50] Philipp Klodt, Gerhard Weikum, Srikanta Bedathur,                  2013.
+     and Stephan Seufert. Indexing Strategies for                  [63] Philip N Klein. Multiple-source shortest paths in
+     Constrained Shortest Paths over Large Social                       planar graphs. In SODA, volume 5, pages 146–155,
+     Networks. PhD thesis, 2011.                                        2005.
+[51] Huiping Cao, K Selçuk Candan, and Maria Luisa                [64] Sergio Cabello, Erin W Chambers, and Jeff Erickson.
+     Sapino. Skynets: Searching for minimum trees in                    Multiple-source shortest paths in embedded graphs.
+     graphs with incomparable edge weights. In Proceedings              SIAM Journal on Computing, 42(4):1542–1571, 2013.
+
+
+
+
+                                                             416
+

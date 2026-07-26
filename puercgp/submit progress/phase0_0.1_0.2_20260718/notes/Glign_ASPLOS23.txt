@@ -1,0 +1,1547 @@
+        Glign: Taming Misaligned Graph Traversals in Concurrent
+                           Graph Processing
+                     Xizhe Yin                                       Zhijia Zhao                                                                                                       Rajiv Gupta
+              xyin014@ucr.edu                                    zhijia@cs.ucr.edu                                                                                   gupta@cs.ucr.edu
+      University of California, Riverside                University of California, Riverside                                                                 University of California, Riverside
+                     USA                                                USA                                                                                                 USA
+ABSTRACT                                                                                                  30                                                                                                  700
+
+
+
+
+                                                                                                                                                                                       LLC Misses (billion)
+                                                                                   LLC Misses (billion)
+                                                                                                          25                                                                                                  600
+In concurrent graph processing, different queries are evaluated on                                        20                                                                                                  500
+                                                                                                                                                                                                              400
+the same graph simultaneously, sharing the graph accesses via the                                         15
+                                                                                                                                                                                                              300
+                                                                                                          10                                                                                                  200
+memory hierarchy. However, different queries may traverse the                                              5                                                                                                  100
+graph differently, especially for those starting from different source                                     0                                                                                                    0
+
+
+
+
+                                                                                                                                                                                                                                        Krill
+
+
+
+
+                                                                                                                                                                                                                                                                            Krill
+                                                                                                                         Ligra-C
+
+
+
+
+                                                                                                                                                             Ligra-C
+
+
+
+
+                                                                                                                                                                                                                              Ligra-C
+
+
+
+
+                                                                                                                                                                                                                                                                  Ligra-C
+                                                                                                               Ligra-S
+
+
+
+
+                                                                                                                                                   Ligra-S
+
+
+
+
+                                                                                                                                                                                                                    Ligra-S
+
+
+
+
+                                                                                                                                                                                                                                                Glign
+                                                                                                                                                                                                                                                        Ligra-S
+
+
+
+
+                                                                                                                                                                                                                                                                                    Glign
+                                                                                                                                   Krill
+
+
+
+
+                                                                                                                                                                       Krill
+                                                                                                                                           Glign
+
+
+
+
+                                                                                                                                                                               Glign
+vertices. When these graph traversals are “misaligned”, the benefits
+of graph access sharing can be seriously compromised. As more
+concurrent queries are added to the evaluation batch, the issue                                                          LJ-SSSP                              LJ-BFS                                                          TW-SSSP                             TW-BFS
+
+tends to become even worse.
+   To address the above issue, this work introduces Glign, a runtime               Figure 1: Last-Level Cache Misses (64 concurrent queries on
+system that automatically aligns the graph traversals for concurrent               LiveJournal [3] and Twitter [12], measured by perf profiler).
+queries. Glign introduces three levels of graph traversal alignment
+for iterative evaluation of concurrent queries. First, it synchronizes
+the accesses of different queries to the active parts of the graph
+within each iteration of the evaluation—intra-iteration alignment.
+                                                                                   1                      INTRODUCTION
+On top of that, Glign leverages a key insight regarding the “heavy
+iterations” in query evaluation to achieve inter-iteration alignment               Although last decade witnessed significant advances in developing
+and alignment-aware batching. The former aligns the iterations of                  efficient graph processing systems, supports for concurrent query
+different queries to increase the graph access sharing, while the                  evaluation remain underexplored. Most existing graph processing
+latter tries to group queries of better graph access sharing into the              systems are designed to process one analytical query each time,
+same evaluation batch. Together, these alignment techniques can                    such as a single-source shortest path (SSSP) query. On the other
+substantially boost the data locality of concurrent query evaluation.              hand, as the demands of graph analytics grow, so do the needs for
+Based on our experiments, Glign outperforms the state-of-the-art                   concurrent evaluation of graph queries [34, 38, 42]. A prior study
+concurrent graph processing systems Krill and GraphM by 3.6×                       on social network application shows that most graph query jobs are
+and 4.7× on average, respectively.                                                 executed concurrently [34]. To fill this gap, several concurrent graph
+                                                                                   processing systems [6, 20, 34, 38, 42] have been proposed in recent
+CCS CONCEPTS                                                                       years, including Seraph [34] for distributed platforms, CGraph [38]
+                                                                                   and GraphM [42] with supports for out-of-core processing, and
+• Computing methodologies → Parallel computing method-
+                                                                                   Congra [20] and Krill [6] which focus on in-memory evaluation
+ologies; • Information systems → Computing platforms.
+                                                                                   of a batch of concurrent graph queries.
+                                                                                   Opportunities and Challenges. By evaluating multiple queries
+KEYWORDS
+                                                                                   simultaneously on a graph, concurrent graph processing enables
+concurrent graph processing, data locality, graph system, iterative                graph access sharing across queries via the memory hierarchy, that
+graph algorithm, graph traversal                                                   is, the graph data fetched to the cache(s) by one query may be used
+ACM Reference Format:                                                              directly by other queries. Intuitively, such sharing may reduce the
+Xizhe Yin, Zhijia Zhao, and Rajiv Gupta. 2023. Glign: Taming Misaligned            total cache misses, benefiting the overall performance. However,
+Graph Traversals in Concurrent Graph Processing. In Proceedings of the 28th        this work finds that the actual cache miss reduction brought by
+ACM International Conference on Architectural Support for Programming              concurrent graph query evaluation could be quite limited.
+Languages and Operating Systems, Volume 1 (ASPLOS ’23), March 25–29,                   Figure 1 reports the last-level cache (LLC) misses of evaluating
+2023, Vancouver, BC, Canada. ACM, New York, NY, USA, 15 pages. https:
+                                                                                   64 concurrent queries on two graphs using some representative
+//doi.org/10.1145/3567955.3567963
+                                                                                   graph systems. As a baseline, Ligra-S evaluates the queries one by
+                                                                                   one using Ligra [28], a well-known in-memory graph processing
+                                                                                   framework that evaluates each query in parallel. In comparison,
+This work is licensed under a Creative Commons Attribution 4.0 Interna-            Ligra-C evaluates all 64 queries simultaneously using an extended
+tional License.                                                                    Ligra with basic concurrency supports (see Section 4); Krill is a
+ASPLOS ’23, March 25–29, 2023, Vancouver, BC, Canada                               state-of-the-art concurrent graph processing system just released
+© 2023 Copyright held by the owner/author(s).
+ACM ISBN 978-1-4503-9915-9/23/03.                                                  recently [6]. As the results show, even with a concurrency degree of
+https://doi.org/10.1145/3567955.3567963                                            64 queries, the cache misses of Ligra-C and Krill are reduced by a
+
+
+
+
+                                                                              78
+ASPLOS ’23, March 25–29, 2023, Vancouver, BC, Canada                                                                                Xizhe Yin, Zhijia Zhao, and Rajiv Gupta
+
+
+limited fraction comparing to Ligra-S and sometimes, their cache                                              Alignment-aware batching
+
+
+
+
+                                                                                                                                                 “heavy iteration”
+misses may even exceed that of the baseline (LJ-BFS and TW-BFS).
+
+
+
+
+                                                                                                                                                    estimation
+                                                                                                              • affinity-oriented batch.
+   A primary reason causing the above unfavorable results lies in
+the potential “misalignment” of underlying graph traversals among                                              Inter-iteration alignment
+concurrent queries. Though the above 64 queries are of the same
+                                                                                                              • delayed start
+type, they may traverse the graph very differently due to their
+vertex-specific nature (i.e., starting from different source vertices).                                              Intra-iteration alignment
+For queries of different types, their underlying graph traversals can
+                                                                                                                • query-oblivious frontier
+be even more diverse. When the traversals are misaligned—visiting
+different parts of the graph for most of the processing time, the
+concurrent evaluation of queries will not benefit much from the                                     Figure 2: Three Levels of Alignments in Glign.
+shared memory accesses. Even worse, they may even “hurt” each
+other by competing for the caches.
+Solution of This Work. To address the above issue, this work                                 found the benefits of reduced memory (from the use of a single-level
+proposes a runtime system for in-memory graph processing on                                  frontier) easily outweighs the side effects of extra computations.
+multi-core platforms 1 , namely, Glign 2 . Glign can automatically                              For inter-iteration alignment and alignment-aware batching,
+align different graph traversals of concurrent queries to maximize                           Glign leverages an important insight revealed in this work:
+the graph access sharing. As a result, it can significantly reduce
+                                                                                                          the “heavy iterations” of concurrent queries
+the cache misses compared to other systems (see Figure 1). Glign
+                                                                                                         should be well aligned during the evaluation.
+primarily targets vertex-specific queries that employ iterative graph
+algorithms for evaluation, such as SSSP and BFS. In addition, to                             Here, “heavy iterations” refer to iterations that access a relatively
+benefit the most from Glign, the vertex function of the iterative                            larger portion of the graph (i.e., a large frontier). The insight is
+algorithms f (v) needs to be monotonic, a common property shared                             backed by two facts. First, heavy iterations often dominate the total
+by many vertex-centric graph query algorithms [11, 25, 31]. Next,                            processing cost of a query; Second, larger frontiers often expose
+we briefly introduce the key techniques behind Glign.                                        more opportunities for intra-iteration alignments—a potentially
+   First, like most existing concurrent graph processing systems [6,                         larger overlapping among the frontiers of different queries.
+38, 42], Glign synchronizes the iterations of different queries during                          The above insight reduces the two higher-level alignments into
+evaluation—the barriers used for iterative evaluation are shared                             the problem of alignment of heavy iterations. To solve the latter, this
+across queries. This design allows Glign to treat the iterations as a                        work uses a simple yet effective heuristic to estimate the arrival
+logical timeline for aligning graph traversals. To distinguish them                          time of heavy iterations. Based on the estimation, two scheduling
+from the iterations in single-query graph processing, we refer to                            techniques are proposed to improve the alignments:
+the iterations shared by queries as global iterations.                                           • Delayed start. For a given batch of concurrent queries, this
+   Based on the global iterations, Glign addresses the problem of                                  technique postpones the start of the evaluation of certain
+graph traversal misalignment at three levels:                                                      queries to later global iterations, based on the arrival time
+     • Intra-iteration alignment. In each iteration of the evaluation,                             differences of their heavy iterations;
+       a query needs to access an active part of the graph (a.k.a.                               • Affinity-oriented batching. Considering all the concurrent
+       frontier). Intuitively, the active parts of different queries may                           queries received, it groups queries with closer arrival time
+       overlap. If the overlapped parts are accessed around the same                               of heavy iterations (affinity) to the same evaluation batch.
+       time, the evaluation will benefit from temporal locality.                                Figure 2 lists the above techniques. To confirm their effectiveness,
+     • Inter-iteration alignment. For a given batch of queries, Glign                        this work evaluated Glign with commonly used graphs and query
+       allows their evaluation to start at different global iterations,                      benchmarks, and compared it with two state-of-the-art concurrent
+       thus making it possible to align the iterations across queries                        graph systems: GraphM [42] and Krill [6]. The results show that
+       based on their graph access sharing.                                                  the proposed alignment techniques can reduce the LLC misses by a
+     • Alignment-aware batching. At the high level, considering all                          significant ratio. They also show that Glign achieves on average
+       the concurrent queries available, which queries should be put                         3.6× speedup over Krill and 4.7× speedup over GraphM.
+       into the same evaluation batch? Different batching strategies                            In summary, this work makes a three-fold contribution:
+       may yield different amounts of graph access sharing.
+                                                                                                 • First, it reveals a key performance issue in concurrent graph
+   For intra-iteration alignment, existing designs [6, 32] require two                             processing—graph traversal misalignments, and categorizes
+levels of frontiers to achieve synchronized frontier traversal. Instead,                           it at three levels of the graph processing system.
+Glign proposes query-oblivious frontier, a single-level frontier that                            • Second, it proposes a series of techniques to address the
+deliberately ignores the frontier differences across queries. This                                 misalignments at each level: a new design of synchronized
+is possible if the vertex function of the query is monotonic. On                                   frontier traversal and two scheduling techniques based on
+the other hand, this may evaluate extra vertices due to its inability                              the insight of heavy iterations.
+to distinguish some inactive ones for certain queries. Overall, we                               • Finally, it integrates the above techniques in a system Glign
+1 Similar ideas could be applied to out-of-core and distributed processing scenarios.
+                                                                                                   and compares it with the state-of-the-art systems.
+2 Pronounced as /gline/.                                                                        Next, we start with some background of this work.
+
+
+
+
+                                                                                        79
+Glign: Taming Misaligned Graph Traversals in Concurrent Graph Processing                                                ASPLOS ’23, March 25–29, 2023, Vancouver, BC, Canada
+
+
+                                                                        "%                             Table 1: Iterative Evaluation of sssp(v 1 )
+                                                                   1         5
+    /* single-source shortest path */                                    4
+    fsssp(v) {                                         ") 4     "$ 2    "&       "(            Iter# v 1     v2    v3     v4    v5      v6     v7   v8     v9            Frontier
+      for each out-neighbor n of v {                       10
+        dist(n) = min { dist(n), dist(v) + w(v, n) };               3                            0     0     ∞     ∞      ∞     ∞       ∞      ∞    ∞      ∞               {v 1 }
+                                                          "!     8       4
+        if dist(n) changed                                                   5                   1     0     ∞     4      ∞     ∞       ∞      ∞    ∞      ∞               {v 3 }
+                                                        5     5
+           then add n to frontier;                        5                                      2     0     ∞     4      12    5       7      6    ∞      ∞       {v 4 , v 5 , v 6 , v 7 }
+                                                     ""         "# 2    "'
+    }                                                              0                             3     0     17    4      12    5       7      6    ∞      10            {v 2 , v 9 }
+                                                                                                 4     0     17    4      12    5       7      6    22     10              {v 8 }
+                 (a)                                         (b)                                 5     0     17    4      12    5       7      6    22     10                {}
+
+
+        Figure 3: Example Vertex Function and Graph.
+                                                                                           to the execution model, Seraph, CGraph, and GraphM all treat each
+                                                                                           concurrent query as a “job”. In Seraph, the minimum execution
+2     BACKGROUND                                                                           unit is a task, consisting a bunch of vertices to be processed in
+                                                                                           a job, while different tasks are processed using a thread pool. In
+This section introduces the basics of vertex-centric graph processing
+                                                                                           comparison, CGraph maps each concurrent job to a core by default,
+and the idea of concurrent graph query evaluation.
+                                                                                           then balances the jobs across cores. GraphM is built on top of the out-
+                                                                                           of-core graph processing system GridGraph [43], where edges are
+2.1     Vertex-Centric Graph Processing
+                                                                                           partitioned into “blocks” and processed by worker threads. Finally,
+Following the idea of “thinking like a vertex” [18], vertex-centric                        Congra [20] and Krill [6] are both built on top of Ligra [28], a
+graph processing emerges as the de facto model for programming                             state-of-the-art in-memory graph processing system. Under the
+graph applications. Many graph systems have been proposed in                               hood, Ligra exploits the vertex-level parallelism where the vertex
+recent years based on this model, such as Pregel [15], GraphLab [14],                      function is applied to the active vertices (in the frontier) in parallel,
+Giraph [26], PowerGraph [9], and Ligra [28]. Under this model, a                           guided by a work stealing scheduler (from Cilk [4]). So even for a
+vertex function f (v) needs to be specified by developers, which                           single query, the system can evaluate it in parallel with relatively
+will be evaluated on every vertex in the graph or a selected subset                        balanced workload across CPU cores.
+of vertices (i.e., frontier) iteration by iteration, to compute certain
+vertex-specific properties, like the shortest distances from a source
+vertex to every other vertex. The iterations stop when the properties                          Table 2: Graph Access Sharing between Two Queries.
+of all vertices stop changing (convergence) or some thresholds are
+met, following the bulk synchronous parallel (BSP) model [30].                                             Iter#   Frontier(sssp(v 2 ))         Frontier(sssp(v 8 ))
+    Take single-source shortest path (SSSP) as an example. The goal                                         0               {v 2 }                        {v 8 }
+is to find the shortest distance from a source vertex to every other                                        1             {v 3 , v 8 }                    {v 4 }
+vertex in the graph. Figure 3-(a) shows its vertex function f sssp (v),                                     2       {v 4 , v 5 , v 6 , v 7 }          {v 2 , v 6 }
+which updates the out-neighbors of vertex v based on its current                                            3               {v 9 }                    {v 3 , v 9 }
+                                                                                                            4                 {}                    {v 5 , v 6 , v 7 }
+value. Considering the graph in Figure 3-(b), the evaluation process                                        5                 {}                          {v 9 }
+of query sssp(v 1 ) is given in Table 1, including the vertex values                                        6                 {}                           {}
+and the frontier in each iteration.
+    Initially, the values of all vertices are set to ∞, except for the
+source vertex v 1 , and only v 1 is in the frontier (i.e., activated). After                   A key potential benefit of concurrent graph query evaluation
+applying the vertex function to v 1 , the (only) out-neighbor of v 1 ,                     is the sharing of graph accesses via the memory hierarchy, which
+which is v 3 , obtains a new value 4. As a result, v 3 becomes the                         improves the overall data locality. Consider two queries, sssp(v 2 )
+new frontier. As the evaluation proceeds, the frontier is propagated                       and sssp(v 8 ), to the graph in Figure 3-(b). In fact, both queries
+through the graph, along with new vertex values being generated                            need to access the out-neighbors of vertices v 2 - v 9 during the
+iteration by iteration, until the frontier becomes empty—the fixed                         evaluation, as indictated by their frontiers in Table 2. If the graph
+point. The resulted vertex values are the answer to the query.                             data fetched by one query still resides in the shared cache when
+    Note that the vertex function in Figure 3-(a) needs to access and                      the other query tries to access it (i.e., temporal locality), the overall
+update the out-neighbors of a vertex. This is known as the push                            cache misses could be dramatically reduced. However, for many
+model. Alternatively, the vertex function might also be designed to                        real-world graphs, their sizes are well beyond the cache capacity.
+access and update the in-neighbors of a vertex, which is referred to                       In order to benefit from this temporal locality, the graph traversals
+as the pull model. In this work, we assume a push model is chosen.                         should be roughly aligned—visiting the same vertices (and their
+                                                                                           out-neighbors) around the same time.
+2.2     Concurrent Evaluation of Graph Queries                                                 In fact, as reported earlier in Figure 1, the underlying graph
+Recently, several graph processing systems have been proposed to                           traversals on real-world graphs could be largely misaligned in the
+support concurrent graph query evaluation, such as Seraph [34],                            existing concurrent graph processing systems, limiting the benefits
+CGraph [38], GraphM [42], Congra [20], and Krill [6], covering                             of shared graph accesses. In the following, we will present a solution
+distributed, in-memory, and out-of-core processing scenarios. As                           to addressing the graph traversal misalignment issue—Glign.
+
+
+
+
+                                                                                      80
+ASPLOS ’23, March 25–29, 2023, Vancouver, BC, Canada                                                                                                       Xizhe Yin, Zhijia Zhao, and Rajiv Gupta
+
+
+                        Alignment-aware                                                                                                                                v1          vmax
+                            batching       1                                                                                                                           1110011001001
+                                                                     Inter-iteration                                  v1                    vmax
+             Query buffer                   Eval. Batch
+                                                                       alignment                               qi+3 0110011001001                                 qi+3 0110011001001
+           ... qj+3 qj+2 qj+1             qi qi+1 qi+2 qi+3
+
+
+
+
+                                                                                                 Eval. batch
+
+
+
+
+                                                                                                                                                    Eval. batch
+                                                                                                                                                                  qi+2 1110011001000
+                                                                                  2                            qi+2   1010011001000
+
+
+
+
+                                                              Global iterations
+                                                                                                               qi+1 1010011001001                                 qi+1 1010011001001
+      v1                        vmax
+                                                                                                               qi     1100001000001                               qi   1100001000001
+      0 … 10 … 01 … 00
+                                               …. …                                                              (a) Separate frontiers             (b) Unified + separate frontiers
+           Intra-iteration
+             alignment          3                                                                                             Eval. batch          v1                       vmax
+                                              Results                                                                      qi+3 qi+2 qi+1 qi       1110011001001
+
+                                                                                                                                 (c) Query-oblivious frontier
+                       Figure 4: Overview of Glign.
+                                                                                                      Figure 5: Different Designs of Frontier Traversal.
+3     Glign
+Figure 4 illustrates the high-level design of Glign. First, assume a
+buffer consists of the concurrent queries to be evaluated, Glign uses                       a global iteration, the frontiers of different queries are traversed
+an alignment-aware batching strategy to group queries with higher                           independently, as shown in Figure 5-(a). The frontier is designed
+potential of a large amount of graph access sharing to the same                             as a boolean array frontier[], where the i-th element shows the
+evaluation batch (see !). After a batch is formed, Glign performs                           activeness of vertex vi . If frontier[i]=1, the vertex function f (v)
+inter-iteration alignment across (global) iterations. In particular, it                     needs to be evaluated on vi , including accessing the out-neighbors
+first estimates the “heavy iterations” for each query in the batch,                         of vi . In other words, the frontier traversal defines how graph data
+then delays some of them to make the “heavy iterations” of different                        is accessed in a global iteration. When these frontiers of different
+queries aligned (see "). Finally, within each global iteration, Glign                       queries are traversed independently, there is no guarantee that the
+ensures that the frontiers of different queries are traversed in a                          commonly used graph data are accessed around the same time. As
+synchronous manner so that the shared graph accesses (dictated                              a result, the data locality could become sub-optimal.
+by the overlapping of frontiers) are accessed in a fully coalesced                             To ensure that different frontiers are traversed in a synchronized
+way (see #). Next, we will present each of these key techniques in                          manner, some recent works (Krill [6] and SimGQ [32]) propose to
+detail. Due to their dependences, we will introduce them in reverse                         add an extra frontier, called unified frontier, defined as follows:
+order with respect to the number labels in Figure 4.                                                                              !
+                                                                                                                Frontier union =      Frontier qi               (1)
+3.1     Global Iterations                                                                                                                          q i ∈B
+First, we introduce the concept of global iterations, which serve as                        where Frontier qi (a boolean array) is the frontier for evaluating
+the basis for some of the proposed alignments. Given a batch of                                            "
+                                                                                            query qi and is the logical OR operator. This means that as long
+iterative graph queries, there are two ways to evaluate them:                               as vertex vi is active for one query in the batch, Frontier union (i) = 1.
+     • Synchronous evaluation evaluates queries in the batch in the                         To synchronize the frontier traversals, we can simply traverse the
+        same pace with respect to iterations (see Figure 4). This is                        unified frontier: if its value for vertex vi is “1”, we further check
+        ensured by a series of global barriers that are shared across                       each individual frontier Frontier qi to find out the specific queries
+        queries in the batch. Most existing concurrent graph systems                        for which vi needs to be evaluated (see Figure 5-(b)).
+        (CGraph [38], GraphM [42] and Krill [6]) follow this scheme.                           The above design ensures that the shared accesses to an active
+     • Asynchronous evaluation evaluates each query in the batch                            vertex and its out-neighbors are perfectly aligned across queries.
+        independently, regardless of the evaluation pace of other                           However, there are some caveats associated with this design. First, it
+        queries, that is, the iterations of evaluating different queries                    increases the memory cost with an extra labeling array Frontier union ;
+        may be interleaved arbitrarily. Congra [20] uses this scheme.                       Second, it needs to check the frontiers at two levels. Overall, our
+   Clearly, the asynchronous design has no control over the graph                           evaluation reports limited performance benefits (see Section 4).
+traversals, so the traversals may or may not align well depending                              To avoid the above caveats, this work proposes an alternative
+on their interleaving in a specific evaluation. For this reason, Glign                      design to the synchronized frontier traversal, called query-oblivious
+follows the synchronous evaluation. To distinguish the iterations                           frontier. This new design explores an interesting tradeoff between
+in the synchronous batch evaluation from those in single-query                              computations and memory accesses, which to our best knowledge,
+evaluation, we refer to the former as global iterations.                                    has not yet been discussed before by any prior work.
+                                                                                            Query-Oblivious Frontier. Our key insight is to deliberately ignore
+3.2     Intra-Iteration Alignment                                                           the differences among the frontiers of queries in the evaluation batch,
+A commonly used design for evaluating concurrent graph queries                              that is, when a vertex function f (v) is invoked, it is applied for
+is to keep a frontier for each query qi in the evaluation batch B. In                       all queries in B. This eliminates the need of second-level frontiers
+
+
+
+
+                                                                                       81
+Glign: Taming Misaligned Graph Traversals in Concurrent Graph Processing                                        ASPLOS ’23, March 25–29, 2023, Vancouver, BC, Canada
+
+
+(Frontier qi , qi in B) used in the prior design. Figure 5-(c) illustrates                                          vj
+this idea with a single frontier Frontier union .                                                           ......0......                 Frontierq1
+   However, the above design immediately raises two concerns:                                               ......1......                 Frontierq2
+     • Correctness. Does the evaluation based on a single unified                                           ......1......                 Frontierunion
+       frontier (Frontier union ) always produce the same results as
+       the one using two levels of (or seperate) frontiers?                                                              Case 1
+     • Efficiency. A vertex v would be evaluated for all queries in                                                      if value of !! has not been changed,
+                                                                                             ""      "#       "!
+                                                                                                                         fq1(!!) must not change !" ‘s value
+       the batch, as long as it is in the frontier of one query. This
+       introduces extra unnecessary computations.                                                                        Case 2
+   First, for correctness, we have established a theorem for safely                                                      if value of !! has been changed, fq1(!!)
+                                                                                             ""      "#        "!
+adopting query-oblivious frontier for a range of iterative queries                                                       may cause an update to !" ‘s value
+based on the monotonicity property of their vertex functions.
+    Definition 3.1. In vertex-centric programming, a vertex function                  Figure 6: Correctness of Using Query-Oblivious Frontier.
+f (·) is monotonic iff. it always changes the values of vertices
+monotonically (always increasing or decreasing) over iterations.
+                                                                                     coarse-grained misalignments, among the iterations of different
+   In fact, the monotonicity property has been widely exploited by                   queries and during the formation of query batches.
+multiple existing graph systems for better efficiency [14, 25] and it
+serves as the basis for incremental query evaluation [11, 31].                       3.3    Inter-Iteration Alignment
+   Theorem 3.2. Evaluating a query batch using query-oblivious                       We first use a simple example to motivate the alignment problem,
+frontier yields the same vertex values as the evaluation using separate              then formalize it and present a heuristic-based solution.
+frontiers iff. the vertex function is monotonic.                                     Motivation. In general, the evaluation of a graph query may access
+   Proof. Without loss of generality, assume the evaluation batch                    different parts of the graph in different iterations, thus the amount
+consists of two queries q 1 and q 2 , and the evaluation is in global                of graph sharing may vary depending on the interleaving of the
+iteration i. Consider an arbitrary vertex v j . Assume v j is inactive               (local) iterations of different queries. Revisit the examples in Table 2
+according to q 1 ’s frontier, but active based on q 2 ’s frontier. Thus, v j         (Section 2) and assume the two sssp queries are evaluated in the
+is marked as an active one in the unified frontier, as illustrated in                same batch, then compare their frontier overlapping per iteration
+Figure 6. Next, we discuss the impacts of an extra evaluation of v j                 with those in Table 3 where a different alignment between the (local)
+with q 1 ’s vertex function, that is, fq1 (v j ). There are two basic cases.         iterations of the two queries is used: sssp(v 2 ) starts two iterations
+In the first case, at the time of evaluating fq1 (v j ), the value of v j has        later than sssp(v 8 ). From the comparison, we can find that the latter
+not been updated by any of its in-neighbors. As its value remains                    alignment exposes more overlapped active vertices than the former
+the same as it was in the prior iteration i − 1, this evaluation will not            (6 v.s. 2). As a result, when these active vertices are evaluated and
+change the value of any of its out-neighbors (like vt ). In the second               their (out-)neighbors are accessed, the latter alignment will yield
+case, at the time of evaluating fq1 (v j ), the value of v j has been                more shared graph accesses.
+updated by at least one of its in-neighbors in the current iteration i.
+In this case, the evaluation may update the value(s) of some out-                                 Table 3: A Better Alignment of Iterations.
+neighbor(s) of v j , causing some side-effects. However, note that
+even if separate frontiers are used, v j would be marked as an active                               Iter#     Frontier(sssp(v 2 ))            Frontier(sssp(v 8 ))
+vertex and evaluated in the next iteration i + 1. That is, using query-
+                                                                                                      0                  –                              {v 8 }
+oblivious frontier might lead to some earlier evaluation of certain                                   1                  –                              {v 4 }
+vertices that are supposed to be evaluated in the next iteration—                                     2                 {v 2 }                      {v 2 , v 6 }
+a form of asynchronous evaluation. One sufficient condition for                                       3              {v 3 , v 8 }                   {v 3 , v 9 }
+the correctness of asynchronous query evaluation is that the query                                    4        {v 4 , v 5 , v 6 , v 7 }           {v 5 , v 6 , v 7 }
+evaluation should be monotonic.                                            !                          5                {v 9 }                          {v 9 }
+                                                                                                      6                  {}                              {}
+   Second, as to the efficiency concern, will the extra evaluation of
+inactive vertices slow down the overall processing? Interestingly,
+our evaluation (see Section 4) shows that using query-oblivious                         Next, we formalize the above inter-iteration alignment problem.
+frontier can substantially improve the overall performance despite                   Problem Formalization. First, we define the alignment vector I
+the extra evaluation of inactive vertices. This is due to fact that                  for a given batch of queries B as follows:
+query-oblivious frontier skips the maintenance and accesses to the
+                                                                                        Definition 3.3. Given a batch B of n queries [q 1, q 2, ..., qn ], its
+separate frontiers all together, dramatically reducing the memory
+                                                                                     alignment vector I is a vector of [a 1, a 2, ..., an ], where ai is the
+footprint of concurrent query evaluation (see Section 4).
+                                                                                     global iteration number from which the evaluation of qi is started.
+   So far, we have introduced the intra-iteration alignment which
+addresses the potential misalignments among different frontier                         Considering the batch B=[sssp(v 2 ), sssp(v 8 )], Table 3 shows
+traversals in a global iteration. Next, we will shift the focus to more              an alignment where the alignment vector I = [2, 0].
+
+
+
+
+                                                                                82
+ASPLOS ’23, March 25–29, 2023, Vancouver, BC, Canada                                                                                                 Xizhe Yin, Zhijia Zhao, and Rajiv Gupta
+
+
+   Next, we introduce the concept of affinity to quantify the amount                                       4E+06
+                                                                                                                                                             sssp(v1)       sssp(v2)
+                                                                                                           3E+06
+
+
+
+
+                                                                                           Frontier Size
+of graph access sharing, which is defined as follows:
+
+
+
+
+                                                                                                                            nd
+
+
+
+
+                                                                                                                                                       sta
+                                                                                                           2E+06
+
+
+
+
+                                                                                                                       expa
+
+
+
+
+                                                                                                                                                          bli
+   Definition 3.4. Given a query batch B and an alignment vector I ,
+
+
+
+
+                                                                                                                                                             ze
+the affinity of this evaluation is defined by the following equation:                                      1E+06
+                                    #K              j                                                      0E+00
+                                      j=0 |Frontier union |                                                        1      3      5   7    9 11 13 15 17 19 21 23 25 27 29
+            Affinity(B, I ) = 1 − # #                             (2)
+                                   K                       j                                                                                                      Iteration
+                                   j=0 q i ∈B |Frontier q i |                                                                               (a) SSSP-LJ
+               j                   j
+where Frontier union and Frontier qi are the unified frontier and the                                      3E+07
+separate frontier for query qi , respectively, at iteration j, and K is                                                                                           bfs(v1)   bfs(v2)
+                                                                                                           2E+07
+
+
+
+
+                                                                                                                                     stab
+                                                                                           Frontier Size
+the total number of global iterations for evaluating this batch.
+
+
+
+
+                                                                                                                       nd
+
+
+                                                                                                                                          lize
+                                                                                                           2E+07
+
+
+
+
+                                                                                                                                              and
+
+
+
+                                                                                                                                                          sta
+                                                                                                                   expa
+
+
+
+
+                                                                                                                                                              b
+                                                                                                                                           exp
+   Again, consider the examples in Table 3, we have                                                        1E+07
+
+
+
+
+                                                                                                                                                             lize
+               Frontier 0union = {v 8 }, Frontier 1union = {v 4 },                                         5E+06
+         Frontier 2union = {v 2 , v 6 }, Frontier 3union = {v 3 , v 8 , v 9 },                             0E+00
+                                                                                                                   1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19
+         Frontier 4union = {v 4 , v 5 , v 6 , v 7 }, Frontier 5union = {v 9 }.
+                                                                                                                                                        Iteration
+Thus, Affinity(B, I ) = 1 − (1 + 1 + 2 + 3 + 4 + 1)/(8 + 10) = 1/3. By                                                                           (b) BFS-TW
+contrast, the affinity for the alignment in Table 2 Affinity(B, I & ) =
+1 − (2 + 3 + 5 + 2 + 3 + 1)/(8 + 10) = 1/9. Obviously, the former                         Figure 7: Frontier Size Distribution across Iterations.
+achieves a significantly higher affinity.
+   The best affinity occurs when all separate frontiers are perfectly
+overlapped, while the worst affinity happens when no separate                              • First, heavy iterations expose more opportunities for shared
+frontiers overlap at all through all the iterations. Note that the                           graph accesses. The larger the frontiers are, the more likely
+affinity may be negative in certain cases, due to the asynchronous                           that they overlap. In the extreme case, when the (separate)
+evaluation as detailed in the proof of Theorem 3.2.                                          frontiers include all vertices, they are perfectly overlapped.
+   The above definition of affinity is based on the ratio of active                        • Second, as the vertex activations in the heavy iterations
+vertices. Alternatively, one can also define affinity based on the                           often dominate the total number of vertex activations for the
+ratio of active edges (the outgoing edges of active vertices), which                         whole evaluation, their alignments could make a significant
+is supposed to be more precise. However, our evaluation shows                                impact on the overall alignment.
+minimal differences between the two definitions in practice.
+                                                                                         To demonstrate the effectiveness of heavy iteration alignment
+   Now we formalize the inter-iteration alignment as follows:
+                                                                                      in improving the overall affinity, we manually delayed the “faster”
+                                                                                      queries in Figure 7 such that their “peaks” align with those in the
+                            max Affinity(B, I )                           (3)
+                             ∀I                                                       “slower” queries. As a result, we observed that the affinity value
+   That is, given an evaluation batch B, the problem is to find out                   gets improved from −0.11 to 0.34 and from 0 to 0.47, respectively.
+the best alignment vector I that maximizes the affinity.                                 One can quantify the heavy iterations based on different metrics,
+   Unfortunately, as the frontier of each query will NOT be known                     such as the ranking of frontier sizes across iterations. However,
+until the query execution is finished, we cannot precompute the                       regardless the metric being used, just like affinity, heavy iterations
+affinity for a batch of queries without evaluating them. Hence, we                    are unknown before the query evaluation. In fact, one may choose to
+cannot solve the above optimization problem precisely in advance.                     detect the heavy iterations dynamically during the query evaluation
+To address this challenge, we need a more proactive approach. Next,                   and use that information to guide the alignments at runtime, for
+we present a heuristic to approximate the best alignment.                             example, pausing the evaluation of queries whose heavy iterations
+Heuristic-based Solution. First, we observe that the distribution                     have arrived, then resuming them after all the "slowest" query has
+of frontier sizes tends to be highly biased across iterations, thanks to              reached its heavy iterations. Though the idea sounds promising, it
+the power-law nature of many real-world graphs. Figure 7 reports                      has a caveat—to “pause and resume” the iterative evaluation of some
+the frontier sizes across iterations during the evaluation of a few                   queries, the system needs to keep “their contexts”—their individual
+vertex-specific queries on two real-world graphs.                                     frontiers. This requires to a design similar to the two-level frontiers
+   From the results, we can easily find some patterns in evaluating                   (see Figure 5-(b)). As discussed earlier, this design is inferior to the
+vertex-specific queries on power-law graphs: in the early iterations,                 query-oblivious frontier in terms of performance.
+the frontier grows exponentially, which we call the expansion phase.                     To work around the above dilemma, we propose to proactively
+After reaching the “peak”, the frontier starts to shrink quickly and                  approximate the “arrival time” of heavy iterations—the iteration that
+steadily until it becomes empty, referred to as stabilization phase.                  marks the beginning of heavy iterations. The key insight behind
+The several iterations around the “peak” often dominate overall                       our arrival time approximation is the correlation between frontier
+size of frontiers for the whole query evaluation.                                     size and the activation of high-degree vertices:
+   With the above observations, we decide to focus the alignment                                              When evaluating a vertex-specific query on a
+on these dominating iterations, referred to as “heavy iterations”.                                            power-law graph, the frontier size often grows
+The rationale behind this decision is two-fold:                                                               sharply once a high-degree vertex is activated.
+
+
+
+
+                                                                                 83
+Glign: Taming Misaligned Graph Traversals in Concurrent Graph Processing                                  ASPLOS ’23, March 25–29, 2023, Vancouver, BC, Canada
+
+
+           Table 4: Arrival Time of Heavy Iterations                                     1 /* preparation for graph G */
+                                                                                         2 HV = getTopHighOutDegreeVertices(G, K)
+             Query       Arrival Time     Query        Arrival Time                      3 Gr = getEdgeReversedGraph(G)
+                                                                                         4 for each vertex vh in HV
+            sssp(v1)         iter. 9      bfs(v1)         iter. 3
+                                                                                         5     leastHops[v1 - vmax][vh] = bfs (Gr, vh)
+            sssp(v2)         iter. 2      bfs(v2)         iter. 7
+                                                                                         6
+                                                                                         7 /* find alignment vector I for query batch B */
+                                                                                         8 getAlignment(B ) {
+   To demonstrate the above phenomenon, Table 4 lists the first                                for each query q(vi ) in B
+                                                                                         9
+iteration where at least one of the top-4 high degree vertices is                       10        closestHV[vi ] = min { leastHops[vi ][vh] | ∀ vh ∈ HV }
+activated for the four queries used in Figure 7. These iterations                       11     latestInBatch = max { closestHV[vi ] | ∀ q(vi) ∈ B }
+are also highlighted with larger marks in Figure 7, which clearly                       12     for each query q(vi ) in B
+indicate the beginning of (relatively) heavy iterations.                                13        I [vi] = latestInBatch – closestHV[vi ]
+   Based on the above discussion, we only need to identify the first                    14 }
+iteration where a high-degree vertex is activated. In fact, given a
+high-degree vertex vh (based on a threshold), it takes i iterations
+                                                                                      Figure 9: Pseudocode for Inter-Iteration Alignment.
+for it to be activated, where i is the least number of hops from
+the source vertex v in query q(v) to the high-degree vertex vh .
+Such information can be pre-computed simply by running a BFS
+query on the high-degree vertex vh , that is, bfs(vh ). Note that, for          above technique as delayed start. As shown later in the evaluation,
+directed graphs, the BFS query should run on the edge-reversed                  comparing to the ground truth—the optimal alignment, the accuracy
+graphs, since the goal is to get the least number of hops from every            of the above heuristic-based alignment is quite high (usually off by
+other vertex to the high-degree vertex, not the other way around.               at most 2 iterations) and also its performance is close to that with
+   Figure 8 summarizes our reasoning—reducing the inter-iteration               the optimal alignment. See more details in Section 4.
+alignment to the problem of BFS queries on high-degree vertices.                   Next, we will move our discussion of alignment to the most
+                                                                                coarse-grained level—query batching.
+                           inter-iteration alignment
+                         reduce                approximate
+                                                                                3.4     Alignment-Aware Batching
+                           heavy iteration alignment
+                                                                                In the prior section, we align (local) iterations of different queries
+                         reduce                compute
+                                                                                to improve the sharing of graph accesses (measured by affinity).
+                    heavy iteration arrival time estimation                     In fact, we may achieve similar or even better effects by grouping
+                         reduce                approximate                      queries whose iterations are better aligned into the same batch. For
+                        least hops to high-degree vertices                      example, it is better to put sssp(v 1 ) (in Table 1) and sssp(v 2 ) into
+                         reduce                compute                          the same batch, rather than sssp(v 2 ) and sssp(v 8 ) (in Table 2),
+                                                                                as the former exposes a better alignment at the iteration level.
+                       BFS queries on high-degree vertices
+                                                                                   Based on the above intuition, we propose affinity-oriented query
+                                                                                batching. The goal is to maximize the affinity for queries in a batch
+    Figure 8: Flow of Solving Inter-Iteration Alignment.                        through the management of batching policy.
+                                                                                Affinity-Oriented Query Batching. By default, all queries in the
+    Next, we present the algorithm of inter-iteration alignment (see            evaluation buffer are processed in the order that they are received.
+Figure 9). First, some one-time preparation is needed: (i) identifying          Though intuitive, this first-come first-serve policy may produce
+the top-K high-degree vertices in terms of the out-degree (due to               query batches with low affinity. To avoid this, affinity-oriented
+the use of push model) at Line 2; (ii) reversing the edges’ directions          batching creates batches based on the affinity among queries, which
+if the graph is directed (Line 3); (iii) running a BFS query on each            can be approximated as detailed in the prior section. However,
+selected high-degree vertex to find the least number of hops from               a simple affinity-oriented batching, in theory, may postpone the
+an arbitrary vertex vi to each high-degree vertex vh (Line 4-5).                processing of some queries—those exhibit poor affinity with most
+    After the preparation, the algorithm is ready to compute the                queries—with an unbounded delay. To avoid this caveat, we limit
+alignment vector I for a give query batch B. First, it computes                 the number of queries considered each time for affinity-oriented
+the least hop number to the closest high-degree vertex for each                 batching using a threshold Bw . That is, every Bw queries in the
+query q(vi ), stored in closestHV[vi ] (Line 9-10). Then, it finds the          buffer are scheduled together, referred to as a batching window.
+largest value among cloestHV[vi ] (Line 11), which essentially is                  Figure 10 illustrates the idea of affinity-oriented query batching.
+the latest time of reaching a high-degree vertex (i.e., arrival time)           First, the earliest received Bw queries in the buffer are selected and
+for a query in the batch, stored in latestInBatch. Finally, based on            ranked by their least number of hops to the closest high-degree
+the difference of arrival time relative to the latest (latestInBatch),          vertex (i.e., closestHV[] in Figure 9). Then, every consecutive
+it calculates the alignment vector I (Line 12-13).                              |B| ranked queries in the batch window are selected to form an
+    From another perspective, the alignment delays the start time               evaluation batch. Note that array closestHV[] is pre-computed
+of certain queries in the evaluation batch, thus we also refer to the           just like that used in inter-iteration alignment.
+
+
+
+
+                                                                           84
+ASPLOS ’23, March 25–29, 2023, Vancouver, BC, Canada                                                                         Xizhe Yin, Zhijia Zhao, and Rajiv Gupta
+
+
+                        Rank by                                                                          Table 5: Methods in Evaluation
+           Query       closestHV
+                                               An eval. batch
+           q(vj’+1)       1        2
+                                        [q(vj’+1), q(vj’+2), q(vj’+3), q(vj’+4)]                Method Brief Description
+           q(vj’+2)       1
+                                                                                              Ligra-S    Eval. queries in batch one by one w/ Ligra [28]
+             ...
+                                                                                              Ligra-C    Eval. queries in batch simultaneously w/ Ligra [28]
+          q(vj’+Bw)       8             Query buffer                                       GraphM [42]   A high-throughput concurrent graph system
+                                    qj+1 ... qj+Bw qj+3 ...
+                                                                                             Krill [6]   A compiler & runtime for concurrent graph processing
+                   1                                                                      Glign-Intra    Glign with only intra-iteration alignment
+                                   Batching window                                        Glign-Inter    Glign-Intra + inter-iteration alignment
+                                                                                          Glign-Batch    Glign-Intra + affinity-oriented batching
+                                                                                                Glign    Glign with all proposed alignment techniques
+           Figure 10: Affinity-Aware Query Batching.
+
+
+Connection with Inter-Iteration Alignment. Note that unlike                             after another, using Ligra [28]—a state-of-the-art in-memory graph
+the intra-iteration alignment which is orthogonal to the later two                      processing engine. Note that Ligra itself processes each single
+alignment techniques, the relation between the two inter-iteration                      query in parallel. Ligra-C extends Ligra to support concurrent
+alignments and affinity-oriented batching are not fully orthogonal.                     query evaluation using both unified and separated frontiers (see
+This is due to the fact that both aim at improving the affinity defined                 Section 3.2), representing a design that has been adopted by the
+at the iteration level. In other words, if affinity-oriented batching                   existing concurrent graph processing systems [6, 13, 42].
+has been employed, then the extra benefits from inter-iteration                            Also, we compare Glign in general with two state-of-the-art
+alignment might be limited, even though in theory, each alignment                       concurrent graph processing systems that are publicly accessible:
+technique may provide its unique benefits.                                              GraphM [42] and Krill [6]. To show the contributions of different
+   So far, we have introduced the alignments at all three levels.                       techniques, Glign is configured differently as listed in Table 5.
+Next, we briefly explain their implementations.                                         In addition to the above systems, we also tested a system design
+                                                                                        that exploits query-level parallelism—each concurrent query is
+3.5     Implementation                                                                  evaluated using the serial implementation from BGL [29], while
+We implemented Glign on top of the popular in-memory graph                              different queries are processed on different threads. However, we
+processing engine Ligra [28]. In fact, thanks to its high-efficiency,                   found it ran slower than our baseline Ligra-S in most cases tested.
+Ligra also serves as the base for two recently proposed concurrent                      Queries. We evaluated five types of graph queries, including BFS
+graph systems: Congra [20] and Krill [6]. One of our goals is to                        (breadth-first search), SSSP (single source shortest path), SSWP (single
+implement Glign as a transparent runtime system, thus keeping                           source widest path), SSNP (single source narrowest path), and Viterbi.
+the original programming interface of Ligra mostly untouched.                           Table 6 lists their vertex functions in pseudo-code.
+For example, developers can still call functions EdgeMap() and                              All queries are vertex-specific in that they start from one source
+VertexMap() for traversing edges and vertices, and VertexSubset                         vertex and compute property values for all vertices in the graph.
+remains to be the frontier representation.                                              To generate the query set for each type of query, we followed a
+    Under the hood, Glign maintains the query-oblivious frontier                        sampling strategy similar to the one used by Qi and others [21].
+and leverages the original parallelization supports from Ligra to                       First, the graph vertices are divided into disjoint bins based on their
+process each query in parallel. To support batching, we extended                        distances (hops) to the (top-4) high-degree vertices. Then, these
+Ligra to let it consume a query buffer based on the batch size B                        bins are scanned in rounds, and in each round a vertex is randomly
+and the batching policy (e.g., affinity-oriented batching). At the                      picked from each bin, until 512 vertices are selected, which serve as
+beginning of an iteration, Glign first checks the alignment vector                      the source vertices of our queries. In this way, the selected queries
+I (in Section 3.3) to decide if some queries need to be started at the                  provide a better coverage of the entire graph structure. We assume
+current iteration. For better locality, the memory layout of vertex                     all the 512 queries are already in the buffer when the systems start to
+values is implemented as a single array and the value of vertex v j                     process them. This allows us to focus on evaluating the throughput
+for query qi can be accessed via ValArray[v j *B+i], where B is the                     of the concurrent systems. One can also add the query arrival time
+batch size. When the graph is loaded into the memory for the first                      information, with which the latency of processing each query could
+time, Glign will automatically compute the least hops from each                         also be inferred. We leave such latency study for future work.
+vertex to the closest high degree vertex (closestHV[]), which will                          Besides grouping queries of the same types into the same query
+later be used to guide the alignments.                                                  buffer (i.e., homogeneous query buffer), we also generated a query
+                                                                                        buffer of mixed types of queries, randomly selected with types of
+4     EVALUATION                                                                        BFS, SSSP, SSWP, and SSNP. We refer to this scenario as “Heter”.
+This section evaluates the effectiveness of the proposed alignment                          By default, we set the query batch size to 64. For evaluating the
+techniques and the efficiency of Glign.                                                 impacts of batch size, we changed the batch size from 2 to 128.
+                                                                                        Graph Data Sets. We primarily evaluate Glign on power-law
+4.1     Methodology                                                                     graphs, which include five real-world graphs. For completeness,
+First, we set up two baselines for comparing with Glign: (i) Ligra-S                    we also evaluate Glign on a couple of road networks, which are
+and (ii) Ligra-C. The former evaluates the queries in a batch one                       more like planar graphs. Their basic properties are summarized in
+
+
+
+
+                                                                                   85
+Glign: Taming Misaligned Graph Traversals in Concurrent Graph Processing                                                                                                                ASPLOS ’23, March 25–29, 2023, Vancouver, BC, Canada
+
+
+                                                                                                                                                                               GraphM                  Krill           Ligra-C        Glign
+Speedup (over Ligra-S)
+
+
+
+                         8
+                                                                                                                                                                                                                                                                 5.2
+                         6                                                                                                                                                                                                                                     2.1
+                                                                                                                                                                                                                                                              1.4
+                         4
+                                                                                                                                                                                                                                                             1.0
+                         2
+
+                         0
+                                     SSSP
+
+
+
+
+                                                                                    SSSP
+
+
+
+
+                                                                                                                                  SSSP
+
+
+
+
+                                                                                                                                                                               SSSP
+
+
+
+
+                                                                                                                                                                                                                              SSSP
+                                                    Viterbi
+
+
+
+
+                                                                                                   Viterbi
+
+
+
+
+                                                                                                                                                Viterbi
+
+
+
+
+                                                                                                                                                                                             Viterbi
+
+
+
+
+                                                                                                                                                                                                                                            Viterbi
+                                                                     Heter
+
+
+
+
+                                                                                                                    Heter
+
+
+
+
+                                                                                                                                                                 Heter
+
+
+
+
+                                                                                                                                                                                                               Heter
+
+
+
+
+                                                                                                                                                                                                                                                             Heter
+                               BFS
+
+
+
+
+                                                                              BFS
+
+
+
+
+                                                                                                                            BFS
+
+
+
+
+                                                                                                                                                                         BFS
+
+
+
+
+                                                                                                                                                                                                                        BFS
+                                            SSWP
+
+
+                                                              SSNP
+
+
+
+
+                                                                                            SSWP
+
+
+                                                                                                             SSNP
+
+
+
+
+                                                                                                                                         SSWP
+
+
+                                                                                                                                                          SSNP
+
+
+
+
+                                                                                                                                                                                      SSWP
+
+
+                                                                                                                                                                                                       SSNP
+
+
+
+
+                                                                                                                                                                                                                                     SSWP
+
+
+                                                                                                                                                                                                                                                      SSNP
+                                                   LJ                                         WP                                           UK2                                          TW                                              FR                           Geo
+
+                                                                                                             Figure 11: Overall Performance.
+
+                             Table 6: Vertex Functions of Graph Queries                                                                                   Table 8: Time of Evaluating 512 Queries using Ligra-S
+
+                     Bench. Pseudo-code of Vertex function f (s)                                                                                                                             LJ        WP         UK2         TW              FR
+                                for each out-neighbor d of s                                                                                                               BFS      66s 300s 334s 1104s 3646s
+                     BFS          level(d ) = min { level(d ), level(s) +1 };                                                                                              SSSP    176s 579s 986s 2332s 10076s
+                                  if level(d) changed then add d to f r ont ier ;                                                                                          SSWP     97s 392s 507s 1734s 4580s
+                                for each out-neighbor d of s                                                                                                               Viterbi 224s 499s 1388s 2129s 7926s
+                     SSSP         dist(d ) = min { dist(d ), dist(s) + w(s, d ) };                                                                                         SSNP     99s 372s 493s 1630s 4440s
+                                  if dist(d) changed then add d to f r ont ier ;                                                                                           Heter 107s 398s 567s 1819s 5858s
+
+                                for each out-neighbor d of s
+                     SSWP         wide(d ) = max { wide(d), min { wide(s), w(s, d) } };
+                                  if wide(d ) changed then add d to f r ont ier ;
+                                for each out-neighbor d of s
+                     Viterbi      viterbi(d ) = max { viterbi(d), viterbi(s) / w(s, d) };
+                                  if viterbi(d ) changed then add d to f r ont ier ;                                                             of the other systems over Ligra-S. From the results, we find that
+                                for each out-neighbor d of s                                                                                     Glign clearly outperforms the other systems in almost all the cases
+                     SSNP         narrow(d ) = min { narrow(d ), max { narrow(s), w(s, d ) } };                                                  (except for the case UK2-Viterbi). The highest speedup it reaches
+                                  if narrow(d) changed then add d to f r ont ier ;                                                               is 9.4× (in the case of UK2-BFS). On average, Glign achieves 5.2×
+                                                                                                                                                 speedup over the baseline Ligra-S.
+                                                                                                                                                    Among the other systems, GraphM exhibits similar performance
+Table 7. The number of edges ranges from 69M to 3.6B, and the
+                                                                                                                                                 as Ligra-S. Note that, unlike the other systems in our evaluation,
+diameter ranges from 10 to 9100.
+                                                                                                                                                 GraphM is not built on top of Ligra, instead, it is built on top of
+                                              Table 7: Graph Statistics                                                                          GridGraph [43], a system mainly designed for out-of-core graph
+                                                                                                                                                 processing. This difference in the base system selection could be
+                                                                                                                                                 one of the reasons that cause GraphM to perform worse than the
+            Graph                                   Abbr. Directed                    |V|          |E| Avg. deg. Dia.
+                                                                                                                                                 other concurrent graph systems used in our evaluation.
+            LiveJournal [3]     LJ                                           Yes 4.8M 69M                           14.2   13                       Krill and Ligra-C both achieve a substantial average speedup
+            Wikipedia [2]      WP                                            Yes 14M 437M                           32.2   10
+            UK-2002 [5]        UK2                                           No 19M 524M                            28.3   45
+                                                                                                                                                 over Ligra-S (1.4× and 2.1×), confirming the general benefits of
+            Twitter [12]       TW                                            Yes 42M 1.5B                           35.3   15                    concurrent query evaluation. However, both perform worse than
+            Friendster [1]      FR                                           No 125M 3.6B                           28.9   38                    Glign, though all the three systems share the same base system
+            roadNet-CA [24] RD-CA                                            No 2.0M 5.5M                           2.81 849                     (Ligra). We believe this is mainly due to the locality improvement
+            roadNet-USA [24] RD-US                                           No 24M 58M                             2.41 9100                    brought by the alignment techniques that Glign employed.
+                                                                                                                                                    To confirm the above speculation, we measured the last-level
+  The experiments are conducted on a 32-core Linux server that                                                                                   cache (LLC) misses using the perf tool. The results are listed in
+equips with Intel Xeon E5-2683 v4 CPU (LLC size: 40MB) and 512GB                                                                                 Table 9. To save space, we report the results mainly for two graphs.
+memory. The application is compiled with g++ 6.3 and runs on                                                                                     From the results, we find that Glign incurs significantly fewer LLC
+CentOS 7.9.                                                                                                                                      misses than the other methods. For example, on LJ graph, Glign’s
+  Next, we will first report the overall performance, followed by                                                                                LLC misses is only 12%, 21%, 5%, and 23% of those (on average)
+more detailed evaluation of each alignment technique.                                                                                            incurred by Ligra-S, Ligra-C, GraphM, and Krill, respectively.
+                                                                                                                                                 These significant LLC miss reduction echos the substantial speedups
+4.2                        Overall Performance                                                                                                   brought by Glign as shown earlier in Figure 11.
+Table 8 shows the total execution time of evaluating a buffer of                                                                                    In the following, we will break down the performance gains of
+512 queries using Ligra-S, while Figure 11 reports the speedups                                                                                  Glign by evaluating each alignment technique.
+
+
+
+
+                                                                                                                                         86
+ASPLOS ’23, March 25–29, 2023, Vancouver, BC, Canada                                                                                            Xizhe Yin, Zhijia Zhao, and Rajiv Gupta
+
+
+                                         Table 9: LLC Misses (in billions)                                      Table 10: LLC Misses Reduction by Glign-Intra
+
+                                               Ligra-S Ligra-C GraphM Krill Glign                                  (Numbers are the ratios between the LLC misses of
+                                                                                                                     Glign-Intra and the LLC misses of Ligra-C)
+                                   BFS               9          11         44         15       1                                       LJ   WP    UK2     TW       FR
+                                   SSSP             28          15         77         15       4
+                                   SSWP             21          12         52         15       2                       BFS          22%     24%    13%    23%    32%
+                            LJ                                                                                         SSSP         33%     37%    12%    34%    36%
+                                   Viterbi          53          20         91          8       4
+                                   SSNP             21          11         52         15       2                       SSWP         32%     27%    17%    28%    24%
+                                   Heter            23          15         45         11       4                       Viterbi      34%     39%    19%    36%    31%
+                                                                                                                       SSNP         32%     28%    17%    31%    21%
+                                  Mean              26          14         60        13        3                       Heter        35%     42%    22%    31%    31%
+                               BFS                 302      245          1083        394      26                       Geomean      31%     32%    16%    30%    29%
+                               SSSP                621      237          1698        399      53
+                               SSWP                545      217           963        397      29
+                            TW
+                               Viterbi             757      242          1622        171      48
+                               SSNP                540      214          1202        396      36
+                                                                                                              Table 11: Memory Footprint Breakdown (64 queries)
+                               Heter               563      252          1201        241      52
+                                  Mean             555      235          1295        333      41                                       LJ                          TW
+                                                                                                                             Ligra-C    Glign-Intra      Ligra-C    Glign-Intra
+                                                                                                              Graph            545MB          545MB    11,400MB         11,400MB
+   Speedup (over Glign-C)
+
+
+
+
+                                         BFS     SSSP    SSWP        Viterbi    SSNP       Heter
+                                                                                                              Vertex Value   1,180MB        1,180MB    10,200MB         10,200MB
+                             2                                                                                Frontier         296MB           4.6MB    2,540MB           39.7MB
+                            1.5
+
+                             1                                                                          concurrent graph systems. These results, to a large extent, explain
+                            0.5                                                                         Glign-Intra’s speedups shown in Figure 12.
+                                                                                                           Finally, to get a sense of the memory reduction brought by the
+                             0                                                                          query-oblivious frontier in comparison to a two-level frontier, we
+                                         LJ        WP           UK2             TW           FR
+                                                                                                        profiled the memory footprints. Table 11 reports the sizes of major
+                                                                                                        data structures in Ligra-C and Glign: (i) the graph topology data,
+                            Figure 12: Speedups of Glign-Intra over Ligra-C                             the values of all vertices, and the frontier (as a labeling array). Note
+                                                                                                        that even though the frontier is only a relatively small portion of
+                                                                                                        the total memory footprint, it is accessed entirely in every iteration.
+4.3                         Intra-Iteration Alignment                                                   In comparison, only some parts of the graph and some vertex values
+In this section, we evaluate the proposed query-oblivious frontier                                      are accessed in each iteration. The results show that the frontier
+(Section 3.2) and compare it with the two-level frontier design                                         size is reduced dramatically with query-oblivious frontier, which
+(i.e., unified and separate frontiers) that is employed by some of                                      leads to the LLC misses reduction as shown in Table 10.
+the existing concurrent query processing systems. Both designs
+ensure synchronized frontier traversal—the key to intra-iteration                                       4.4     Inter-Iteration Alignment
+alignment. In our setting, Ligra-C employs the two-level frontier
+                                                                                                        To show the benefits of inter-iteration alignment, we compare
+design, while Glign-Intra uses the query-oblivious frontier (other
+                                                                                                        Glign-Inter with Glign-Intra.
+alignment techniques are disabled).
+    First, we have verified the correctness of all the query results                                    Performance. Figure 13 reports the speedups of Glign-Inter over
+produced by Glign-Intra, thus experimentally demonstrated the                                           Glign-Intra. Overall, Glign-Inter achieves better performance
+correctness of this new frontier design with real-world large data,                                     in all evaluated cases, except for WP-SSWP and WP-SSNP. The
+complimenting the theoretical proof in Section 3.2.                                                     speedups range from 0.89× to 2.95×. This demonstrates the benefits
+    Second, in terms of performance, Figure 12 reports speedups of                                      of our proposed inter-iteration alignment technique—delayed start.
+Glign-Intra over Ligra-C. The results show that Glign-Intra                                             In general, we found Glign-Inter does not perform significantly
+yields consistent speedups across different queries and graphs,                                         better on WP graph. The reason might be related to the fact that WP
+which range from 1.13× to 1.96×.                                                                        has a relatively smaller diameter (see Table 7). Smaller diameters
+    In addition, we also collected the LLC misses of Glign-Intra                                        imply that the vertices selected as the source vertices of the queries
+which may offer some more direct evidences on the effectiveness                                         tend to be closer to each other in terms of hops. Based on the
+of query-oblivious frontier. The results are reported in Table 10.                                      discussion in Section 3.3, queries with closer source vertices tend to
+From the results, we find that Glign-Intra can consistently reduce                                      align better (i.e., yielding better affinity) during their evaluation. As
+the LLC misses under all the evaluated cases, and the average                                           a result, there is less room for inter-iteration alignment to improve.
+reduction is quite substantial—its LLC misses are only around 30%                                       Affinity. To get a deeper understanding of the improvements, we
+on average of those incurred by the baseline Ligra-C. The reduction                                     also collected the affinity values (see Definition 3.4). The results
+mainly comes from the elimination of separate frontiers and the                                         are shown in Figure 14. Note that we set the Y-axis to 1 − affinity
+two-level frontier checking used by the baseline and other existing                                     because, for a batch of 64 queries, the affinity value tends to be
+
+
+
+
+                                                                                                   87
+Glign: Taming Misaligned Graph Traversals in Concurrent Graph Processing                                                           ASPLOS ’23, March 25–29, 2023, Vancouver, BC, Canada
+
+
+
+                                            BFS    SSSP        SSWP     Viterbi     SSNP       Heter
+                                                                                                                    Table 13: Ground Truth Study of Glign-Inter
+   Speedup (over Glign-Intra)
+
+
+
+                                 3
+                                2.5                                                                                                                       Speedup
+                                  2                                                                                    Diff Cnt Ratio Glign-Intra Glign-Inter Best-Align
+                                1.5                                                                                       0 172 33.6%            1.36×        1.51×        1.51×
+                                  1                                                                                       1 217 42.4%            1.32×        1.42×        1.51×
+                                0.5                                                                                       2 102 19.9%            1.20×        1.27×        1.46×
+                                 0
+                                                                                                                          3 20 3.9%              1.13×        1.20×        1.47×
+                                                                                                                          4   0 0.0%              N/A          N/A          N/A
+                                           LJ        WP               UK2           TW           FR
+                                                                                                                          5   1 0.2%             1.62×        1.52×        1.56×
+                                                                                                                  Sum./Avg. 512     100%         1.30×        1.41×        1.50×
+        Figure 13: Speedups of Glign-Inter over Glign-Intra
+
+                                                                                                                                  Table 14: Profiling Costs
+close to 1, using 1 − affinity can better reflect its significants. In
+fact, 1 − affinity reflects how much different frontiers are misaligned,
+                                                                                                                                                            LJ      TW
+thus the lower the value is, the better alignment we get. The results
+show that Glign-Inter substantially reduces the divergence, from                                                                           Profiling Cost 0.20s   3.84s
+0.068 to 0.041 on average. The highest reductions happen to BFS                                                                Query Eval. Cost SSSP 4.47s 53.40s
+on UK2 and FR graphs, which match well with the top two best                                                              (batch size:64, Glign) BFS 1.56s 25.51s
+speedups (2.91× and 2.95×) reported in Figure 13. The results also
+show that divergence for Glign-Intra is already very low in the
+                                                                                                            graph is set up. It is a one-time effort for each graph, with benefits
+case of WP graph, leaving little room for further improvements.
+                                                                                                            applying to different types of queries that run on the graph. Table 14
+This explains the limited speedups achieved by Glign-Inter on
+                                                                                                            lists the profiling costs on two graphs (LJ and TW), compared to the
+this graph (see Figure 13).
+                                                                                                            query evaluation time on the same graphs. During the concurrent
+   In addition, we report the LLC miss reduction by Glign-Inter
+                                                                                                            query evaluation, accessing the profiling result (a table lookup) is
+over Glign-Intra in Table 12. In general, the results echo well
+                                                                                                            quick and the cost is negligible.
+the above findings. For example, the highest cache miss reductions
+also happen to BFS on UK2 and FR graphs (37% and 32%) and the
+                                                                                                            4.5    Alignment-Oriented Batching
+reduction ratio on WP graph is the least.
+                                                                                                            To demonstrate the benefits of alignment-oriented batching, we
+                                Table 12: LLC Misses Reduction by Glign-Inter                               compare Glign-Batch with Glign-Intra. Figure 15 reports the
+                                                                                                            speedups of Glign-Batch over Glign-Intra. These speedups are
+                                      (Numbers are the ratios between the LLC misses of                     slightly higher than those achieved by Glign-Inter (Figure 13).
+                                      Glign-Inter and the LLC misses of Glign-Intra)                        This is expected as both alignments essentially explore the same
+                                                          LJ    WP      UK2       TW     FR                 affinity opportunities. The additional improvements indicate that
+                                         BFS          67%       96%     37%       68%    32%                the alignment opportunities across queries (in the query buffer) are
+                                         SSSP         73%       91%     53%       77%    51%                slightly higher than those within a single evaluation batch, which
+                                         SSWP         73%      101%     39%       76%    48%                is also confirmed by the affinity differences between Glign-Inter
+                                         Viterbi      64%       69%     38%       60%    37%                and Glign-Batch as shown in Figure 14.
+                                         SSNP         74%       97%     41%       67%    42%
+                                         Heter        64%       81%     31%       65%    51%
+                                                                                                            4.6    Impacts of Batch Size
+                                         Geomean      69%       88%     39%       69%    43%
+                                                                                                            To understand the sensitivity of Glign to a basic parameter—the
+                                                                                                            batch size. We changed the batch size from 2 to 128. Note that 128 is
+Heuristic v.s. Ground Truth. To examine the effectiveness of the                                            the largest value Glign can achieve based on the memory capacity
+proposed heuristic, we profiled the ground-truth best alignments for                                        of our machine and the size of the evaluated graphs.
+512 sampled batches, where each batch consists of only two queries.                                             Figure 16 reports the results using four types of queries and two
+The best alignment of each batch is found by exhaustively trying                                            input graphs. Most curves in the figure follow a similar trend, that
+all possible alignments and calculating the corresponding affinity                                          is, the speedup first grows as the batch size increases, until the
+value. Table 13 summarizes our findings. Among the 512 batches,                                             batch size reaches around 64, then the speedup starts to drop. The
+our heuristic finds the best alignments in 33.6% of them, and the                                           upward trend indicates that increasing the degree of concurrency
+difference with the optimal alignment is within 2 iterations for                                            tends to be beneficial, while the downward trend indicates there is
+over 95% cases. As to the speedups, the best alignments outperform                                          a limit for the benefit—the memory pressure also increases as the
+ours (1.50× vs 1.45×), indicating that extra room exists for further                                        batch size increases, which eventually would curb the gain.
+improving the performance via alignments.
+Profiling Costs. As discussed in Section 3.3, our heuristic requires                                        4.7    Performance on Road Networks
+profiling—running BFS queries on (four) high-degree vertices. Note                                          Though Glign is primarily designed for processing power-law
+that the profiling happens at the beginning when the system and                                             graphs, for completeness, we also report its performance on some
+
+
+
+
+                                                                                                       88
+ASPLOS ’23, March 25–29, 2023, Vancouver, BC, Canada                                                                                                                                                                       Xizhe Yin, Zhijia Zhao, and Rajiv Gupta
+
+
+                                    0.2
+                                             Glign-Intra                   Glign-Inter                 Glign-Batch
+                                   0.15
+   1 - Affinity
+
+
+
+
+                                    0.1
+
+                                   0.05
+
+                                       0
+                                                 SSSP
+
+
+
+
+                                                                                              SSSP
+
+
+
+
+                                                                                                                                           SSSP
+
+
+
+
+                                                                                                                                                                                        SSSP
+
+
+
+
+                                                                                                                                                                                                                                     SSSP
+                                                               Viterbi
+
+
+
+
+                                                                                                            Viterbi
+
+
+
+
+                                                                                                                                                         Viterbi
+
+
+
+
+                                                                                                                                                                                                      Viterbi
+
+
+
+
+                                                                                                                                                                                                                                                   Viterbi
+                                                                                Heter
+
+
+
+
+                                                                                                                             Heter
+
+
+
+
+                                                                                                                                                                          Heter
+
+
+
+
+                                                                                                                                                                                                                       Heter
+
+
+
+
+                                                                                                                                                                                                                                                                    Heter
+                                                                                                                                                                                                                                                                    Mean
+                                           BFS
+
+
+
+
+                                                                                        BFS
+
+
+
+
+                                                                                                                                     BFS
+
+
+
+
+                                                                                                                                                                                  BFS
+
+
+
+
+                                                                                                                                                                                                                               BFS
+                                                        SSWP
+
+
+                                                                         SSNP
+
+
+
+
+                                                                                                     SSWP
+
+
+                                                                                                                      SSNP
+
+
+
+
+                                                                                                                                                  SSWP
+
+
+                                                                                                                                                                   SSNP
+
+
+
+
+                                                                                                                                                                                               SSWP
+
+
+                                                                                                                                                                                                                SSNP
+
+
+
+
+                                                                                                                                                                                                                                            SSWP
+
+
+                                                                                                                                                                                                                                                             SSNP
+                                                           LJ                                          WP                                           UK2                                          TW                                            FR
+
+                                                                  Figure 14: Affinity Comparison: Glign-Intra vs Glign-Inter vs Glign-Batch
+
+                                                                                                                                                                                    Table 16: Comparison with iBFS
+                                             BFS        SSSP             SSWP           Viterbi       SSNP            Heter
+       Speedup (over Glign-Intra
+
+
+
+
+                                   3                                                                                                                                                           iBFS Glign-Intra Glign-Batch
+                                                                                                                                                                                  LJ   16.6s                              0.98×                    1.78×
+                                   2                                                                                                                                              WP   41.1s                              0.92×                    1.45×
+                                                                                                                                                                                  UK2 130.8s                              0.95×                    3.17×
+                                   1                                                                                                                                              TW 276.3s                               1.08×                    2.10×
+                                                                                                                                                                                  FR 2465.1s                              1.02×                    3.04×
+                                   0
+                                            LJ             WP                     UK2                TW                      FR
+
+                                                                                                                                                         the unified and separate frontiers to achieve synchronized frontier
+      Figure 15: Speedups of Glign-Batch over Glign-Intra
+                                                                                                                                                         traversal, just like Ligra-C and Krill. In comparison, Glign uses
+                                                                                                                                                         unified frontier only (i.e., query-oblivious frontier); Second, to group
+                                       Table 15: Performance on Road Networks                                                                            BFS queries, iBFS uses a different heuristic based on the out-degrees
+                                                                                                                                                         of source vertices. In particular, it requires two conditions for query
+                                                           RD-CA                                       RD-US                                             grouping: (i) out-degrees of source vertices should be less than p;
+                                                 SSSP             BFS SSWP                    SSSP           BFS SSWP                                    and (ii) the source vertices must connect to at least one common
+                           Ligra-S 369.8s 239.5s 219.6s 15224s 7916s                                                     1298s                           vertex whose out degree is greater than q. In comparison, Glign
+                           Ligra-C 2.91× 5.30× 1.45× 1.25× 2.66×                                                         0.30×                           groups queries only based on the affinity (or number of hops to
+                       Glign-Intra 6.08× 9.31× 2.99× 2.04× 14.67×                                                        1.86×                           a high-degree vertex). Last but not least, iBFS does not support
+                       Glign-Inter 6.85× 10.05× 3.15× 1.75× 13.51×                                                       1.25×                           inter-iteration alignment. To experimentally compare the two, we
+                      Glign-Batch 8.36× 11.15× 3.66× 2.52× 15.37×                                                        1.91×
+                                                                                                                                                         have implemented the heuristic of iBFS in Ligra-C. Note that the
+                             Glign 8.90× 12.41× 3.64× 2.77× 16.91×                                                       1.29×
+                                                                                                                                                         original iBFS work is implemented for the GPU platform.
+                                                                                                                                                            Table 16 reports the performance of using iBFS for evaluating 512
+road networks (RD-CA and RD-US). Table 15 reports the speedups                                                                                           BFS queries, and the speedups of Glign-Intra and Glign-Batch
+of Glign and their variants over our baseline Ligra-S. First, the                                                                                        over iBFS. Overall, we find that the performance of iBFS is similar
+results show that Glign-Intra still achieves good or even higher                                                                                         to Glign-Intra, but substantially slower than Glign-Batch. On
+speedups (e.g., 9.3× and 14.7× speedups for BFS). This is due the                                                                                        average the gap between iBFS and Glign-Batch is between 1.45×
+fact that, typically, only a small portion of the road network needs                                                                                     and 3.17×. A further examination reveals that the heuristic of iBFS
+to be accessed in each iteration, which makes the costs to access                                                                                        is too strict—it works better when there are an extremely large
+frontier(s) relatively higher. On the other hand, the extra benefits                                                                                     number of queries involved (e.g., querying all vertices in the graph).
+brought by the inter-iteration alignment and alignment-oriented
+batching are more limited. This is because evaluation on such                                                                                            5         RELATED WORK
+graphs often fails to yield sufficiently “heavy” iterations, making                                                                                      This section provides a more detailed summary of the works on
+the affinity issue less of a concern.                                                                                                                    multi-query graph processing as well as some other relevant works.
+                                                                                                                                                            Targeting distributed platforms, Seraph [33, 34] is an early work
+4.8                                Comparison with iBFS                                                                                                  that provides system-level supports for concurrent graph query
+Finally, we compare Glign with iBFS [13]—a specialized graph                                                                                             processing. Its key idea is to decouple the graph structure from
+system dedicated to concurrent BFS queries. It is an early work that                                                                                     query-specific data to allow concurrent query evaluations to share
+groups BFS query instances and leverages shared frontier traversal,                                                                                      the common graph structure data. Some other distributed systems
+which resembles affinity-oriented batching. However, there are a                                                                                         for concurrent graph query processing include MultiLyra [16] and
+few key differences between the two. First, iBFS maintains both                                                                                          BEAD [17], both of which support efficient batched query evaluation
+
+
+
+
+                                                                                                                                              89
+Glign: Taming Misaligned Graph Traversals in Concurrent Graph Processing                                   ASPLOS ’23, March 25–29, 2023, Vancouver, BC, Canada
+
+
+            7
+            6                  Glign-Batch   Glign-Inter   Ligra-C                                                       Glign-Batch   Glign-Inter    Ligra-C
+  Speedup
+
+
+
+
+            5
+            4
+            3
+            2
+            1
+                  2
+                  4
+                  8
+                 16
+                 32
+                 64
+                128
+                  2
+                  4
+                  8
+                 16
+                 32
+                 64
+                128
+                  2
+                  4
+                  8
+                 16
+                 32
+                 64
+                128
+                  2
+                  4
+                  8
+                 16
+                 32
+                 64
+                128
+
+
+                                                                                      2
+                                                                                      4
+                                                                                      8
+                                                                                     16
+                                                                                     32
+                                                                                     64
+                                                                                    128
+                                                                                      2
+                                                                                      4
+                                                                                      8
+                                                                                     16
+                                                                                     32
+                                                                                     64
+                                                                                    128
+                                                                                      2
+                                                                                      4
+                                                                                      8
+                                                                                     16
+                                                                                     32
+                                                                                     64
+                                                                                    128
+                                                                                      2
+                                                                                      4
+                                                                                      8
+                                                                                     16
+                                                                                     32
+                                                                                     64
+                                                                                    128
+                SSSP              BFS               SSWP             Viterbi             SSSP              BFS              SSWP                Viterbi
+
+
+                                  Figure 16: Impacts of Query Batch Size (Left: LJ graph, Right: TW graph)
+
+
+with graph sharing and frontier sharing in order to amortize the                    be more challenging than extending the Ligra framework, due to
+communication costs among computation nodes in the cluster.                         the involvement of a DSL and the consideration of bucketing-based
+   For single-machine graph processing with out-of-core processing                  algorithms, respectively. Some other recent works offer supports
+supports, some prior works include CGraph [38] and GraphM [42],                     for hypergraphs [27] and streaming graphs [8, 31]—scenarios that
+both of which follow the idea of graph sharing as in Seraph. The                    our work does not cover currently. It would be an interesting topic
+key insight of both works is to exploit the temporal and spatial                    to explore concurrent query evaluation under such schemes.
+locality of shared graph accesses. To achieve that, they first partition               There are recent works on graph accelerators (GraphPulse [22],
+the graph (as well as the vertex value array) so that each partition                JetStream [23], and LCCG [41]). GraphPulse is an asynchronous
+is small enough to fit into the cache, then they load one partition                 graph processing accelerator for static graphs. JetStream supports
+each time and process all jobs (queries) relevant to this partition.                streaming graphs and incremental computations. It also exploits the
+Comparing to their “partition-centric” approach, our approach is                    monotonicity property of iterative graph queries, but for a different
+more “iteration-centric”, though both of them share the same goal—                  purpose than our work. The property is leveraged to guarantee the
+improving the data locality.                                                        correctness of incremental computations. Neither GraphPulse or
+   For in-memory graph processing, one early work is Congra [20],                   JetStream addresses the concurrent query evaluations scenario.
+which is built on top of Ligra [28]. Its main goal is to maximize the               LCCG is a graph accelerator that supports concurrent graph jobs by
+memory bandwidth by forking processes for new queries through                       utilizing a topology-aware approach with new hardware units. It
+the guidance of a scheduler. It needs offline profiling on each graph               remains an interesting open question how our proposed alignment
+query to get the memory bandwidth and scalability characteristics.                  techniques can be integrated into the graph accelerators. One of
+Since each query is evaluated by a separate process, Congra does                    the first steps should be extending the above accelerators so that
+not exploit graph sharing or frontier sharing. Unlike the others,                   they can handle multiple queries simultaneously.
+SimGQ [32] exploits the shared subcomputations of queries in a                         Finally, there are many works aimed at improving the memory
+batch of concurrent queries and reuses some computation results                     locality for a single query evaluation [19, 36, 39]. To carryover these
+proposed in VRGQ [10] to improve the efficiency. These techniques                   improvements to concurrent queries, they must be combined with
+exploit shared computations, thus are orthogonal to our techniques                  an approach like Glign.
+which exploit shared graph accesses. Finally, Krill [6] is a more
+recent work that not only exploits graph sharing, but also gains                    6   CONCLUSION
+benefits from an efficient management of property data that are                     This work reveals a major performance issue in concurrent graph
+computed during the evaluation. In comparison, our work supports                    processing—alignment of graph traversals. It addresses this issue
+both graph sharing and frontier sharing among concurrent queries                    at three levels. First, it proposes the query-oblivious frontier to
+while also achieves improvements in alignment of graph traversals                   achieve synchronized frontier traversal within each global iteration.
+and thus significant reductions in LLC misses over Krill. Like the                  Second, it introduces a heuristic-based solution based a series of
+above systems, our system Glign also targets in-memory graph                        insights and observations to intelligently align the iterations of
+processing, however, Glign explores three levels of alignments                      different queries and to group queries with different affinities. It
+which are not seen in any of these existing systems.                                integrates the proposed techniques into a runtime system called
+   Following up the Ligra [28] framework, two more recent graph                     Glign. A full evaluation of Glign has confirmed the effectiveness of
+programming systems, GraphIt [37, 40] and Julienne [7], have                        the proposed alignments and demonstrated superior performance
+been proposed for optimizing single query processing. In particular,                over state-of-the-art concurrent graph processing systems.
+GraphIt designs a DSL that provides custom scheduling functions
+for exploring various optimization opportunities. In comparison,
+                                                                                    ACKNOWLEDGMENTS
+Julienne is specialized for bucketing-based algorithms like k-core
+and approximate set-cover which cannot be supported efficiently                     We thank all the reviewers for their very valuable feedback. This
+in Ligra. Their techniques are orthogonal to those in our work                      material is based upon the work supported in part by National
+which focus on the performance of concurrent queries. However,                      Science Foundation Grants CCF-2028714, CCF-2002554 and CCF-
+to incorporate our alignment techniques, these systems need to be                   1813173. Any opinions, findings, and conclusions or recommenda-
+extended to support concurrent query evaluation, which appears to                   tions expressed in this material are those of the authors and do not
+                                                                                    necessarily reflect the views of the National Science Foundation.
+
+
+
+
+                                                                               90
+ASPLOS ’23, March 25–29, 2023, Vancouver, BC, Canada                                                                             Xizhe Yin, Zhijia Zhao, and Rajiv Gupta
+
+
+A ARTIFACT APPENDIX                                                                running times, speedups, and LLC misses may vary depending on
+                                                                                   the computing environments, but the trends should be similar.
+A.1 Abstract
+This artifact contains the source code of Glign, including the five                REFERENCES
+concurrent query evaluation designs discussed in the paper and                      [1] 2013. Friendster network dataset. http://konect.cc/networks/friendster/. Ac-
+some graph benchmarks used in the experiments. In addition, this                        cessed: 2022-01-02.
+artifact provides bash scripts to compile Glign and reproduce the                   [2] 2013. Wikipedia links, english network dataset. http://konect.cc/networks/
+                                                                                        wikipedia_link_en/. Accessed: 2022-01-02.
+key experimental results reported in the paper.                                     [3] Lars Backstrom, Dan Huttenlocher, Jon Kleinberg, and Xiangyang Lan. 2006.
+                                                                                        Group formation in large social networks: membership, growth, and evolution.
+                                                                                        In Proceedings of the 12th ACM SIGKDD international conference on Knowledge
+A.2      Artifact check-list (meta-information)                                         discovery and data mining. 44–54.
+      • Algorithm: Five designs of concurrent query evaluation schemes:             [4] Robert D Blumofe, Christopher F Joerg, Bradley C Kuszmaul, Charles E Leiserson,
+        Glign, Glign-Intra, Glign-Inter, Glign-Batch, and Ligra-C.                      Keith H Randall, and Yuli Zhou. 1995. Cilk: An efficient multithreaded runtime
+                                                                                        system. ACM SigPlan Notices 30, 8 (1995), 207–216.
+      • Program: The concurrent query evaluation system Glign built on              [5] Paolo Boldi and Sebastiano Vigna. 2004. The webgraph framework I: compression
+        top of Ligra.                                                                   techniques. In Proceedings of the 13th international conference on World Wide Web.
+      • Compilation: GCC 6.3.0                                                          595–602.
+      • Data set: There are seven graphs tested in the paper. We include            [6] Hongzheng Chen, Minghua Shen, Nong Xiao, and Yutong Lu. 2021. Krill: a
+                                                                                        compiler and runtime system for concurrent graph processing. In Proceedings of
+        the smaller ones (LiveJournal and roadNet-CA) in the artifact.                  the International Conference for High Performance Computing, Networking, Storage
+      • Run-time environment: The system is developed and tested in                     and Analysis. 1–16.
+        Linux environment (CentOS 7.9).                                             [7] Laxman Dhulipala, Guy Blelloch, and Julian Shun. 2017. Julienne: A framework
+      • Hardware: The experiments in the paper were run on a machine                    for parallel graph algorithms using work-efficient bucketing. In Proceedings of the
+                                                                                        29th ACM Symposium on Parallelism in Algorithms and Architectures. 293–304.
+        with Intel Xeon E5-2683 v4 CPU and 512GB memory. 150GB disk                 [8] Laxman Dhulipala, Guy E Blelloch, and Julian Shun. 2019. Low-latency graph
+        space is enough for storing all graphs.                                         streaming using compressed purely-functional trees. In Proceedings of the 40th
+      • Experiments: Bash scripts are included in Glign-AE/apps and                     ACM SIGPLAN conference on programming language design and implementation.
+        Glign-AE/results/scripts. Detailed instructions are provided in                 918–934.
+                                                                                    [9] Joseph E Gonzalez, Yucheng Low, Haijie Gu, Danny Bickson, and Carlos Guestrin.
+        Glign-AE/README.md                                                              2012. Powergraph: Distributed graph-parallel computation on natural graphs.
+      • How much time is needed to prepare workflow (approximately)?:                   In 10th {USENIX } Symposium on Operating Systems Design and Implementation
+        2-3 hours to prepare all graphs.                                                ( {OSDI } 12). 17–30.
+      • How much time is needed to complete experiments (approx-                   [10] Xiaolin Jiang, Chengshuo Xu, and Rajiv Gupta. 2021. VRGQ: Evaluating a Stream
+                                                                                        of Iterative Graph Queries via Value Reuse. ACM SIGOPS Operating Systems
+        imately)?: It takes around 2-4 hours to generate all data for the               Review 55, 1 (2021), 11–20.
+        LiveJournal (LJ) graph. Note that collecting data for all the graphs       [11] Xiaolin Jiang, Chengshuo Xu, Xizhe Yin, Zhijia Zhao, and Rajiv Gupta. 2021.
+        reported in the paper may be very time-consuming. It is suggested               Tripoline: generalized incremental graph processing via graph triangle inequality.
+        that the reviewer first test the LJ graph and check the results. If time        In Proceedings of the Sixteenth European Conference on Computer Systems. 17–32.
+                                                                                   [12] Haewoon Kwak, Changhyun Lee, Hosung Park, and Sue Moon. 2010. What is
+        allows, the reviewer can test other larger graphs.                              Twitter, a social network or a news media?. In Proceedings of the 19th international
+      • Publicly available?: Yes                                                        conference on World wide web. 591–600.
+                                                                                   [13] Hang Liu, H Howie Huang, and Yang Hu. 2016. iBFS: Concurrent breadth-
+                                                                                        first search on GPUs. In Proceedings of the 2016 International Conference on
+A.3      Description                                                                    Management of Data. 403–416.
+A.3.1 How to access. A file named ASPLOS23_AE.zip, containing                      [14] Yucheng Low, Joseph Gonzalez, Aapo Kyrola, Danny Bickson, Carlos Guestrin,
+                                                                                        and Joseph M Hellerstein. 2012. Distributed GraphLab: A framework for machine
+the source files, scripts, and input query files, is available as a public              learning in the cloud. arXiv preprint arXiv:1204.6078 (2012).
+repository on Zenodo (find its URL in [35].)                                       [15] Grzegorz Malewicz, Matthew H Austern, Aart JC Bik, James C Dehnert, Ilan
+                                                                                        Horn, Naty Leiser, and Grzegorz Czajkowski. 2010. Pregel: a system for large-
+A.3.2 Hardware dependencies. To reproduce the results reported                          scale graph processing. In Proceedings of the 2010 ACM SIGMOD International
+in the paper, we recommend running the artifact on Intel Xeon CPU                       Conference on Management of data. 135–146.
+                                                                                   [16] Abbas Mazloumi, Xiaolin Jiang, and Rajiv Gupta. 2019. Multilyra: Scalable dis-
+with at least 32 cores. For smaller graphs like LJ, 64GB memory is                      tributed evaluation of batches of iterative graph queries. In 2019 IEEE International
+enough, for larger graphs (FR), 400GB memory is required.                               Conference on Big Data (Big Data). IEEE, 349–358.
+                                                                                   [17] Abbas Mazloumi, Chengshuo Xu, Zhijia Zhao, and Rajiv Gupta. 2020. BEAD:
+A.3.3 Software dependencies. We recommend that the artifact runs                        Batched Evaluation of Iterative Graph Queries with Evolving Analytics Demands.
+                                                                                        In 2020 IEEE International Conference on Big Data (Big Data). IEEE, 461–468.
+on CentOS 7, but other similar Linux distributions should also work.               [18] Robert Ryan McCune, Tim Weninger, and Greg Madey. 2015. Thinking like a
+To compile and run the source code with scripts, users need GCC                         vertex: a survey of vertex-centric frameworks for large-scale distributed graph
+with Cilk support (GCC 7.4.0 or 6.3.0 or lower versions).                               processing. ACM Computing Surveys (CSUR) 48, 2 (2015), 1–39.
+                                                                                   [19] Anurag Mukkara, Nathan Beckmann, Maleen Abeydeera, Xiaosong Ma, and
+                                                                                        Daniel Sanchez. 2018. Exploiting Locality in Graph Analytics through Hardware-
+A.4      Installation                                                                   Accelerated Traversal Scheduling. In Proceedings of the 51st Annual IEEE/ACM
+                                                                                        International Symposium on Microarchitecture (Fukuoka, Japan) (MICRO-51). IEEE
+The compilation script is provided in Glign-AE/apps. Detailed                           Press, 1–14. https://doi.org/10.1109/MICRO.2018.00010
+instructions are provided in Glign-AE/README.md                                    [20] Peitian Pan and Chao Li. 2017. Congra: Towards efficient processing of concurrent
+                                                                                        graph queries on shared-memory machines. In 2017 IEEE International Conference
+                                                                                        on Computer Design (ICCD). IEEE, 217–224.
+A.5      Evaluation and expected results                                           [21] Zichao Qi, Yanghua Xiao, Bin Shao, and Haixun Wang. 2013. Toward a distance
+                                                                                        oracle for billion-node graphs. Proceedings of the VLDB Endowment 7, 1 (2013),
+The performance tests and profiling experiments could be run with                       61–72.
+the provided scripts (in Glign-AE/apps). See detailed instructions                 [22] Shafiur Rahman, Nael Abu-Ghazaleh, and Rajiv Gupta. 2020. Graphpulse: An
+in Glign-AE/README.md. Scripts for collecting data reported in the                      event-driven hardware accelerator for asynchronous graph processing. In 2020
+                                                                                        53rd Annual IEEE/ACM International Symposium on Microarchitecture (MICRO).
+paper are provided in Glign-AE/results/scripts). Note that the                          IEEE, 908–921.
+
+
+
+
+                                                                             91
+Glign: Taming Misaligned Graph Traversals in Concurrent Graph Processing                                                   ASPLOS ’23, March 25–29, 2023, Vancouver, BC, Canada
+
+
+[23] Shafiur Rahman, Mahbod Afarin, Nael Abu-Ghazaleh, and Rajiv Gupta. 2021.                        international symposium on High-performance parallel and distributed computing.
+     JetStream: Graph Analytics on Streaming Data with Event-Driven Hardware                         227–238.
+     Accelerator. In MICRO-54: 54th Annual IEEE/ACM International Symposium on                  [35] Xizhe Yin. 2022. Glign: Taming Misaligned Graph Traversals in Concurrent Graph
+     Microarchitecture. 1091–1105.                                                                   Processing. https://doi.org/10.5281/zenodo.7173860
+[24] Ryan A. Rossi and Nesreen K. Ahmed. 2015. The Network Data Reposi-                         [36] Pingpeng Yuan, Wenya Zhang, Changfeng Xie, Hai Jin, Ling Liu, and Kisung Lee.
+     tory with Interactive Graph Analytics and Visualization. In AAAI. https:                        2014. Fast Iterative Graph Computation: A Path Centric Approach (SC ’14). IEEE
+     //networkrepository.com                                                                         Press, 401–412. https://doi.org/10.1109/SC.2014.38
+[25] Amir Hossein Nodehi Sabet, Zhijia Zhao, and Rajiv Gupta. 2020. Subway: Mini-               [37] Yunming Zhang, Ajay Brahmakshatriya, Xinyi Chen, Laxman Dhulipala, Shoaib
+     mizing data transfer during out-of-GPU-memory graph processing. In Proceedings                  Kamil, Saman Amarasinghe, and Julian Shun. 2019. Optimizing ordered graph
+     of the Fifteenth European Conference on Computer Systems. 1–16.                                 algorithms with graphit. arXiv preprint arXiv:1911.07260 (2019).
+[26] Sherif Sakr, Faisal Moeen Orakzai, Ibrahim Abdelaziz, and Zuhair Khayyat. 2016.            [38] Yu Zhang, Xiaofei Liao, Hai Jin, Lin Gu, Ligang He, Bingsheng He, and Haikun
+     Large-scale graph processing using Apache Giraph. Springer.                                     Liu. 2018. Cgraph: A correlations-aware approach for efficient concurrent
+[27] Julian Shun. 2020. Practical parallel hypergraph algorithms. In Proceedings of the              iterative graph processing. In 2018 {USENIX } Annual Technical Conference
+     25th ACM SIGPLAN Symposium on Principles and Practice of Parallel Programming.                  ( {USENIX } {ATC } 18). 441–452.
+     232–249.                                                                                   [39] Yu Zhang, Xiaofei Liao, Hai Jin, Bingsheng He, Haikun Liu, and Lin Gu. 2019.
+[28] Julian Shun and Guy E Blelloch. 2013. Ligra: a lightweight graph processing                     DiGraph: An Efficient Path-Based Iterative Directed Graph Processing System
+     framework for shared memory. In Proceedings of the 18th ACM SIGPLAN sympo-                      on Multiple GPUs (ASPLOS ’19). Association for Computing Machinery, New
+     sium on Principles and practice of parallel programming. 135–146.                               York, NY, USA, 601–614. https://doi.org/10.1145/3297858.3304029
+[29] Jeremy Siek, Lie-Quan Lee, Andrew Lumsdaine, et al. 2002. The boost graph                  [40] Yunming Zhang, Mengjiao Yang, Riyadh Baghdadi, Shoaib Kamil, Julian Shun, and
+     library. Vol. 243. Pearson India.                                                               Saman Amarasinghe. 2018. Graphit: A high-performance graph dsl. Proceedings
+[30] Leslie G Valiant. 1990. A bridging model for parallel computation. Commun.                      of the ACM on Programming Languages 2, OOPSLA (2018), 1–30.
+     ACM 33, 8 (1990), 103–111.                                                                 [41] Jin Zhao, Yu Zhang, Xiaofei Liao, Ligang He, Bingsheng He, Hai Jin, and Haikun
+[31] Keval Vora, Rajiv Gupta, and Guoqing Xu. 2017. Kickstarter: Fast and accurate                   Liu. 2021. LCCG: a locality-centric hardware accelerator for high throughput of
+     computations on streaming graphs via trimmed approximations. In Proceed-                        concurrent graph processing. In Proceedings of the International Conference for
+     ings of the twenty-second international conference on architectural support for                 High Performance Computing, Networking, Storage and Analysis. 1–14.
+     programming languages and operating systems. 237–251.                                      [42] Jin Zhao, Yu Zhang, Xiaofei Liao, Ligang He, Bingsheng He, Hai Jin, Haikun
+[32] Chengshuo Xu, Abbas Mazloumi, Xiaolin Jiang, and Rajiv Gupta. 2020. SimGQ:                      Liu, and Yicheng Chen. 2019. GraphM: an efficient storage system for high
+     Simultaneously evaluating iterative graph queries. In 2020 IEEE 27th International              throughput of concurrent graph processing. In Proceedings of the International
+     Conference on High Performance Computing, Data, and Analytics (HiPC). IEEE,                     Conference for High Performance Computing, Networking, Storage and Analysis.
+     1–10.                                                                                           1–14.
+[33] Jilong Xue, Zhi Yang, Shian Hou, and Yafei Dai. 2016. Processing concurrent                [43] Xiaowei Zhu, Wentao Han, and Wenguang Chen. 2015. {GridGraph }: {Large-
+     graph analytics with decoupled computation model. IEEE Trans. Comput. 66, 5                     Scale } Graph Processing on a Single Machine Using 2-Level Hierarchical Parti-
+     (2016), 876–890.                                                                                tioning. In 2015 USENIX Annual Technical Conference (USENIX ATC 15). 375–386.
+[34] Jilong Xue, Zhi Yang, Zhi Qu, Shian Hou, and Yafei Dai. 2014. Seraph: an efficient,
+     low-cost system for concurrent graph processing. In Proceedings of the 23rd                Received 2022-03-31; accepted 2022-06-16
+
+
+
+
+                                                                                           92
+
