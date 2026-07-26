@@ -326,6 +326,28 @@ pair<size_t, size_t> Compute_Base(graph<vertex>& G, std::vector<long> vecQueries
   }
 #endif
 
+#ifdef VALIDATE_SUMMARY
+  for (int i = 0; i < batch_size; ++i) {
+    unsigned long long reached = 0;
+    unsigned long long distance_sum = 0;
+    unsigned long long weighted_sum = 0;
+#pragma omp parallel for reduction(+ : reached, distance_sum, weighted_sum)
+    for (long vertex_id = 0; vertex_id < n; ++vertex_id) {
+      const auto distance = ShortestPathLen[vertex_id * batch_size + i];
+      if (distance < MAXPATH) {
+        ++reached;
+        distance_sum += static_cast<unsigned long long>(distance);
+        weighted_sum += (static_cast<unsigned long long>(vertex_id) + 1) *
+            (static_cast<unsigned long long>(distance) + 1);
+      }
+    }
+    std::cout << "validation_summary query=" << i
+              << " reached=" << reached
+              << " value_sum=" << distance_sum
+              << " weighted_sum=" << weighted_sum << std::endl;
+  }
+#endif
+
   Frontier.del();
   pbbs::delete_array(ShortestPathLen, totalNumVertices);
   pbbs::delete_array(CurrActiveArray, totalNumVertices);
@@ -572,6 +594,28 @@ pair<size_t, size_t> Compute_Base_Dynamic(graph<vertex>& G, std::vector<long> ve
   }
 #endif
 
+#ifdef VALIDATE_SUMMARY
+  for (int i = 0; i < batch_size; ++i) {
+    unsigned long long reached = 0;
+    unsigned long long distance_sum = 0;
+    unsigned long long weighted_sum = 0;
+#pragma omp parallel for reduction(+ : reached, distance_sum, weighted_sum)
+    for (long vertex_id = 0; vertex_id < n; ++vertex_id) {
+      const auto distance = ShortestPathLen[vertex_id * batch_size + i];
+      if (distance < MAXPATH) {
+        ++reached;
+        distance_sum += static_cast<unsigned long long>(distance);
+        weighted_sum += (static_cast<unsigned long long>(vertex_id) + 1) *
+            (static_cast<unsigned long long>(distance) + 1);
+      }
+    }
+    std::cout << "validation_summary query=" << i
+              << " reached=" << reached
+              << " value_sum=" << distance_sum
+              << " weighted_sum=" << weighted_sum << std::endl;
+  }
+#endif
+
   Frontier.del();
   pbbs::delete_array(ShortestPathLen, totalNumVertices);
   pbbs::delete_array(CurrActiveArray, totalNumVertices);
@@ -634,6 +678,28 @@ pair<size_t, size_t> Compute_Base_Skipping(graph<vertex>& G, std::vector<long> v
     for (long j = 0; j < n; j++)
       fprintf(fp, "%ld %d\n", j, ShortestPathLen[j * batch_size + i]);
     fclose(fp);
+  }
+#endif
+
+#ifdef VALIDATE_SUMMARY
+  for (int i = 0; i < batch_size; ++i) {
+    unsigned long long reached = 0;
+    unsigned long long distance_sum = 0;
+    unsigned long long weighted_sum = 0;
+#pragma omp parallel for reduction(+ : reached, distance_sum, weighted_sum)
+    for (long vertex_id = 0; vertex_id < n; ++vertex_id) {
+      const auto distance = ShortestPathLen[vertex_id * batch_size + i];
+      if (distance < MAXPATH) {
+        ++reached;
+        distance_sum += static_cast<unsigned long long>(distance);
+        weighted_sum += (static_cast<unsigned long long>(vertex_id) + 1) *
+            (static_cast<unsigned long long>(distance) + 1);
+      }
+    }
+    std::cout << "validation_summary query=" << i
+              << " reached=" << reached
+              << " value_sum=" << distance_sum
+              << " weighted_sum=" << weighted_sum << std::endl;
   }
 #endif
 
@@ -811,6 +877,28 @@ pair<size_t, size_t> Compute_Delay_Skipping(graph<vertex>& G, std::vector<long> 
     for (long j = 0; j < n; j++)
       fprintf(fp, "%ld %d\n", j, ShortestPathLen[j * batch_size + i]);
     fclose(fp);
+  }
+#endif
+
+#ifdef VALIDATE_SUMMARY
+  for (int i = 0; i < batch_size; ++i) {
+    unsigned long long reached = 0;
+    unsigned long long distance_sum = 0;
+    unsigned long long weighted_sum = 0;
+#pragma omp parallel for reduction(+ : reached, distance_sum, weighted_sum)
+    for (long vertex_id = 0; vertex_id < n; ++vertex_id) {
+      const auto distance = ShortestPathLen[vertex_id * batch_size + i];
+      if (distance < MAXPATH) {
+        ++reached;
+        distance_sum += static_cast<unsigned long long>(distance);
+        weighted_sum += (static_cast<unsigned long long>(vertex_id) + 1) *
+            (static_cast<unsigned long long>(distance) + 1);
+      }
+    }
+    std::cout << "validation_summary query=" << i
+              << " reached=" << reached
+              << " value_sum=" << distance_sum
+              << " weighted_sum=" << weighted_sum << std::endl;
   }
 #endif
 

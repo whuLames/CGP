@@ -2,6 +2,7 @@
 #include "sssp_cpu.hxx"  // Reference implementation
 #include <gunrock/util/performance.hxx>
 #include <gunrock/io/parameters.hxx>
+#include <gunrock/io/gr.hxx>
 
 using namespace gunrock;
 using namespace memory;
@@ -23,14 +24,22 @@ void test_sssp(int num_arguments, char** argument_array) {
   gunrock::io::cli::parameters_t arguments(num_arguments, argument_array,
                                         "Single Source Shortest Path");
 
-  io::matrix_market_t<vertex_t, edge_t, weight_t> mm;
-  auto [properties, coo] = mm.load(arguments.filename);
-
   csr_t csr;
-
+  gunrock::graph::graph_properties_t properties;
   if (arguments.binary) {
     csr.read_binary(arguments.filename);
+    properties.directed = true;
+    properties.symmetric = false;
+    properties.weighted = true;
+  } else if (gunrock::util::is_gr(arguments.filename)) {
+    auto [gr_properties, gr_csr] =
+        io::load_gr<vertex_t, edge_t, weight_t>(arguments.filename);
+    properties = gr_properties;
+    csr = gr_csr;
   } else {
+    io::matrix_market_t<vertex_t, edge_t, weight_t> mm;
+    auto [mm_properties, coo] = mm.load(arguments.filename);
+    properties = mm_properties;
     csr.from_coo(coo);
   }
 
@@ -88,7 +97,11 @@ void test_sssp(int num_arguments, char** argument_array) {
   if (arguments.export_metrics) {
     gunrock::util::stats::export_performance_stats(
         benchmark_metrics, n_edges, n_vertices, run_times, "sssp",
-        arguments.filename, "market", arguments.json_dir, arguments.json_file,
+        arguments.filename,
+        gunrock::util::is_gr(arguments.filename) ? "gr"
+                                                 : (arguments.binary ? "csr"
+                                                                     : "market"),
+        arguments.json_dir, arguments.json_file,
         source_vect, tag_vect, num_arguments, argument_array);
   }
 

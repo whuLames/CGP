@@ -1,1 +1,2 @@
 add_essentials_example(pr)
+add_essentials_example(pr_concurrent)

@@ -323,6 +323,30 @@ pair<size_t, size_t> Compute_Base_Skipping(graph<vertex>& G, std::vector<long> v
   }
 #endif
 
+#ifdef VALIDATE_SUMMARY
+  for (int i = 0; i < batch_size; ++i) {
+    unsigned long long reached = 0;
+    unsigned long long width_sum = 0;
+    unsigned long long weighted_sum = 0;
+#pragma omp parallel for reduction(+ : reached, width_sum, weighted_sum)
+    for (long vertex_id = 0; vertex_id < n; ++vertex_id) {
+      const auto value = WidestPathVal[vertex_id * batch_size + i];
+      const bool is_source = vertex_id == vecQueries[i];
+      if (is_source || value > 0) {
+        const auto width = is_source ? 0ULL
+                                     : static_cast<unsigned long long>(value);
+        ++reached;
+        width_sum += width;
+        weighted_sum += (static_cast<unsigned long long>(vertex_id) + 1) *
+            (width + 1);
+      }
+    }
+    std::cout << "validation_summary query=" << i
+              << " reached=" << reached << " value_sum=" << width_sum
+              << " weighted_sum=" << weighted_sum << std::endl;
+  }
+#endif
+
   Frontier.del();
   pbbs::delete_array(WidestPathVal, totalNumVertices);
   return make_pair(totalActivated, 0);
@@ -392,6 +416,30 @@ pair<size_t, size_t> Compute_Delay_Skipping(graph<vertex>& G, std::vector<long> 
     for (long j = 0; j < n; j++)
       fprintf(fp, "%ld %d\n", j, WidestPathVal[j * batch_size + i]);
     fclose(fp);
+  }
+#endif
+
+#ifdef VALIDATE_SUMMARY
+  for (int i = 0; i < batch_size; ++i) {
+    unsigned long long reached = 0;
+    unsigned long long width_sum = 0;
+    unsigned long long weighted_sum = 0;
+#pragma omp parallel for reduction(+ : reached, width_sum, weighted_sum)
+    for (long vertex_id = 0; vertex_id < n; ++vertex_id) {
+      const auto value = WidestPathVal[vertex_id * batch_size + i];
+      const bool is_source = vertex_id == vecQueries[i];
+      if (is_source || value > 0) {
+        const auto width = is_source ? 0ULL
+                                     : static_cast<unsigned long long>(value);
+        ++reached;
+        width_sum += width;
+        weighted_sum += (static_cast<unsigned long long>(vertex_id) + 1) *
+            (width + 1);
+      }
+    }
+    std::cout << "validation_summary query=" << i
+              << " reached=" << reached << " value_sum=" << width_sum
+              << " weighted_sum=" << weighted_sum << std::endl;
   }
 #endif
 

@@ -1,1 +1,2 @@
 add_essentials_example(sssp)
+add_essentials_example(sssp_concurrent)
