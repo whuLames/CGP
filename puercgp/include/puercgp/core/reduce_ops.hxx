@@ -55,5 +55,30 @@ __device__ __forceinline__ apply_result_t apply_min_reduce(
   return {false, __int_as_float(old)};
 }
 
+__device__ __forceinline__ apply_result_t apply_max_reduce(
+    algorithms::unified_value_t* slot,
+    algorithms::unified_value_t candidate) {
+  int* addr = reinterpret_cast<int*>(slot);
+  int old = *addr;
+  while (candidate > __int_as_float(old)) {
+    int assumed = old;
+    old = atomicCAS(addr, assumed, __float_as_int(candidate));
+    if (assumed == old) {
+      return {true, __int_as_float(assumed)};
+    }
+  }
+  return {false, __int_as_float(old)};
+}
+
+__device__ __forceinline__ apply_result_t apply_reduce(
+    algorithms::algo_kind_t kind,
+    algorithms::unified_value_t* slot,
+    algorithms::unified_value_t candidate) {
+  if (kind == algorithms::algo_kind_t::sswp) {
+    return apply_max_reduce(slot, candidate);
+  }
+  return apply_min_reduce(slot, candidate);
+}
+
 }  // namespace hybrid_detail
 }  // namespace puercgp

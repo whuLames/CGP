@@ -13,6 +13,7 @@
 
 #include <puercgp/algorithms/bfs.hxx>
 #include <puercgp/algorithms/sssp.hxx>
+#include <puercgp/algorithms/sswp.hxx>
 #include <puercgp/algorithms/wcc.hxx>
 #include <puercgp/backend/graph_adapter.hxx>
 #include <puercgp/backend/pull_graph_access.hxx>
@@ -29,6 +30,7 @@
 #include <puercgp/kernels/common/pull_postprocess.hxx>
 #include <puercgp/kernels/pull/fused_pull_kernels.hxx>
 #include <puercgp/kernels/push/shared_push_kernels.hxx>
+#include <puercgp/scheduling/slot_start_schedule.hxx>
 #include <puercgp/state/engine_workspace.hxx>
 #include <puercgp/state/pull_workspace.hxx>
 
@@ -66,6 +68,39 @@ __global__ void init_shared_sources_kernel(
        q += stride) {
     vertex_t source = sources[q];
     query_mask_t bit = query_bit(static_cast<int>(q));
+    values[value_index(static_cast<std::size_t>(source), q,
+                       static_cast<std::size_t>(query_count))] =
+        Policy::source_value();
+    if constexpr (std::is_same<Policy, algorithms::bfs_policy>::value) {
+      atomic_or_query_mask(visited_mask + source, bit);
+    }
+    query_mask_t old = atomic_or_query_mask(frontier_mask + source, bit);
+    if (old == 0) {
+      unsigned long long position = atomicAdd(unique_count, 1ULL);
+      frontier_vertices[position] = source;
+    }
+  }
+}
+
+template <typename Policy, typename vertex_t>
+__global__ void activate_shared_sources_kernel(
+    const vertex_t* sources,
+    int query_count,
+    query_mask_t activation_mask,
+    typename Policy::value_type* values,
+    query_mask_t* visited_mask,
+    query_mask_t* frontier_mask,
+    vertex_t* frontier_vertices,
+    unsigned long long* unique_count) {
+  std::size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+  std::size_t stride = blockDim.x * gridDim.x;
+  for (std::size_t q = tid; q < static_cast<std::size_t>(query_count);
+       q += stride) {
+    query_mask_t bit = query_bit(static_cast<int>(q));
+    if ((activation_mask & bit) == 0) {
+      continue;
+    }
+    vertex_t source = sources[q];
     values[value_index(static_cast<std::size_t>(source), q,
                        static_cast<std::size_t>(query_count))] =
         Policy::source_value();
@@ -124,6 +159,23 @@ class frontier_engine {
                   const query_batch<vertex_type>& queries,
                   execution_context& context,
                   const run_options& options) const {
+    return run_impl(graph, queries, context, options, nullptr);
+  }
+
+  template <typename graph_t>
+  result_type run(
+      graph_t& graph, const query_batch<vertex_type>& queries,
+      execution_context& context, const run_options& options,
+      const scheduling::slot_start_schedule& start_schedule) const {
+    return run_impl(graph, queries, context, options, &start_schedule);
+  }
+
+ private:
+  template <typename graph_t>
+  result_type run_impl(
+      graph_t& graph, const query_batch<vertex_type>& queries,
+      execution_context& context, const run_options& options,
+      const scheduling::slot_start_schedule* start_schedule) const {
     static_assert(std::is_same<vertex_type, int>::value,
                   "puercgp frontier policies currently require int vertices");
 
@@ -131,6 +183,15 @@ class frontier_engine {
     const int query_count = static_cast<int>(queries.size());
     if (query_count > 64) {
       throw std::invalid_argument("shared frontier supports at most 64 queries");
+    }
+    const bool scheduled = start_schedule != nullptr;
+    if (scheduled) {
+      start_schedule->validate(query_count);
+      if constexpr (Policy::init_mode !=
+                    algorithms::init_mode_t::single_source) {
+        throw std::invalid_argument(
+            "slot start schedules require a single-source algorithm");
+      }
     }
 
     const auto vertex_count =
@@ -156,6 +217,11 @@ class frontier_engine {
     auto& next_unique_count_dev = workspace.next_unique_count_vector();
     auto& next_pair_count_dev = workspace.next_pair_count_vector();
     thrust::device_vector<unsigned long long> frontier_metric_counters(3);
+    thrust::device_vector<query_mask_t> active_union_dev(scheduled ? 1 : 0);
+    thrust::device_vector<int> device_start_levels;
+    if (scheduled) {
+      device_start_levels = start_schedule->offsets();
+    }
 
     pull_workspace pull_state;
     pull_state.resize(vertex_count);
@@ -188,25 +254,28 @@ class frontier_engine {
         thrust::raw_pointer_cast(unique_count_dev.data()));
     detail::throw_if_cuda_error(cudaGetLastError(), "reset_counter_kernel");
 
-    if constexpr (std::is_same<Policy, algorithms::wcc_policy>::value) {
-      detail::init_wcc_labels_kernel<graph_t, vertex_type>
-          <<<detail::grid_for(vertex_count, threads), threads, 0, stream>>>(
-              graph, query_count, thrust::raw_pointer_cast(values.data()),
-              thrust::raw_pointer_cast(frontier_mask.data()),
-              thrust::raw_pointer_cast(frontier_vertices.data()),
-              thrust::raw_pointer_cast(unique_count_dev.data()));
-      detail::throw_if_cuda_error(cudaGetLastError(), "init_wcc_labels_kernel");
-    } else {
-      detail::init_shared_sources_kernel<Policy>
-          <<<detail::grid_for(queries.size(), threads), threads, 0, stream>>>(
-              graph, thrust::raw_pointer_cast(device_sources.data()),
-              query_count, thrust::raw_pointer_cast(values.data()),
-              thrust::raw_pointer_cast(visited_mask.data()),
-              thrust::raw_pointer_cast(frontier_mask.data()),
-              thrust::raw_pointer_cast(frontier_vertices.data()),
-              thrust::raw_pointer_cast(unique_count_dev.data()));
-      detail::throw_if_cuda_error(cudaGetLastError(),
-                                  "init_shared_sources_kernel");
+    if (!scheduled) {
+      if constexpr (std::is_same<Policy, algorithms::wcc_policy>::value) {
+        detail::init_wcc_labels_kernel<graph_t, vertex_type>
+            <<<detail::grid_for(vertex_count, threads), threads, 0, stream>>>(
+                graph, query_count, thrust::raw_pointer_cast(values.data()),
+                thrust::raw_pointer_cast(frontier_mask.data()),
+                thrust::raw_pointer_cast(frontier_vertices.data()),
+                thrust::raw_pointer_cast(unique_count_dev.data()));
+        detail::throw_if_cuda_error(cudaGetLastError(),
+                                    "init_wcc_labels_kernel");
+      } else {
+        detail::init_shared_sources_kernel<Policy>
+            <<<detail::grid_for(queries.size(), threads), threads, 0, stream>>>(
+                graph, thrust::raw_pointer_cast(device_sources.data()),
+                query_count, thrust::raw_pointer_cast(values.data()),
+                thrust::raw_pointer_cast(visited_mask.data()),
+                thrust::raw_pointer_cast(frontier_mask.data()),
+                thrust::raw_pointer_cast(frontier_vertices.data()),
+                thrust::raw_pointer_cast(unique_count_dev.data()));
+        detail::throw_if_cuda_error(cudaGetLastError(),
+                                    "init_shared_sources_kernel");
+      }
     }
 
     unsigned long long current_unique_raw = 0;
@@ -220,15 +289,17 @@ class frontier_engine {
 
     std::size_t current_unique_count =
         static_cast<std::size_t>(current_unique_raw);
-    std::size_t current_count = queries.size();
+    std::size_t current_count = scheduled ? 0 : queries.size();
     if constexpr (std::is_same<Policy, algorithms::wcc_policy>::value) {
-      current_count =
-          current_unique_count * static_cast<std::size_t>(query_count);
+      if (!scheduled) {
+        current_count =
+            current_unique_count * static_cast<std::size_t>(query_count);
+      }
     }
 
     const double pull_frontier_threshold =
         options.pull_frontier_ratio * static_cast<double>(value_count);
-    const double pull_edge_threshold =
+    const double default_pull_edge_threshold =
         options.pull_edge_ratio * static_cast<double>(query_count) *
         static_cast<double>(graph.get_number_of_edges());
     const bool has_pull_adjacency = detail::graph_has_pull_adjacency(graph);
@@ -243,19 +314,78 @@ class frontier_engine {
     result.effective_query_dim = query_count;
     result.frontier_sizes.push_back(current_count);
     result.unique_frontier_sizes.push_back(current_unique_count);
-    const query_partition_t partition =
+    const query_partition_t default_partition =
         query_partition_t::all_slots(query_count, options.traversal_mode);
 
     vertex_type level = 0;
-    while (current_unique_count > 0 &&
+    query_mask_t live_slots = scheduled ? query_mask_t{0}
+                                        : default_partition.active_slots;
+    const int last_start_step = scheduled ? start_schedule->max_offset() : -1;
+    bool bfs_pull_phase = false;
+    while ((current_unique_count > 0 ||
+            (scheduled && static_cast<int>(level) <= last_start_step)) &&
            (options.max_iterations <= 0 ||
             result.iterations < options.max_iterations)) {
+      if (scheduled) {
+        const query_mask_t activation_mask =
+            start_schedule->activation_mask(static_cast<int>(level));
+        if (activation_mask != 0) {
+          current_unique_raw =
+              static_cast<unsigned long long>(current_unique_count);
+          detail::throw_if_cuda_error(
+              cudaMemcpyAsync(
+                  thrust::raw_pointer_cast(unique_count_dev.data()),
+                  &current_unique_raw, sizeof(current_unique_raw),
+                  cudaMemcpyHostToDevice, stream),
+              "cudaMemcpyAsync(current_unique_count_for_activation)");
+          detail::activate_shared_sources_kernel<Policy, vertex_type>
+              <<<detail::grid_for(queries.size(), threads), threads, 0,
+                 stream>>>(
+                  thrust::raw_pointer_cast(device_sources.data()), query_count,
+                  activation_mask, thrust::raw_pointer_cast(values.data()),
+                  thrust::raw_pointer_cast(visited_mask.data()),
+                  thrust::raw_pointer_cast(frontier_mask.data()),
+                  thrust::raw_pointer_cast(frontier_vertices.data()),
+                  thrust::raw_pointer_cast(unique_count_dev.data()));
+          detail::throw_if_cuda_error(cudaGetLastError(),
+                                      "activate_shared_sources_kernel");
+          detail::throw_if_cuda_error(
+              cudaMemcpyAsync(
+                  &current_unique_raw,
+                  thrust::raw_pointer_cast(unique_count_dev.data()),
+                  sizeof(current_unique_raw), cudaMemcpyDeviceToHost, stream),
+              "cudaMemcpyAsync(current_unique_count_after_activation)");
+          context.synchronize();
+          current_unique_count =
+              static_cast<std::size_t>(current_unique_raw);
+          current_count += static_cast<std::size_t>(
+              __builtin_popcountll(
+                  static_cast<unsigned long long>(activation_mask)));
+          live_slots |= activation_mask;
+        }
+        if (current_unique_count == 0) {
+          ++level;
+          continue;
+        }
+      }
+
+      const query_mask_t iteration_active_slots =
+          scheduled ? live_slots : default_partition.active_slots;
+      const int active_slot_count = scheduled
+          ? __builtin_popcountll(
+                static_cast<unsigned long long>(iteration_active_slots))
+          : query_count;
+      const double iteration_pull_edge_threshold = scheduled
+          ? options.pull_edge_ratio * static_cast<double>(active_slot_count) *
+                static_cast<double>(graph.get_number_of_edges())
+          : default_pull_edge_threshold;
+
       iteration_profile_t profile;
       profile.iteration = static_cast<int>(level);
       profile.frontier_size = current_count;
       profile.unique_frontier_size = current_unique_count;
       profile.pull_frontier_threshold = pull_frontier_threshold;
-      profile.pull_edge_threshold = pull_edge_threshold;
+      profile.pull_edge_threshold = iteration_pull_edge_threshold;
       auto iteration_start = std::chrono::high_resolution_clock::now();
 
       detail::throw_if_cuda_error(
@@ -266,6 +396,12 @@ class frontier_engine {
           thrust::raw_pointer_cast(next_unique_count_dev.data()));
       detail::reset_counter_kernel<<<1, 1, 0, stream>>>(
           thrust::raw_pointer_cast(next_pair_count_dev.data()));
+      if (scheduled) {
+        detail::throw_if_cuda_error(
+            cudaMemsetAsync(thrust::raw_pointer_cast(active_union_dev.data()),
+                            0, sizeof(query_mask_t), stream),
+            "cudaMemsetAsync(active_union)");
+      }
       detail::throw_if_cuda_error(cudaGetLastError(),
                                   "reset_frontier_counters");
 
@@ -286,7 +422,7 @@ class frontier_engine {
                                                              vertex_type>(
                   graph, thrust::raw_pointer_cast(frontier_vertices.data()),
                   thrust::raw_pointer_cast(frontier_mask.data()),
-                  current_unique_count, partition.active_slots,
+                  current_unique_count, iteration_active_slots,
                   thrust::raw_pointer_cast(frontier_metric_counters.data()),
                   thrust::raw_pointer_cast(frontier_metric_counters.data()) + 1,
                   thrust::raw_pointer_cast(frontier_metric_counters.data()) + 2,
@@ -319,30 +455,53 @@ class frontier_engine {
       if (options.traversal_mode == traversal_mode_t::pull) {
         use_pull = true;
       } else if (options.traversal_mode == traversal_mode_t::hybrid) {
-        if (has_pull_adjacency) {
+        if constexpr (std::is_same<Policy,
+                                   algorithms::bfs_policy>::value) {
+          use_pull = bfs_pull_phase;
+        }
+        if (has_pull_adjacency && !use_pull) {
           compute_frontier_metrics();
           if (active_pairs != 0) {
             current_count = static_cast<std::size_t>(active_pairs);
             profile.frontier_size = current_count;
           }
-          use_pull = static_cast<double>(virtual_edges) >= pull_edge_threshold;
+          use_pull = static_cast<double>(virtual_edges) >=
+              iteration_pull_edge_threshold;
         }
+      }
+      if constexpr (std::is_same<Policy, algorithms::bfs_policy>::value) {
+        bfs_pull_phase |= use_pull;
       }
 
       unsigned long long next_count = 0;
       unsigned long long next_unique_count = 0;
+      query_mask_t next_live_slots = scheduled ? live_slots : query_mask_t{0};
 
       if (use_pull) {
         profile.mode = "pull";
         profile.pull_kernel_ms = detail::timed_gpu(
             stream, options.profile_iterations, [&]() {
-              detail::launch_fused_pull_compute<Policy, graph_t, vertex_type>(
-                  graph, query_count, thrust::raw_pointer_cast(values.data()),
-                  thrust::raw_pointer_cast(visited_mask.data()),
-                  thrust::raw_pointer_cast(next_frontier_mask.data()),
-                  thrust::raw_pointer_cast(unique_flags.data()),
-                  thrust::raw_pointer_cast(pair_counts.data()),
-                  partition.active_slots, stream);
+              if (scheduled) {
+                detail::launch_fused_pull_compute_scheduled<
+                    Policy, graph_t, vertex_type>(
+                    graph, query_count,
+                    thrust::raw_pointer_cast(values.data()),
+                    thrust::raw_pointer_cast(visited_mask.data()),
+                    thrust::raw_pointer_cast(next_frontier_mask.data()),
+                    thrust::raw_pointer_cast(unique_flags.data()),
+                    thrust::raw_pointer_cast(pair_counts.data()),
+                    iteration_active_slots,
+                    thrust::raw_pointer_cast(active_union_dev.data()), stream);
+              } else {
+                detail::launch_fused_pull_compute<Policy, graph_t, vertex_type>(
+                    graph, query_count,
+                    thrust::raw_pointer_cast(values.data()),
+                    thrust::raw_pointer_cast(visited_mask.data()),
+                    thrust::raw_pointer_cast(next_frontier_mask.data()),
+                    thrust::raw_pointer_cast(unique_flags.data()),
+                    thrust::raw_pointer_cast(pair_counts.data()),
+                    iteration_active_slots, stream);
+              }
             });
         detail::throw_if_cuda_error(cudaGetLastError(), "launch_fused_pull");
 
@@ -379,6 +538,14 @@ class frontier_engine {
                               cudaMemcpyDeviceToHost, stream),
               "cudaMemcpyAsync(pull_next_pair_count)");
         }
+        if (scheduled) {
+          detail::throw_if_cuda_error(
+              cudaMemcpyAsync(
+                  &next_live_slots,
+                  thrust::raw_pointer_cast(active_union_dev.data()),
+                  sizeof(query_mask_t), cudaMemcpyDeviceToHost, stream),
+              "cudaMemcpyAsync(pull_active_union)");
+        }
         context.synchronize();
         profile.count_sync_ms += detail::elapsed_ms(sync_start);
       } else {
@@ -387,42 +554,103 @@ class frontier_engine {
             stream, options.profile_iterations, [&]() {
               if (options.push_strategy ==
                   push_strategy_t::shared_node_query_parallel) {
-                detail::launch_shared_push_query_parallel<Policy, graph_t,
-                                                          vertex_type>(
-                    graph, thrust::raw_pointer_cast(frontier_vertices.data()),
-                    thrust::raw_pointer_cast(frontier_mask.data()),
-                    current_unique_count,
-                    thrust::raw_pointer_cast(visited_mask.data()),
-                    thrust::raw_pointer_cast(next_frontier_mask.data()),
-                    thrust::raw_pointer_cast(next_frontier_vertices.data()),
-                    thrust::raw_pointer_cast(next_unique_count_dev.data()),
-                    thrust::raw_pointer_cast(next_pair_count_dev.data()),
-                    thrust::raw_pointer_cast(values.data()), query_count,
-                    partition.active_slots, level, threads, stream);
+                if (scheduled) {
+                  detail::launch_shared_push_query_parallel_scheduled<
+                      Policy, graph_t, vertex_type>(
+                      graph,
+                      thrust::raw_pointer_cast(frontier_vertices.data()),
+                      thrust::raw_pointer_cast(frontier_mask.data()),
+                      current_unique_count,
+                      thrust::raw_pointer_cast(visited_mask.data()),
+                      thrust::raw_pointer_cast(next_frontier_mask.data()),
+                      thrust::raw_pointer_cast(next_frontier_vertices.data()),
+                      thrust::raw_pointer_cast(next_unique_count_dev.data()),
+                      thrust::raw_pointer_cast(next_pair_count_dev.data()),
+                      thrust::raw_pointer_cast(values.data()), query_count,
+                      iteration_active_slots, level,
+                      thrust::raw_pointer_cast(device_start_levels.data()),
+                      thrust::raw_pointer_cast(active_union_dev.data()),
+                      threads, stream);
+                } else {
+                  detail::launch_shared_push_query_parallel<
+                      Policy, graph_t, vertex_type>(
+                      graph,
+                      thrust::raw_pointer_cast(frontier_vertices.data()),
+                      thrust::raw_pointer_cast(frontier_mask.data()),
+                      current_unique_count,
+                      thrust::raw_pointer_cast(visited_mask.data()),
+                      thrust::raw_pointer_cast(next_frontier_mask.data()),
+                      thrust::raw_pointer_cast(next_frontier_vertices.data()),
+                      thrust::raw_pointer_cast(next_unique_count_dev.data()),
+                      thrust::raw_pointer_cast(next_pair_count_dev.data()),
+                      thrust::raw_pointer_cast(values.data()), query_count,
+                      iteration_active_slots, level, threads, stream);
+                }
               } else if (options.push_strategy == push_strategy_t::shared_node) {
-                detail::launch_shared_push_simple<Policy, graph_t, vertex_type>(
-                    graph, thrust::raw_pointer_cast(frontier_vertices.data()),
-                    thrust::raw_pointer_cast(frontier_mask.data()),
-                    current_unique_count,
-                    thrust::raw_pointer_cast(visited_mask.data()),
-                    thrust::raw_pointer_cast(next_frontier_mask.data()),
-                    thrust::raw_pointer_cast(next_frontier_vertices.data()),
-                    thrust::raw_pointer_cast(next_unique_count_dev.data()),
-                    thrust::raw_pointer_cast(next_pair_count_dev.data()),
-                    thrust::raw_pointer_cast(values.data()), query_count,
-                    partition.active_slots, level, threads, stream);
+                if (scheduled) {
+                  detail::launch_shared_push_simple_scheduled<
+                      Policy, graph_t, vertex_type>(
+                      graph,
+                      thrust::raw_pointer_cast(frontier_vertices.data()),
+                      thrust::raw_pointer_cast(frontier_mask.data()),
+                      current_unique_count,
+                      thrust::raw_pointer_cast(visited_mask.data()),
+                      thrust::raw_pointer_cast(next_frontier_mask.data()),
+                      thrust::raw_pointer_cast(next_frontier_vertices.data()),
+                      thrust::raw_pointer_cast(next_unique_count_dev.data()),
+                      thrust::raw_pointer_cast(next_pair_count_dev.data()),
+                      thrust::raw_pointer_cast(values.data()), query_count,
+                      iteration_active_slots, level,
+                      thrust::raw_pointer_cast(device_start_levels.data()),
+                      thrust::raw_pointer_cast(active_union_dev.data()),
+                      threads, stream);
+                } else {
+                  detail::launch_shared_push_simple<Policy, graph_t,
+                                                    vertex_type>(
+                      graph,
+                      thrust::raw_pointer_cast(frontier_vertices.data()),
+                      thrust::raw_pointer_cast(frontier_mask.data()),
+                      current_unique_count,
+                      thrust::raw_pointer_cast(visited_mask.data()),
+                      thrust::raw_pointer_cast(next_frontier_mask.data()),
+                      thrust::raw_pointer_cast(next_frontier_vertices.data()),
+                      thrust::raw_pointer_cast(next_unique_count_dev.data()),
+                      thrust::raw_pointer_cast(next_pair_count_dev.data()),
+                      thrust::raw_pointer_cast(values.data()), query_count,
+                      iteration_active_slots, level, threads, stream);
+                }
               } else {
-                detail::launch_shared_push_warp<Policy, graph_t, vertex_type>(
-                    graph, thrust::raw_pointer_cast(frontier_vertices.data()),
-                    thrust::raw_pointer_cast(frontier_mask.data()),
-                    current_unique_count,
-                    thrust::raw_pointer_cast(visited_mask.data()),
-                    thrust::raw_pointer_cast(next_frontier_mask.data()),
-                    thrust::raw_pointer_cast(next_frontier_vertices.data()),
-                    thrust::raw_pointer_cast(next_unique_count_dev.data()),
-                    thrust::raw_pointer_cast(next_pair_count_dev.data()),
-                    thrust::raw_pointer_cast(values.data()), query_count,
-                    partition.active_slots, level, threads, stream);
+                if (scheduled) {
+                  detail::launch_shared_push_warp_scheduled<
+                      Policy, graph_t, vertex_type>(
+                      graph,
+                      thrust::raw_pointer_cast(frontier_vertices.data()),
+                      thrust::raw_pointer_cast(frontier_mask.data()),
+                      current_unique_count,
+                      thrust::raw_pointer_cast(visited_mask.data()),
+                      thrust::raw_pointer_cast(next_frontier_mask.data()),
+                      thrust::raw_pointer_cast(next_frontier_vertices.data()),
+                      thrust::raw_pointer_cast(next_unique_count_dev.data()),
+                      thrust::raw_pointer_cast(next_pair_count_dev.data()),
+                      thrust::raw_pointer_cast(values.data()), query_count,
+                      iteration_active_slots, level,
+                      thrust::raw_pointer_cast(device_start_levels.data()),
+                      thrust::raw_pointer_cast(active_union_dev.data()),
+                      threads, stream);
+                } else {
+                  detail::launch_shared_push_warp<Policy, graph_t, vertex_type>(
+                      graph,
+                      thrust::raw_pointer_cast(frontier_vertices.data()),
+                      thrust::raw_pointer_cast(frontier_mask.data()),
+                      current_unique_count,
+                      thrust::raw_pointer_cast(visited_mask.data()),
+                      thrust::raw_pointer_cast(next_frontier_mask.data()),
+                      thrust::raw_pointer_cast(next_frontier_vertices.data()),
+                      thrust::raw_pointer_cast(next_unique_count_dev.data()),
+                      thrust::raw_pointer_cast(next_pair_count_dev.data()),
+                      thrust::raw_pointer_cast(values.data()), query_count,
+                      iteration_active_slots, level, threads, stream);
+                }
               }
             });
         detail::throw_if_cuda_error(cudaGetLastError(),
@@ -448,6 +676,10 @@ class frontier_engine {
         profile.count_sync_ms += detail::elapsed_ms(sync_start);
       }
 
+      if (scheduled) {
+        profile.query_convergence_mask = next_live_slots;
+        live_slots = next_live_slots;
+      }
       profile.iteration_wall_ms = detail::elapsed_ms(iteration_start);
       result.iteration_edge_counts.push_back(profile.edge_count);
       result.actual_iteration_edge_counts.push_back(profile.actual_edge_count);

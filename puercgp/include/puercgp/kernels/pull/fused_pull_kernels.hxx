@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <stdexcept>
 
@@ -14,7 +15,8 @@
 namespace puercgp {
 namespace detail {
 
-template <typename Policy, typename graph_t, typename vertex_t>
+template <typename Policy, typename graph_t, typename vertex_t,
+          bool track_active = false>
 __global__ void fused_pull_simple_kernel(
     graph_t graph,
     int query_count,
@@ -23,7 +25,8 @@ __global__ void fused_pull_simple_kernel(
     query_mask_t* next_frontier_mask,
     unsigned long long* unique_flags,
     unsigned long long* pair_counts,
-    query_mask_t active_slots) {
+    query_mask_t active_slots,
+    query_mask_t* active_union) {
   using value_t = typename Policy::value_type;
   __shared__ query_mask_t thread_masks[128];
 
@@ -50,7 +53,7 @@ __global__ void fused_pull_simple_kernel(
       if (nb_val != Policy::infinity()) {
         value_t candidate =
             Policy::relax(nb_val, get_pull_edge_weight(graph, edge));
-        if (candidate < acc) {
+        if (Policy::should_update(candidate, acc)) {
           acc = candidate;
         }
       }
@@ -77,10 +80,16 @@ __global__ void fused_pull_simple_kernel(
     unique_flags[vertex] = improved_mask != 0 ? 1ULL : 0ULL;
     pair_counts[vertex] =
         static_cast<unsigned long long>(mask_popcount(improved_mask));
+    if constexpr (track_active) {
+      if (improved_mask != 0) {
+        atomic_or_query_mask(active_union, improved_mask);
+      }
+    }
   }
 }
 
-template <int TILE_ROW, typename Policy, typename graph_t, typename vertex_t>
+template <int TILE_ROW, typename Policy, typename graph_t, typename vertex_t,
+          bool track_active = false>
 __global__ void fused_pull_smem_kernel(
     graph_t graph,
     int query_count,
@@ -89,7 +98,8 @@ __global__ void fused_pull_smem_kernel(
     query_mask_t* next_frontier_mask,
     unsigned long long* unique_flags,
     unsigned long long* pair_counts,
-    query_mask_t active_slots) {
+    query_mask_t active_slots,
+    query_mask_t* active_union) {
   using value_t = typename Policy::value_type;
   constexpr int warp_size = 32;
   __shared__ vertex_t neighbor_tile[TILE_ROW][warp_size];
@@ -136,7 +146,7 @@ __global__ void fused_pull_smem_kernel(
                                query_stride)];
         if (nb_val != Policy::infinity()) {
           value_t candidate = Policy::relax(nb_val, weight);
-          if (candidate < acc0) {
+          if (Policy::should_update(candidate, acc0)) {
             acc0 = candidate;
           }
         }
@@ -148,7 +158,7 @@ __global__ void fused_pull_smem_kernel(
                                query_stride)];
         if (nb_val != Policy::infinity()) {
           value_t candidate = Policy::relax(nb_val, weight);
-          if (candidate < acc1) {
+          if (Policy::should_update(candidate, acc1)) {
             acc1 = candidate;
           }
         }
@@ -187,6 +197,11 @@ __global__ void fused_pull_smem_kernel(
     unique_flags[vertex] = improved_mask != 0 ? 1ULL : 0ULL;
     pair_counts[vertex] =
         static_cast<unsigned long long>(mask_popcount(improved_mask));
+    if constexpr (track_active) {
+      if (improved_mask != 0) {
+        atomic_or_query_mask(active_union, improved_mask);
+      }
+    }
   }
 }
 
@@ -210,10 +225,133 @@ void launch_fused_pull(graph_t graph,
     fused_pull_simple_kernel<Policy, graph_t, vertex_t>
         <<<grid_x, dim3(query_count, tile_row), 0, stream>>>(
             graph, query_count, values, visited_mask, next_frontier_mask,
-            unique_flags, pair_counts, active_slots);
+            unique_flags, pair_counts, active_slots, nullptr);
   } else {
     throw std::invalid_argument("fused pull supports at most 64 queries");
   }
+}
+
+template <typename Policy, typename graph_t, typename vertex_t>
+void launch_fused_pull_scheduled(
+    graph_t graph, int query_count, typename Policy::value_type* values,
+    query_mask_t* visited_mask, query_mask_t* next_frontier_mask,
+    unsigned long long* unique_flags, unsigned long long* pair_counts,
+    query_mask_t active_slots, query_mask_t* active_union,
+    cudaStream_t stream) {
+  if (query_count <= 0 || query_count > 64) {
+    throw std::invalid_argument(
+        "scheduled fused pull supports between 1 and 64 queries");
+  }
+  const int vertex_count = static_cast<int>(graph.get_number_of_vertices());
+  const int tile_row = std::max(1, 128 / query_count);
+  const int grid_x = (vertex_count + tile_row - 1) / tile_row;
+  fused_pull_simple_kernel<Policy, graph_t, vertex_t, true>
+      <<<grid_x, dim3(query_count, tile_row), 0, stream>>>(
+          graph, query_count, values, visited_mask, next_frontier_mask,
+          unique_flags, pair_counts, active_slots, active_union);
+}
+
+template <typename Policy, typename graph_t, typename vertex_t>
+__global__ void fused_pull_sum_kernel(
+    graph_t graph, int query_count, const float* old_values,
+    float* next_values, const float* damping_factors, const float* epsilons,
+    const vertex_t* personalization_sources, const float* dangling_mass,
+    query_mask_t* next_frontier_mask, unsigned long long* unique_flags,
+    unsigned long long* pair_counts, query_mask_t* changed_queries,
+    query_mask_t active_slots) {
+  static_assert(Policy::reduction == reduction_kind_t::sum,
+                "sum pull requires a sum-reduction policy");
+  __shared__ query_mask_t thread_masks[128];
+
+  const std::size_t vertex_count = graph.get_number_of_vertices();
+  const std::size_t vertex = blockIdx.x * blockDim.y + threadIdx.y;
+  const int query_id = threadIdx.x;
+  const int shared_index = threadIdx.y * blockDim.x + threadIdx.x;
+  query_mask_t local_mask = 0;
+
+  if (vertex < vertex_count && query_id < query_count) {
+    const std::size_t value_pos =
+        value_index(vertex, static_cast<std::size_t>(query_id),
+                    static_cast<std::size_t>(query_count));
+    const float old_value = old_values[value_pos];
+    const query_mask_t query_mask = query_bit(query_id);
+
+    if ((active_slots & query_mask) == 0) {
+      next_values[value_pos] = old_value;
+    } else {
+      float incoming_sum = 0.0f;
+      auto begin = get_pull_starting_edge(graph, static_cast<vertex_t>(vertex));
+      auto end =
+          get_pull_starting_edge(graph, static_cast<vertex_t>(vertex + 1));
+      for (auto edge = begin; edge < end; ++edge) {
+        const vertex_t source = get_pull_neighbor_vertex(graph, edge);
+        const auto source_begin = graph.get_starting_edge(source);
+        const auto source_end = graph.get_starting_edge(source + 1);
+        const auto source_degree = source_end - source_begin;
+        if (source_degree == 0) {
+          continue;
+        }
+        incoming_sum +=
+            old_values[value_index(static_cast<std::size_t>(source),
+                                   static_cast<std::size_t>(query_id),
+                                   static_cast<std::size_t>(query_count))] /
+            static_cast<float>(source_degree);
+      }
+
+      const float personalization = Policy::personalization_value(
+          static_cast<vertex_t>(vertex), query_id, vertex_count,
+          personalization_sources);
+      const float damping = damping_factors[query_id];
+      const float next_value =
+          (1.0f - damping) * personalization +
+          damping *
+              (incoming_sum + dangling_mass[query_id] * personalization);
+      next_values[value_pos] = next_value;
+      if (fabsf(next_value - old_value) > epsilons[query_id]) {
+        local_mask = query_mask;
+      }
+    }
+  }
+
+  thread_masks[shared_index] = local_mask;
+  __syncthreads();
+
+  if (vertex < vertex_count && threadIdx.x == 0) {
+    query_mask_t improved_mask = 0;
+    const int row_base = threadIdx.y * blockDim.x;
+    for (int q = 0; q < query_count; ++q) {
+      improved_mask |= thread_masks[row_base + q];
+    }
+    next_frontier_mask[vertex] = improved_mask;
+    unique_flags[vertex] = improved_mask != 0 ? 1ULL : 0ULL;
+    pair_counts[vertex] =
+        static_cast<unsigned long long>(mask_popcount(improved_mask));
+    if (improved_mask != 0) {
+      atomic_or_query_mask(changed_queries, improved_mask);
+    }
+  }
+}
+
+template <typename Policy, typename graph_t, typename vertex_t>
+void launch_fused_pull_sum(
+    graph_t graph, int query_count, const float* old_values,
+    float* next_values, const float* damping_factors, const float* epsilons,
+    const vertex_t* personalization_sources, const float* dangling_mass,
+    query_mask_t* next_frontier_mask, unsigned long long* unique_flags,
+    unsigned long long* pair_counts, query_mask_t* changed_queries,
+    query_mask_t active_slots, cudaStream_t stream) {
+  if (query_count <= 0 || query_count > 64) {
+    throw std::invalid_argument("sum pull supports between 1 and 64 queries");
+  }
+  const int vertex_count = static_cast<int>(graph.get_number_of_vertices());
+  const int tile_rows = std::max(1, 128 / query_count);
+  const int grid_x = (vertex_count + tile_rows - 1) / tile_rows;
+  fused_pull_sum_kernel<Policy, graph_t, vertex_t>
+      <<<grid_x, dim3(query_count, tile_rows), 0, stream>>>(
+          graph, query_count, old_values, next_values, damping_factors,
+          epsilons, personalization_sources, dangling_mass,
+          next_frontier_mask, unique_flags, pair_counts, changed_queries,
+          active_slots);
 }
 
 }  // namespace detail

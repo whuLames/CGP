@@ -25,6 +25,9 @@ int main(int argc, char** argv) {
 
   smoke_graph graph;
   puercgp::query_batch<int> queries({0, 1, 2, 3});
+  puercgp::algorithms::pagerank_query_batch rank_queries({
+      {0.85f, 1.0e-8f},
+  });
 
   puercgp::run_options options;
   options.traversal_mode = puercgp::traversal_mode_t::hybrid;
@@ -40,7 +43,7 @@ int main(int argc, char** argv) {
       graph, queries, context, options));
   using pagerank_result_t =
       decltype(puercgp::run<puercgp::algorithms::pagerank_policy>(
-          graph, queries, context, options));
+          graph, rank_queries, context, options));
   static_assert(std::is_same<typename puercgp::algorithms::bfs_policy::value_type,
                              int>::value,
                 "BFS smoke policy should use int distances");
@@ -53,7 +56,7 @@ int main(int argc, char** argv) {
   if (argc < -1) {
     pagerank_result_t result =
         puercgp::run<puercgp::algorithms::pagerank_policy>(
-            graph, queries, context, options);
+            graph, rank_queries, context, options);
     (void)result;
   }
 

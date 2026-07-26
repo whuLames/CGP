@@ -18,6 +18,8 @@ struct bfs_policy {
   static constexpr algo_kind_t algorithm_kind = algo_kind_t::bfs;
   static constexpr init_mode_t init_mode =
       algorithm_traits<algorithm_kind>::init_mode;
+  static constexpr reduction_kind_t reduction =
+      algorithm_traits<algorithm_kind>::reduction;
 
   static constexpr value_type infinity() {
     return std::numeric_limits<value_type>::max();

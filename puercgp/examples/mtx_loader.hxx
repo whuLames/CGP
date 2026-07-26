@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <fstream>
+#include <limits>
 #include <queue>
 #include <sstream>
 #include <stdexcept>
@@ -325,6 +327,109 @@ inline std::vector<float> cpu_sssp(const host_csr_graph& graph, int source) {
     }
   }
   return distances;
+}
+
+inline std::vector<float> cpu_sswp(const host_csr_graph& graph, int source) {
+  const float unreachable = -std::numeric_limits<float>::infinity();
+  using item_t = std::pair<float, int>;
+  std::priority_queue<item_t> queue;
+  std::vector<float> widths(static_cast<std::size_t>(graph.vertices),
+                            unreachable);
+  widths[static_cast<std::size_t>(source)] =
+      std::numeric_limits<float>::infinity();
+  queue.emplace(widths[static_cast<std::size_t>(source)], source);
+  while (!queue.empty()) {
+    auto [width, vertex] = queue.top();
+    queue.pop();
+    if (width != widths[static_cast<std::size_t>(vertex)]) {
+      continue;
+    }
+    for (int edge = graph.row_offsets[static_cast<std::size_t>(vertex)];
+         edge < graph.row_offsets[static_cast<std::size_t>(vertex) + 1];
+         ++edge) {
+      int neighbor = graph.column_indices[static_cast<std::size_t>(edge)];
+      float candidate =
+          std::min(width, graph.edge_weights[static_cast<std::size_t>(edge)]);
+      if (candidate > widths[static_cast<std::size_t>(neighbor)]) {
+        widths[static_cast<std::size_t>(neighbor)] = candidate;
+        queue.emplace(candidate, neighbor);
+      }
+    }
+  }
+  return widths;
+}
+
+inline std::vector<float> cpu_personalized_pagerank(
+    const host_csr_graph& graph,
+    const std::vector<double>& personalization,
+    double damping_factor,
+    double tolerance = 1.0e-12,
+    int max_iterations = 100000) {
+  const std::size_t vertex_count =
+      static_cast<std::size_t>(graph.vertices);
+  if (personalization.size() != vertex_count) {
+    throw std::invalid_argument("personalization size must match graph");
+  }
+  std::vector<double> rank = personalization;
+  std::vector<double> next(vertex_count, 0.0);
+  for (int iteration = 0; iteration < max_iterations; ++iteration) {
+    double dangling_mass = 0.0;
+    for (int vertex = 0; vertex < graph.vertices; ++vertex) {
+      int begin = graph.row_offsets[static_cast<std::size_t>(vertex)];
+      int end = graph.row_offsets[static_cast<std::size_t>(vertex) + 1];
+      if (begin == end) {
+        dangling_mass += rank[static_cast<std::size_t>(vertex)];
+      }
+    }
+    for (std::size_t vertex = 0; vertex < vertex_count; ++vertex) {
+      next[vertex] =
+          ((1.0 - damping_factor) + damping_factor * dangling_mass) *
+          personalization[vertex];
+    }
+    for (int source = 0; source < graph.vertices; ++source) {
+      int begin = graph.row_offsets[static_cast<std::size_t>(source)];
+      int end = graph.row_offsets[static_cast<std::size_t>(source) + 1];
+      int degree = end - begin;
+      if (degree == 0) {
+        continue;
+      }
+      double contribution = damping_factor *
+          rank[static_cast<std::size_t>(source)] /
+          static_cast<double>(degree);
+      for (int edge = begin; edge < end; ++edge) {
+        int destination =
+            graph.column_indices[static_cast<std::size_t>(edge)];
+        next[static_cast<std::size_t>(destination)] += contribution;
+      }
+    }
+    double delta = 0.0;
+    for (std::size_t vertex = 0; vertex < vertex_count; ++vertex) {
+      delta += std::fabs(next[vertex] - rank[vertex]);
+    }
+    rank.swap(next);
+    if (delta <= tolerance) {
+      break;
+    }
+  }
+  return std::vector<float>(rank.begin(), rank.end());
+}
+
+inline std::vector<float> cpu_pagerank(const host_csr_graph& graph,
+                                       double damping_factor) {
+  const std::size_t vertex_count =
+      static_cast<std::size_t>(graph.vertices);
+  std::vector<double> personalization(
+      vertex_count, 1.0 / static_cast<double>(vertex_count));
+  return cpu_personalized_pagerank(graph, personalization, damping_factor);
+}
+
+inline std::vector<float> cpu_ppr(const host_csr_graph& graph,
+                                 int source,
+                                 double damping_factor) {
+  std::vector<double> personalization(
+      static_cast<std::size_t>(graph.vertices), 0.0);
+  personalization[static_cast<std::size_t>(source)] = 1.0;
+  return cpu_personalized_pagerank(graph, personalization, damping_factor);
 }
 
 // WCC via Label Propagation（异步 LP，与 GPU hybrid push 语义一致）

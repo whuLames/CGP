@@ -455,7 +455,7 @@ replay_result run_schedule(
               thrust::raw_pointer_cast(next_unique_count_dev.data()),
               thrust::raw_pointer_cast(next_pair_count_dev.data()),
               thrust::raw_pointer_cast(values.data()), kQueryCount,
-              scheduled_mask, step);
+              scheduled_mask, step, nullptr, nullptr);
     } else if (scheduled_mask != 0) {
       phase_expand_shared_node_warp_kernel
           <<<puercgp::detail::grid_for(current_unique * 32, kThreads),

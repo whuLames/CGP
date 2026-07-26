@@ -100,7 +100,7 @@ class hybrid_query_batch {
     return m;
   }
 
-  // 预算非 BFS slot 的 mask（SSSP + WCC）
+  // 预算非 BFS slot 的 mask（SSSP + WCC + SSWP）
   // 注意：显式遍历构造，不能用 ~bfs_slot_mask()（会反转高位引入虚假 slot）
   query_mask_t nonbfs_slot_mask() const {
     query_mask_t m = 0;
@@ -147,6 +147,13 @@ class hybrid_query_batch {
   bool has_wcc() const {
     for (const auto& d : descs_) {
       if (d.kind == algorithms::algo_kind_t::wcc) return true;
+    }
+    return false;
+  }
+
+  bool has_sswp() const {
+    for (const auto& d : descs_) {
+      if (d.kind == algorithms::algo_kind_t::sswp) return true;
     }
     return false;
   }

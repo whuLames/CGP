@@ -130,6 +130,7 @@ int main() {
           thrust::raw_pointer_cast(next_pair_count.data()),
           thrust::raw_pointer_cast(values.data()),
           views.kinds, Q, /*level=*/0, bfs_mask, nonbfs_mask,
+          /*bfs_start_levels=*/nullptr,
           thrust::raw_pointer_cast(active_union_dev.data()));
   CUDA_CHECK(cudaGetLastError());
   CUDA_CHECK(cudaDeviceSynchronize());

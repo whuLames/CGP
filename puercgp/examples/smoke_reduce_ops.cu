@@ -3,7 +3,8 @@
  * 验证 hybrid_detail 的 device 原语行为：
  *   - apply_first_write（BFS 路径 CAS）
  *   - apply_min_reduce（SSSP/WCC 路径 CAS 循环）
- *   - algorithm dispatcher（三种 algo_kind 分支）
+ *   - apply_max_reduce（SSWP 路径 CAS 循环）
+ *   - algorithm dispatcher（四种 algo_kind 分支）
  *
  * 不依赖真实图，仅用 device 标量数组做单元级验证。
  */
@@ -17,6 +18,7 @@ using puercgp::algorithms::algo_kind_t;
 using puercgp::algorithms::unified_infinity;
 using puercgp::algorithms::unified_value_t;
 using puercgp::hybrid_detail::apply_min_reduce;
+using puercgp::hybrid_detail::apply_max_reduce;
 using puercgp::hybrid_detail::apply_first_write;
 using puercgp::hybrid_detail::apply_result_t;
 using puercgp::algorithms::dispatch_candidate_push;
@@ -31,6 +33,14 @@ __global__ void test_first_write(unified_value_t* slot, apply_result_t* out) {
   if (threadIdx.x == 0) {
     out[0] = apply_first_write(slot, unified_value_t{5});  // INF→5, 期望 improved=true
     out[1] = apply_first_write(slot, unified_value_t{3});  // 5≠INF, 期望 improved=false
+  }
+}
+
+__global__ void test_max_reduce(unified_value_t* slot, apply_result_t* out) {
+  if (threadIdx.x == 0) {
+    out[0] = apply_max_reduce(slot, unified_value_t{5});
+    out[1] = apply_max_reduce(slot, unified_value_t{3});
+    out[2] = apply_max_reduce(slot, unified_value_t{8});
   }
 }
 
@@ -54,6 +64,8 @@ __global__ void test_candidate(unified_value_t* out_push,
         algo_kind_t::sssp, 2.0f, 3.5f, 0);  // 2+3.5=5.5
     out_push[2] = dispatch_candidate_push(
         algo_kind_t::wcc, 7.0f, 1.0f, 0);  // identity=7
+    out_push[3] = dispatch_candidate_push(
+        algo_kind_t::sswp, 7.0f, 3.5f, 0);  // min(7,3.5)=3.5
     // pull 模式
     out_pull[0] =
         dispatch_candidate_pull(algo_kind_t::bfs, 2.0f, 1.0f);  // 2+1=3
@@ -61,7 +73,10 @@ __global__ void test_candidate(unified_value_t* out_push,
         dispatch_candidate_pull(algo_kind_t::sssp, 2.0f, 3.5f);  // 5.5
     out_pull[2] =
         dispatch_candidate_pull(algo_kind_t::wcc, 7.0f, 1.0f);  // 7
+    out_pull[3] =
+        dispatch_candidate_pull(algo_kind_t::sswp, 2.0f, 5.0f);  // 2
   }
+
 }
 
 static int failures = 0;
@@ -128,26 +143,50 @@ int main() {
     cudaFree(d_res);
   }
 
+  printf("apply_max_reduce:\n");
+  {
+    unified_value_t* d_slot;
+    apply_result_t* d_res;
+    CUDA_CHECK(cudaMalloc(&d_slot, sizeof(unified_value_t)));
+    CUDA_CHECK(cudaMalloc(&d_res, sizeof(apply_result_t) * 3));
+    unified_value_t init = unified_value_t{1};
+    CUDA_CHECK(cudaMemcpy(d_slot, &init, sizeof(unified_value_t),
+                          cudaMemcpyHostToDevice));
+    test_max_reduce<<<1, 32>>>(d_slot, d_res);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    apply_result_t h_res[3];
+    CUDA_CHECK(cudaMemcpy(h_res, d_res, sizeof(apply_result_t) * 3,
+                          cudaMemcpyDeviceToHost));
+    check("max_reduce #1 1->5 improved", h_res[0].improved == true, "");
+    check("max_reduce #2 5->3 not improved", h_res[1].improved == false, "");
+    check("max_reduce #3 5->8 improved", h_res[2].improved == true, "");
+    cudaFree(d_slot);
+    cudaFree(d_res);
+  }
+
   // ============ dispatcher candidate ============
   printf("dispatcher candidate:\n");
   {
     unified_value_t* d_push;
     unified_value_t* d_pull;
-    CUDA_CHECK(cudaMalloc(&d_push, sizeof(unified_value_t) * 3));
-    CUDA_CHECK(cudaMalloc(&d_pull, sizeof(unified_value_t) * 3));
+    CUDA_CHECK(cudaMalloc(&d_push, sizeof(unified_value_t) * 4));
+    CUDA_CHECK(cudaMalloc(&d_pull, sizeof(unified_value_t) * 4));
     test_candidate<<<1, 32>>>(d_push, d_pull);
     CUDA_CHECK(cudaDeviceSynchronize());
-    unified_value_t h_push[3], h_pull[3];
-    CUDA_CHECK(cudaMemcpy(h_push, d_push, sizeof(unified_value_t) * 3,
+    unified_value_t h_push[4], h_pull[4];
+    CUDA_CHECK(cudaMemcpy(h_push, d_push, sizeof(unified_value_t) * 4,
                           cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(h_pull, d_pull, sizeof(unified_value_t) * 3,
+    CUDA_CHECK(cudaMemcpy(h_pull, d_pull, sizeof(unified_value_t) * 4,
                           cudaMemcpyDeviceToHost));
     check("push bfs source+1=1", h_push[0] == unified_value_t{1}, "");
     check("push sssp 2+3.5=5.5", h_push[1] == unified_value_t{5.5f}, "");
     check("push wcc identity=7", h_push[2] == unified_value_t{7}, "");
+    check("push sswp min(7,3.5)=3.5",
+          h_push[3] == unified_value_t{3.5f}, "");
     check("pull bfs nb+1=3", h_pull[0] == unified_value_t{3}, "");
     check("pull sssp 2+3.5=5.5", h_pull[1] == unified_value_t{5.5f}, "");
     check("pull wcc identity=7", h_pull[2] == unified_value_t{7}, "");
+    check("pull sswp min(2,5)=2", h_pull[3] == unified_value_t{2}, "");
     cudaFree(d_push);
     cudaFree(d_pull);
   }

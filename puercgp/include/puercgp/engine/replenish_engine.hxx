@@ -53,6 +53,12 @@ class replenish_frontier_engine {
     if (N == 0) {
       throw std::invalid_argument("replenish: query list must be non-empty");
     }
+    for (const auto& query : all_queries) {
+      if (query.kind == algorithms::algo_kind_t::sswp) {
+        throw std::invalid_argument(
+            "replenish: SSWP slot reset is not implemented");
+      }
+    }
     const std::size_t slot_capacity =
         options.max_queries == 0
             ? std::size_t{64}

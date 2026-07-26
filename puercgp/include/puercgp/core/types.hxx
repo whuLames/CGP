@@ -7,6 +7,8 @@ namespace puercgp {
 
 enum class execution_model_t { frontier, dense };
 
+enum class reduction_kind_t { minimum, maximum, sum };
+
 enum class traversal_mode_t { push, pull, hybrid };
 
 enum class push_strategy_t {
@@ -30,6 +32,9 @@ struct run_options {
   bool profile_iterations = false;
   bool emit_nvtx = false;
   int max_iterations = 0;
+  // Keep dense algorithms active until max_iterations even if the convergence
+  // test succeeds early. Frontier algorithms continue to use convergence.
+  bool fixed_iterations = false;
   std::size_t max_queries = 0;
   // replenishment（运行期 slot 动态补给）开关：
   //   false（默认）→ 走现有 hybrid_frontier_engine::run，所有 replenish kernel 不调用

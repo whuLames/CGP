@@ -1,0 +1,9 @@
+%%MatrixMarket matrix coordinate pattern general
+6 6 7
+1 2
+1 3
+2 3
+3 1
+3 4
+4 4
+5 3

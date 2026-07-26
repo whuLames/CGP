@@ -1,12 +1,12 @@
 #pragma once
 
-// 异构 batch 执行引擎：支持 BFS + SSSP + WCC 在同一 batch 内混合执行
+// 异构 batch 执行引擎：支持 BFS + SSSP + WCC + SSWP 混合执行
 // 与同质 frontier_engine 并存，复用 detail 命名空间下算法无关的 device helper
 //
 // 设计要点（见 /home/zyl/.claude/plans/sunny-dancing-fog.md）：
-//   - unified_value_t = float，统一表示 BFS 层级 / SSSP 距离 / WCC label
+//   - unified_value_t = float，统一表示层级、距离、label 和 path width
 //   - BFS slot 保留 visited_mask 批量 atomicOr 优化
-//   - SSSP/WCC slot 走 apply_min_reduce（与 SSSP 同构）
+//   - SSSP/WCC 走 min-reduce，SSWP 走 max-reduce
 //   - WCC per-vertex init（label=vertex_id），区别于 BFS/SSSP 单源 init
 
 #include <chrono>
@@ -59,7 +59,20 @@ __global__ void fill_unified_kernel(
   }
 }
 
-// BFS / SSSP 源点 init（WCC slot 跳过，由 init_wcc_all_vertices_kernel 处理）
+__global__ void fill_hybrid_values_kernel(
+    algorithms::unified_value_t* values,
+    std::size_t total,
+    const algorithms::algo_kind_t* slot_kinds,
+    int query_count) {
+  std::size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+  std::size_t stride = blockDim.x * gridDim.x;
+  for (std::size_t i = tid; i < total; i += stride) {
+    int query_id = static_cast<int>(i % static_cast<std::size_t>(query_count));
+    values[i] = algorithms::dispatch_infinity(slot_kinds[query_id]);
+  }
+}
+
+// 单源算法 init（WCC slot 跳过，由 init_wcc_all_vertices_kernel 处理）
 //   BFS slot : values[src,q]=source_value, visited_mask 设 bit, frontier_mask 设 bit
 //   SSSP slot: values[src,q]=source_value, frontier_mask 设 bit（无 visited）
 //   WCC slot : 跳过
@@ -85,7 +98,9 @@ __global__ void init_hybrid_sources_kernel(
     query_mask_t bit = query_bit(static_cast<int>(q));
     values[value_index(static_cast<std::size_t>(src), q,
                        static_cast<std::size_t>(query_count))] =
-        slot_source_values[q];
+        kind == algorithms::algo_kind_t::sswp
+            ? algorithms::dispatch_source_value(kind)
+            : slot_source_values[q];
     if (kind == algorithms::algo_kind_t::bfs) {
       atomic_or_query_mask(visited_mask + src, bit);
     }
@@ -132,7 +147,7 @@ __global__ void init_wcc_all_vertices_kernel(
 // ============================================================
 // Step 5: heterogeneous shared_node push kernel
 // 双路设计：BFS slot 走 visited_mask 批量 atomicOr；
-//           SSSP/WCC slot 走 apply_min_reduce
+//           SSSP/WCC/SSWP slot 走对应的 runtime reduce
 // bfs_slot_mask / nonbfs_slot_mask 由 host 端预算（hybrid_query_batch），
 // 作为 kernel 参数传入，O(1) 寄存器常量，避免 inner loop 查表
 // ============================================================
@@ -192,7 +207,7 @@ __global__ void expand_shared_node_hybrid_kernel(
         }
       }
 
-      // ===== 路径 B：SSSP/WCC slot 逐 query min-reduce =====
+      // ===== 路径 B：非 BFS slot 逐 query runtime reduce =====
       query_mask_t active_nonbfs = active_mask & nonbfs_slot_mask;
       if (active_nonbfs != 0) {
         query_mask_t bits = active_nonbfs;
@@ -205,7 +220,7 @@ __global__ void expand_shared_node_hybrid_kernel(
                 static_cast<std::size_t>(q),
                 static_cast<std::size_t>(query_count));
             algorithms::unified_value_t src_val = values[src_pos];
-            if (src_val != algorithms::unified_infinity()) {
+            if (algorithms::dispatch_is_reachable(kind, src_val)) {
               algorithms::unified_value_t cand =
                   algorithms::dispatch_candidate_push(kind, src_val, weight,
                                                       level);
@@ -213,7 +228,7 @@ __global__ void expand_shared_node_hybrid_kernel(
                   static_cast<std::size_t>(neighbor),
                   static_cast<std::size_t>(q),
                   static_cast<std::size_t>(query_count));
-              apply_result_t res = apply_min_reduce(&values[nb_pos], cand);
+              apply_result_t res = apply_reduce(kind, &values[nb_pos], cand);
               if (res.improved) {
                 improved |= query_bit(q);
               }
@@ -237,7 +252,7 @@ __global__ void expand_shared_node_hybrid_kernel(
 // expand_shared_node_warp_hybrid_kernel（P3：warp 级异构 push）
 // 参照同质 expand_shared_node_warp_kernel:819-905，
 // 每 warp 处理 1 个 frontier 顶点（32 lane 协作遍历出边）。
-// update 段套用 hybrid 双路：路径 A BFS 批量 atomicOr + 路径 B 非 BFS 逐 query min-reduce
+// update 段套用 hybrid 双路：BFS 批量 atomicOr，其他算法逐 query reduce
 // 相比 block 版（1 block/vertex）：高出度顶点的并行度从 1 block → 32 lane/warp
 // ============================================================
 template <typename graph_t, bool use_start_levels = false>
@@ -307,7 +322,7 @@ __global__ void expand_shared_node_warp_hybrid_kernel(
         }
       }
 
-      // ===== 路径 B：SSSP/WCC slot 逐 query min-reduce =====
+      // ===== 路径 B：非 BFS slot 逐 query runtime reduce =====
       query_mask_t active_nonbfs = active_mask & nonbfs_slot_mask;
       if (active_nonbfs != 0) {
         query_mask_t bits = active_nonbfs;
@@ -320,7 +335,7 @@ __global__ void expand_shared_node_warp_hybrid_kernel(
                 static_cast<std::size_t>(q),
                 static_cast<std::size_t>(query_count));
             algorithms::unified_value_t src_val = values[src_pos];
-            if (src_val != algorithms::unified_infinity()) {
+            if (algorithms::dispatch_is_reachable(kind, src_val)) {
               algorithms::unified_value_t cand =
                   algorithms::dispatch_candidate_push(kind, src_val, weight,
                                                       level);
@@ -328,7 +343,7 @@ __global__ void expand_shared_node_warp_hybrid_kernel(
                   static_cast<std::size_t>(neighbor),
                   static_cast<std::size_t>(q),
                   static_cast<std::size_t>(query_count));
-              apply_result_t res = apply_min_reduce(&values[nb_pos], cand);
+              apply_result_t res = apply_reduce(kind, &values[nb_pos], cand);
               if (res.improved) {
                 improved |= query_bit(q);
               }
@@ -375,7 +390,7 @@ __global__ void fused_pull_hybrid_simple_kernel(
 
   if (vertex < vertex_count && query_id < query_count) {
     algorithms::algo_kind_t kind = slot_kinds[query_id];
-    algorithms::unified_value_t acc = algorithms::unified_infinity();
+    algorithms::unified_value_t acc = algorithms::dispatch_infinity(kind);
     auto begin = get_pull_starting_edge(graph, static_cast<int>(vertex));
     auto end = get_pull_starting_edge(graph, static_cast<int>(vertex + 1));
     for (auto edge = begin; edge < end; ++edge) {
@@ -383,18 +398,18 @@ __global__ void fused_pull_hybrid_simple_kernel(
       algorithms::unified_value_t nb_val = values[value_index(
           static_cast<std::size_t>(neighbor),
           static_cast<std::size_t>(query_id), query_stride)];
-      if (nb_val != algorithms::unified_infinity()) {
+      if (algorithms::dispatch_is_reachable(kind, nb_val)) {
         algorithms::unified_value_t candidate =
             algorithms::dispatch_candidate_pull(
                 kind, nb_val, get_pull_edge_weight(graph, edge));
-        if (candidate < acc) {
+        if (algorithms::dispatch_should_update(kind, candidate, acc)) {
           acc = candidate;
         }
       }
     }
     std::size_t value_pos =
         value_index(vertex, static_cast<std::size_t>(query_id), query_stride);
-    if (acc < values[value_pos]) {  // should_update: acc < cur（min 语义统一）
+    if (algorithms::dispatch_should_update(kind, acc, values[value_pos])) {
       values[value_pos] = acc;
       local_mask = query_bit(query_id);
     }
@@ -422,10 +437,10 @@ __global__ void fused_pull_hybrid_simple_kernel(
 // fused_pull_hybrid_smem_kernel（Q=33-64）
 // 参照同质 fused_pull_smem_kernel(frontier_engine.hxx:1779-1879)，
 // 核心差异：
-//   - Policy::infinity() → algorithms::unified_infinity()
+//   - Policy::infinity() → algorithms::dispatch_infinity(kind)
 //   - Policy::relax(nb, w) → algorithms::dispatch_candidate_pull(kind, nb, w)
 //   - 每 thread 读 slot_kinds[query0/1] 取自己的 kind
-//   - should_update 统一为 acc < cur（min-reduce 语义）
+//   - should_update 由算法 tag 分派
 // 每 thread 处理 2 条 query（query0=lane, query1=lane+32）覆盖 64 query
 // ============================================================
 template <int TILE_ROW, typename graph_t>
@@ -459,8 +474,8 @@ __global__ void fused_pull_hybrid_smem_kernel(
   algorithms::algo_kind_t kind1 =
       (query1 < query_count) ? slot_kinds[query1] : algorithms::algo_kind_t::bfs;
 
-  algorithms::unified_value_t acc0 = algorithms::unified_infinity();
-  algorithms::unified_value_t acc1 = algorithms::unified_infinity();
+  algorithms::unified_value_t acc0 = algorithms::dispatch_infinity(kind0);
+  algorithms::unified_value_t acc1 = algorithms::dispatch_infinity(kind1);
 
   decltype(get_pull_starting_edge(graph, static_cast<vertex_t>(0))) begin = 0;
   decltype(begin) end = 0;
@@ -485,20 +500,24 @@ __global__ void fused_pull_hybrid_smem_kernel(
         algorithms::unified_value_t nb_val = values[value_index(
             static_cast<std::size_t>(neighbor),
             static_cast<std::size_t>(query0), query_stride)];
-        if (nb_val != algorithms::unified_infinity()) {
+        if (algorithms::dispatch_is_reachable(kind0, nb_val)) {
           algorithms::unified_value_t candidate =
               algorithms::dispatch_candidate_pull(kind0, nb_val, weight);
-          if (candidate < acc0) acc0 = candidate;
+          if (algorithms::dispatch_should_update(kind0, candidate, acc0)) {
+            acc0 = candidate;
+          }
         }
       }
       if (query1 < query_count) {
         algorithms::unified_value_t nb_val = values[value_index(
             static_cast<std::size_t>(neighbor),
             static_cast<std::size_t>(query1), query_stride)];
-        if (nb_val != algorithms::unified_infinity()) {
+        if (algorithms::dispatch_is_reachable(kind1, nb_val)) {
           algorithms::unified_value_t candidate =
               algorithms::dispatch_candidate_pull(kind1, nb_val, weight);
-          if (candidate < acc1) acc1 = candidate;
+          if (algorithms::dispatch_should_update(kind1, candidate, acc1)) {
+            acc1 = candidate;
+          }
         }
       }
     }
@@ -509,7 +528,7 @@ __global__ void fused_pull_hybrid_smem_kernel(
   if (row_valid && query0 < query_count) {
     std::size_t value_pos =
         value_index(vertex, static_cast<std::size_t>(query0), query_stride);
-    if (acc0 < values[value_pos]) {
+    if (algorithms::dispatch_should_update(kind0, acc0, values[value_pos])) {
       values[value_pos] = acc0;
       local_mask |= query_bit(query0);
     }
@@ -517,7 +536,7 @@ __global__ void fused_pull_hybrid_smem_kernel(
   if (row_valid && query1 < query_count) {
     std::size_t value_pos =
         value_index(vertex, static_cast<std::size_t>(query1), query_stride);
-    if (acc1 < values[value_pos]) {
+    if (algorithms::dispatch_should_update(kind1, acc1, values[value_pos])) {
       values[value_pos] = acc1;
       local_mask |= query_bit(query1);
     }
@@ -630,9 +649,17 @@ class hybrid_frontier_engine {
     auto mask_bytes = V * sizeof(query_mask_t);
 
     // ===== init =====
-    hybrid_detail::fill_unified_kernel<<<hybrid_detail::grid_for(V * Q, threads),
-                                         threads, 0, stream>>>(
-        thrust::raw_pointer_cast(values.data()), V * static_cast<std::size_t>(Q));
+    if (batch.has_sswp()) {
+      hybrid_detail::fill_hybrid_values_kernel
+          <<<hybrid_detail::grid_for(V * Q, threads), threads, 0, stream>>>(
+              thrust::raw_pointer_cast(values.data()),
+              V * static_cast<std::size_t>(Q), views.kinds, Q);
+    } else {
+      hybrid_detail::fill_unified_kernel
+          <<<hybrid_detail::grid_for(V * Q, threads), threads, 0, stream>>>(
+              thrust::raw_pointer_cast(values.data()),
+              V * static_cast<std::size_t>(Q));
+    }
     hybrid_detail::throw_if_cuda_error(cudaGetLastError(), "fill_unified");
 
     hybrid_detail::throw_if_cuda_error(

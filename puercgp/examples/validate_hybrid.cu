@@ -1,6 +1,6 @@
 /*
  * validate_hybrid.cu
- * 端到端验证 run_heterogeneous：BFS + SSSP + WCC 三方混合 batch
+ * 端到端验证 run_heterogeneous：BFS + SSSP + WCC + SSWP 混合 batch
  *
  * toy graph: 0->1(w=2), 0->2(w=5), 1->3(w=1)
  * batch     : [BFS src=0, SSSP src=0, WCC(全顶点)]
@@ -38,7 +38,7 @@ static void check(const char* name, bool cond) {
 }
 
 int main() {
-  const int V = 4, E = 3, Q = 3;
+  const int V = 4, E = 3, Q = 4;
   std::vector<int> h_row = {0, 2, 3, 3, 3};
   std::vector<int> h_col = {1, 2, 3};
   std::vector<float> h_w = {2.0f, 5.0f, 1.0f};
@@ -69,6 +69,11 @@ int main() {
   descs.push_back(d_bfs);
   descs.push_back(d_sssp);
   descs.push_back(d_wcc);
+  query_descriptor_t d_sswp;
+  d_sswp.source = 0;
+  d_sswp.kind = algo_kind_t::sswp;
+  d_sswp.source_value = unified_infinity();
+  descs.push_back(d_sswp);
 
   hybrid_query_batch batch(descs);
   batch.validate();
@@ -104,6 +109,12 @@ int main() {
   check("values[1,2]=0", h_values[1 * Q + 2] == 0.0f);
   check("values[2,2]=0", h_values[2 * Q + 2] == 0.0f);
   check("values[3,2]=0", h_values[3 * Q + 2] == 0.0f);
+
+  printf("SSWP slot(3) [widest path]:\n");
+  check("values[0,3]=INF", h_values[0 * Q + 3] == INF);
+  check("values[1,3]=2", h_values[1 * Q + 3] == 2.0f);
+  check("values[2,3]=5", h_values[2 * Q + 3] == 5.0f);
+  check("values[3,3]=1", h_values[3 * Q + 3] == 1.0f);
 
   if (failures == 0) {
     printf("\nvalidate_hybrid: ALL PASS\n");

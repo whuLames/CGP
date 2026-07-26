@@ -14,7 +14,8 @@
 namespace puercgp {
 namespace detail {
 
-template <typename Policy, typename graph_t, typename vertex_t>
+template <typename Policy, typename graph_t, typename vertex_t,
+          bool use_start_levels = false, bool track_active = false>
 __global__ void expand_shared_node_kernel(
     graph_t graph,
     const vertex_t* frontier_vertices,
@@ -28,7 +29,9 @@ __global__ void expand_shared_node_kernel(
     typename Policy::value_type* values,
     int query_count,
     query_mask_t active_slots,
-    vertex_t level) {
+    vertex_t level,
+    const int* start_levels,
+    query_mask_t* active_union) {
   using value_t = typename Policy::value_type;
   std::size_t vertex_count = graph.get_number_of_vertices();
 
@@ -55,10 +58,18 @@ __global__ void expand_shared_node_kernel(
         while (bits != 0) {
           int query_id = mask_ffs(bits) - 1;
           if (query_id < query_count) {
+            int next_level = static_cast<int>(level) + 1;
+            if constexpr (use_start_levels) {
+              next_level = static_cast<int>(values[value_index(
+                               static_cast<std::size_t>(source),
+                               static_cast<std::size_t>(query_id),
+                               static_cast<std::size_t>(query_count))]) +
+                  1;
+            }
             values[value_index(static_cast<std::size_t>(neighbor),
                                static_cast<std::size_t>(query_id),
                                static_cast<std::size_t>(query_count))] =
-                static_cast<value_t>(level + 1);
+                static_cast<value_t>(next_level);
           }
           bits &= (bits - 1);
         }
@@ -74,12 +85,12 @@ __global__ void expand_shared_node_kernel(
             if (source_distance != Policy::infinity()) {
               value_t candidate =
                   Policy::relax(source_distance, graph.get_edge_weight(edge));
-              value_t old = atomic_min_value(
+              value_t old = atomic_reduce_value<Policy>(
                   values + value_index(static_cast<std::size_t>(neighbor),
                                        static_cast<std::size_t>(query_id),
                                        static_cast<std::size_t>(query_count)),
                   candidate);
-              if (candidate < old) {
+              if (Policy::should_update(candidate, old)) {
                 improved |= query_bit(query_id);
               }
             }
@@ -92,14 +103,21 @@ __global__ void expand_shared_node_kernel(
         continue;
       }
 
-      mark_next_shared_frontier(neighbor, improved, next_frontier_mask,
-                                next_frontier_vertices, next_unique_count,
-                                next_pair_count);
+      if constexpr (track_active) {
+        mark_next_shared_frontier_with_signal(
+            neighbor, improved, next_frontier_mask, next_frontier_vertices,
+            next_unique_count, next_pair_count, active_union);
+      } else {
+        mark_next_shared_frontier(neighbor, improved, next_frontier_mask,
+                                  next_frontier_vertices, next_unique_count,
+                                  next_pair_count);
+      }
     }
   }
 }
 
-template <typename Policy, typename graph_t, typename vertex_t>
+template <typename Policy, typename graph_t, typename vertex_t,
+          bool use_start_levels = false, bool track_active = false>
 __global__ void expand_shared_node_query_parallel_kernel(
     graph_t graph,
     const vertex_t* frontier_vertices,
@@ -113,7 +131,9 @@ __global__ void expand_shared_node_query_parallel_kernel(
     typename Policy::value_type* values,
     int query_count,
     query_mask_t active_slots,
-    vertex_t level) {
+    vertex_t level,
+    const int* start_levels,
+    query_mask_t* active_union) {
   using value_t = typename Policy::value_type;
   constexpr int warp_size = 32;
   std::size_t vertex_count = graph.get_number_of_vertices();
@@ -145,10 +165,18 @@ __global__ void expand_shared_node_query_parallel_kernel(
             0xffffffffU, static_cast<unsigned long long>(improved), 0));
         for (int query_id = lane; query_id < query_count; query_id += 32) {
           if ((improved & query_bit(query_id)) != 0) {
+            int next_level = static_cast<int>(level) + 1;
+            if constexpr (use_start_levels) {
+              next_level = static_cast<int>(values[value_index(
+                               static_cast<std::size_t>(source),
+                               static_cast<std::size_t>(query_id),
+                               static_cast<std::size_t>(query_count))]) +
+                  1;
+            }
             values[value_index(static_cast<std::size_t>(neighbor),
                                static_cast<std::size_t>(query_id),
                                static_cast<std::size_t>(query_count))] =
-                static_cast<value_t>(level + 1);
+                static_cast<value_t>(next_level);
           }
         }
       } else {
@@ -161,12 +189,12 @@ __global__ void expand_shared_node_query_parallel_kernel(
             if (source_distance != Policy::infinity()) {
               value_t candidate =
                   Policy::relax(source_distance, graph.get_edge_weight(edge));
-              value_t old = atomic_min_value(
+              value_t old = atomic_reduce_value<Policy>(
                   values + value_index(static_cast<std::size_t>(neighbor),
                                        static_cast<std::size_t>(query_id),
                                        static_cast<std::size_t>(query_count)),
                   candidate);
-              if (candidate < old) {
+              if (Policy::should_update(candidate, old)) {
                 improved |= query_bit(query_id);
               }
             }
@@ -182,15 +210,22 @@ __global__ void expand_shared_node_query_parallel_kernel(
       }
 
       if (lane == 0 && improved != 0) {
-        mark_next_shared_frontier(neighbor, improved, next_frontier_mask,
-                                  next_frontier_vertices, next_unique_count,
-                                  next_pair_count);
+        if constexpr (track_active) {
+          mark_next_shared_frontier_with_signal(
+              neighbor, improved, next_frontier_mask, next_frontier_vertices,
+              next_unique_count, next_pair_count, active_union);
+        } else {
+          mark_next_shared_frontier(neighbor, improved, next_frontier_mask,
+                                    next_frontier_vertices, next_unique_count,
+                                    next_pair_count);
+        }
       }
     }
   }
 }
 
-template <typename Policy, typename graph_t, typename vertex_t>
+template <typename Policy, typename graph_t, typename vertex_t,
+          bool use_start_levels = false, bool track_active = false>
 __global__ void expand_shared_node_warp_kernel(
     graph_t graph,
     const vertex_t* frontier_vertices,
@@ -204,7 +239,9 @@ __global__ void expand_shared_node_warp_kernel(
     typename Policy::value_type* values,
     int query_count,
     query_mask_t active_slots,
-    vertex_t level) {
+    vertex_t level,
+    const int* start_levels,
+    query_mask_t* active_union) {
   using value_t = typename Policy::value_type;
   constexpr int warp_size = 32;
   std::size_t vertex_count = graph.get_number_of_vertices();
@@ -236,10 +273,18 @@ __global__ void expand_shared_node_warp_kernel(
         while (bits != 0) {
           int query_id = mask_ffs(bits) - 1;
           if (query_id < query_count) {
+            int next_level = static_cast<int>(level) + 1;
+            if constexpr (use_start_levels) {
+              next_level = static_cast<int>(values[value_index(
+                               static_cast<std::size_t>(source),
+                               static_cast<std::size_t>(query_id),
+                               static_cast<std::size_t>(query_count))]) +
+                  1;
+            }
             values[value_index(static_cast<std::size_t>(neighbor),
                                static_cast<std::size_t>(query_id),
                                static_cast<std::size_t>(query_count))] =
-                static_cast<value_t>(level + 1);
+                static_cast<value_t>(next_level);
           }
           bits &= (bits - 1);
         }
@@ -255,12 +300,12 @@ __global__ void expand_shared_node_warp_kernel(
             if (source_distance != Policy::infinity()) {
               value_t candidate =
                   Policy::relax(source_distance, graph.get_edge_weight(edge));
-              value_t old = atomic_min_value(
+              value_t old = atomic_reduce_value<Policy>(
                   values + value_index(static_cast<std::size_t>(neighbor),
                                        static_cast<std::size_t>(query_id),
                                        static_cast<std::size_t>(query_count)),
                   candidate);
-              if (candidate < old) {
+              if (Policy::should_update(candidate, old)) {
                 improved |= query_bit(query_id);
               }
             }
@@ -273,9 +318,15 @@ __global__ void expand_shared_node_warp_kernel(
         continue;
       }
 
-      mark_next_shared_frontier(neighbor, improved, next_frontier_mask,
-                                next_frontier_vertices, next_unique_count,
-                                next_pair_count);
+      if constexpr (track_active) {
+        mark_next_shared_frontier_with_signal(
+            neighbor, improved, next_frontier_mask, next_frontier_vertices,
+            next_unique_count, next_pair_count, active_union);
+      } else {
+        mark_next_shared_frontier(neighbor, improved, next_frontier_mask,
+                                  next_frontier_vertices, next_unique_count,
+                                  next_pair_count);
+      }
     }
   }
 }

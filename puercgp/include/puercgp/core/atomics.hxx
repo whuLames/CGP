@@ -87,5 +87,37 @@ __device__ __forceinline__ value_t atomic_min_value(value_t* address,
   }
 }
 
+template <typename value_t>
+__device__ __forceinline__ value_t atomic_max_value(value_t* address,
+                                                    value_t value) {
+  if constexpr (std::is_same<value_t, int>::value) {
+    return atomicMax(address, value);
+  } else {
+    int* address_as_int = reinterpret_cast<int*>(address);
+    int old = *address_as_int;
+    while (value > __int_as_float(old)) {
+      int assumed = old;
+      old = atomicCAS(address_as_int, assumed, __float_as_int(value));
+      if (assumed == old) {
+        return __int_as_float(assumed);
+      }
+    }
+    return __int_as_float(old);
+  }
+}
+
+template <typename Policy>
+__device__ __forceinline__ typename Policy::value_type atomic_reduce_value(
+    typename Policy::value_type* address,
+    typename Policy::value_type value) {
+  if constexpr (Policy::reduction == reduction_kind_t::minimum) {
+    return atomic_min_value(address, value);
+  } else {
+    static_assert(Policy::reduction == reduction_kind_t::maximum,
+                  "unsupported frontier reduction");
+    return atomic_max_value(address, value);
+  }
+}
+
 }  // namespace detail
 }  // namespace puercgp

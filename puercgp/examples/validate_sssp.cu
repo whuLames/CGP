@@ -55,6 +55,7 @@ int main(int argc, char** argv) {
   std::string traversal_mode = "push";
   std::string push_strategy = "shared_node_warp";
   std::string pull_strategy = "fused";
+  bool print_validation_summary = false;
   if (argc > 1) {
     matrix = argv[1];
   }
@@ -72,6 +73,9 @@ int main(int argc, char** argv) {
   }
   if (argc > 6) {
     pull_strategy = argv[6];
+  }
+  if (argc > 7) {
+    print_validation_summary = std::string(argv[7]) == "summary";
   }
 
   const bool build_pull_adjacency = traversal_mode != "push";
@@ -137,6 +141,31 @@ int main(int argc, char** argv) {
             ++mismatches;
           }
         }
+      }
+    }
+    if (repeat + 1 == repeats && print_validation_summary) {
+      thrust::host_vector<float> distances(result.values);
+      for (std::size_t query_id = 0; query_id < sources.size(); ++query_id) {
+        unsigned long long reached = 0;
+        unsigned long long distance_sum = 0;
+        unsigned long long weighted_sum = 0;
+        for (int vertex_id = 0; vertex_id < graph.vertices; ++vertex_id) {
+          const float value = distances[
+              static_cast<std::size_t>(vertex_id) * sources.size() + query_id];
+          if (std::isfinite(value)) {
+            const auto distance =
+                static_cast<unsigned long long>(std::llround(value));
+            ++reached;
+            distance_sum += distance;
+            weighted_sum +=
+                (static_cast<unsigned long long>(vertex_id) + 1) *
+                (distance + 1);
+          }
+        }
+        std::cout << "validation_summary query=" << query_id
+                  << " reached=" << reached
+                  << " value_sum=" << distance_sum
+                  << " weighted_sum=" << weighted_sum << "\n";
       }
     }
   }

@@ -13,7 +13,8 @@ using unified_value_t = float;
 enum class algo_kind_t : std::uint8_t {
   bfs = 0,
   sssp = 1,
-  wcc = 2
+  wcc = 2,
+  sswp = 3
 };
 
 __host__ __device__ __forceinline__ constexpr unified_value_t
@@ -24,6 +25,11 @@ unified_infinity() {
 __host__ __device__ __forceinline__ constexpr unified_value_t
 unified_source_value() {
   return unified_value_t{0};
+}
+
+__host__ __device__ __forceinline__ constexpr unified_value_t
+unified_negative_infinity() {
+  return -std::numeric_limits<unified_value_t>::infinity();
 }
 
 static_assert(sizeof(unified_value_t) == 4,
