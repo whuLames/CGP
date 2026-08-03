@@ -2,6 +2,7 @@
 
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -155,6 +156,92 @@ class green_context_pair {
   CUstream second_stream_ = nullptr;
   unsigned int first_sms_ = 0;
   unsigned int second_sms_ = 0;
+  bool primary_retained_ = false;
+};
+
+// N-way SM partition. Each partition owns one green context and stream.
+// The requested sum may be smaller than the device SM count.
+class green_context_group {
+ public:
+  green_context_group(int device_ordinal,
+                      const std::vector<unsigned int>& requested) {
+    if (requested.empty())
+      throw std::invalid_argument("green_context_group: empty partition list");
+    throw_if_driver_error(cuInit(0), "cuInit");
+    throw_if_driver_error(cuDeviceGet(&device_, device_ordinal), "cuDeviceGet");
+    CUcontext primary = nullptr;
+    throw_if_driver_error(cuDevicePrimaryCtxRetain(&primary, device_),
+                          "cuDevicePrimaryCtxRetain");
+    primary_retained_ = true;
+    throw_if_driver_error(cuCtxSetCurrent(primary), "cuCtxSetCurrent");
+
+    // The driver cannot split the returned remainder again. Create every
+    // equal-sized partition in one split-by-count call.
+    for (unsigned int size : requested) {
+      if (size != requested.front())
+        throw std::invalid_argument(
+            "green_context_group: partitions must be uniform "
+            "(single split-by-count call)");
+    }
+    CUdevResource pool{};
+    throw_if_driver_error(
+        cuDeviceGetDevResource(device_, &pool, CU_DEV_RESOURCE_TYPE_SM),
+        "cuDeviceGetDevResource");
+    unsigned int group_count = static_cast<unsigned int>(requested.size());
+    std::vector<CUdevResource> selected(requested.size());
+    CUdevResource remaining{};
+    throw_if_driver_error(
+        cuDevSmResourceSplitByCount(selected.data(), &group_count, &pool,
+                                    &remaining, 0, requested.front()),
+        "cuDevSmResourceSplitByCount(group)");
+    if (group_count < requested.size())
+      throw std::runtime_error(
+          "green_context_group: driver produced fewer SM groups than "
+          "requested");
+    for (std::size_t g = 0; g < requested.size(); ++g) {
+      if (selected[g].sm.smCount == 0)
+        throw std::runtime_error("green_context_group: empty SM group");
+      CUdevResourceDesc descriptor = nullptr;
+      throw_if_driver_error(
+          cuDevResourceGenerateDesc(&descriptor, &selected[g], 1),
+          "cuDevResourceGenerateDesc(group)");
+      CUgreenCtx context = nullptr;
+      throw_if_driver_error(
+          cuGreenCtxCreate(&context, descriptor, device_,
+                           CU_GREEN_CTX_DEFAULT_STREAM),
+          "cuGreenCtxCreate(group)");
+      CUstream stream = nullptr;
+      throw_if_driver_error(
+          cuGreenCtxStreamCreate(&stream, context, CU_STREAM_NON_BLOCKING, 0),
+          "cuGreenCtxStreamCreate(group)");
+      contexts_.push_back(context);
+      streams_.push_back(stream);
+      sm_counts_.push_back(selected[g].sm.smCount);
+    }
+  }
+
+  green_context_group(const green_context_group&) = delete;
+  green_context_group& operator=(const green_context_group&) = delete;
+
+  ~green_context_group() {
+    for (CUstream stream : streams_)
+      if (stream) cuStreamDestroy(stream);
+    for (CUgreenCtx context : contexts_)
+      if (context) cuGreenCtxDestroy(context);
+    if (primary_retained_) cuDevicePrimaryCtxRelease(device_);
+  }
+
+  std::size_t size() const { return streams_.size(); }
+  cudaStream_t stream(std::size_t i) const {
+    return reinterpret_cast<cudaStream_t>(streams_.at(i));
+  }
+  unsigned int sm_count(std::size_t i) const { return sm_counts_.at(i); }
+
+ private:
+  CUdevice device_ = 0;
+  std::vector<CUgreenCtx> contexts_;
+  std::vector<CUstream> streams_;
+  std::vector<unsigned int> sm_counts_;
   bool primary_retained_ = false;
 };
 
