@@ -73,3 +73,22 @@ __pycache__/
 
 # Local nested git metadata backups, if any are created while flattening.
 .nested-git-backup/
+
+# Local baseline checkouts. Reproducible adaptations live in baselines/patches.
+/baselines/ForkGraph/
+/baselines/iBFS/
+
+# Validation executables without a filename extension.
+/experiments/*/artifacts/correctness/bin/
+/src/kernels/ge_spmm_group_slots_bench
+
+# Downloaded papers and generated LaTeX artifacts.
+/puercgp/paper-writing/literature/references/papers/*.pdf
+/puercgp/paper-writing/sigmod27/main.pdf
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.out
+*.synctex.gz

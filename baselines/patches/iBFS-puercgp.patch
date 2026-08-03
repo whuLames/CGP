@@ -1,0 +1,672 @@
+diff --git a/BENCHMARK.md b/BENCHMARK.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..9292e8c56974fe7f372f6a1cbd6aa9862564bcd3
+--- /dev/null
++++ b/BENCHMARK.md
+@@ -0,0 +1,115 @@
++# iBFS Performance Benchmark
++
++> 测试日期: 2026-05-27 | GPU: Tesla V100-SXM2-32GB | CUDA 12.8 | 编译: -arch=compute_60 -code=sm_70
++
++## 数据集
++
++| 数据集 | 顶点数 | 边数 | CSR 来源 |
++|--------|--------|------|----------|
++| cit-Patents | 3,774,768 | 33,037,895 | SNAP |
++| soc-orkut | 2,997,166 | 212,698,418 | SNAP |
++| soc-sinaweibo | 58,655,849 | 522,642,142 | SNAP (rabbit reorder) |
++| soc-twitter | 21,297,772 | 530,051,618 | SNAP |
++
++## 测试参数
++
++- `sw_level = 8`（方向切换阈值）
++- `bfs_count = concurrent_count`（每轮恰好执行 concurrent_count 个 BFS）
++- 源顶点随机生成（非孤立且深度 ≥ 2）
++- 1 轮遍历
++
++## 汇总表
++
++Traversal 时间为单轮所有并发 BFS 共同完成的端到端耗时（含 Expand + Inspect + 同步开销）。
++
++### Traversal 耗时 (s)
++
++| 数据集 | c=2 | c=4 | c=8 | c=16 | c=32 | c=64 |
++|--------|-----|-----|-----|------|------|------|
++| cit-Patents | 0.040 | 0.050 | 0.057 | 0.064 | 0.070 | 0.079 |
++| soc-orkut | 0.169 | 0.197 | 0.211 | 0.224 | 0.239 | 0.255 |
++| soc-sinaweibo | 0.768 | 0.850 | 0.883 | 0.927 | 0.953 | 3.696 |
++| soc-twitter | 1.244 | 1.373 | 1.666 | 1.816 | 2.039 | 2.271 |
++
++### Expand 耗时 (s)
++
++| 数据集 | c=2 | c=4 | c=8 | c=16 | c=32 | c=64 |
++|--------|-----|-----|-----|------|------|------|
++| cit-Patents | 0.033 | 0.040 | 0.047 | 0.053 | 0.058 | 0.065 |
++| soc-orkut | 0.162 | 0.189 | 0.203 | 0.215 | 0.230 | 0.244 |
++| soc-sinaweibo | 0.616 | 0.685 | 0.711 | 0.748 | 0.766 | 2.800 |
++| soc-twitter | 1.021 | 1.107 | 1.365 | 1.517 | 1.720 | 1.911 |
++
++### Inspect 耗时 (s)
++
++| 数据集 | c=2 | c=4 | c=8 | c=16 | c=32 | c=64 |
++|--------|-----|-----|-----|------|------|------|
++| cit-Patents | 0.007 | 0.009 | 0.009 | 0.010 | 0.011 | 0.013 |
++| soc-orkut | 0.007 | 0.007 | 0.008 | 0.008 | 0.009 | 0.010 |
++| soc-sinaweibo | 0.150 | 0.163 | 0.169 | 0.177 | 0.184 | 0.890 |
++| soc-twitter | 0.218 | 0.262 | 0.296 | 0.294 | 0.318 | 0.356 |
++
++### 单 BFS 等效耗时 (ms) = Traversal / concurrent_count
++
++| 数据集 | c=2 | c=4 | c=8 | c=16 | c=32 | c=64 |
++|--------|-----|-----|-----|------|------|------|
++| cit-Patents | 20.1 | 12.5 | 7.1 | 4.0 | 2.2 | 1.2 |
++| soc-orkut | 84.7 | 49.2 | 26.4 | 14.0 | 7.5 | 4.0 |
++| soc-sinaweibo | 384.1 | 212.5 | 110.3 | 57.9 | 29.8 | 57.8* |
++| soc-twitter | 621.8 | 343.2 | 208.3 | 113.5 | 63.7 | 35.5 |
++
++*soc-sinaweibo c=64 出现显著性能退化，GPU 内存接近溢出（8.9 GB / 32 GB），推测与 128 位位图操作在虚拟 compute_60 架构下的效率下降有关。
++
++## BFS 层级分布
++
++所有测试均在 12 层内完成（Level 1-12），方向切换模式：
++
++- Level 1~7: top-down (td)
++- Level 8: switch (sw)
++- Level 9~12: bottom-up (bu)
++
++## 逐测试详细数据
++
++### cit-Patents (3.8M verts, 33M edges)
++
++| 并发数 | Traversal(s) | Expand(s) | Inspect(s) | BFS层数 | GPU内存(bytes) |
++|--------|-------------|-----------|------------|---------|---------------|
++| 2 | 0.040 | 0.033 | 0.007 | 12 | 336,012,668 |
++| 4 | 0.050 | 0.040 | 0.009 | 12 | 348,110,988 |
++| 8 | 0.057 | 0.047 | 0.009 | 12 | 360,210,556 |
++| 16 | 0.064 | 0.053 | 0.010 | 12 | 390,408,732 |
++| 32 | 0.070 | 0.058 | 0.011 | 12 | 450,805,084 |
++| 64 | 0.079 | 0.065 | 0.013 | 12 | 571,597,788 |
++
++### soc-orkut (3.0M verts, 213M edges)
++
++| 并发数 | Traversal(s) | Expand(s) | Inspect(s) | BFS层数 | GPU内存(bytes) |
++|--------|-------------|-----------|------------|---------|---------------|
++| 2 | 0.169 | 0.162 | 0.007 | 12 | 1,014,213,508 |
++| 4 | 0.197 | 0.189 | 0.007 | 12 | 1,020,207,848 |
++| 8 | 0.211 | 0.203 | 0.008 | 12 | 1,032,196,528 |
++| 16 | 0.224 | 0.215 | 0.008 | 12 | 1,056,173,888 |
++| 32 | 0.239 | 0.230 | 0.009 | 12 | 1,104,128,608 |
++| 64 | 0.255 | 0.244 | 0.010 | 12 | 1,200,038,048 |
++
++### soc-sinaweibo (58.7M verts, 523M edges)
++
++| 并发数 | Traversal(s) | Expand(s) | Inspect(s) | BFS层数 | GPU内存(bytes) |
++|--------|-------------|-----------|------------|---------|---------------|
++| 2 | 0.768 | 0.616 | 0.150 | 12 | 5,259,557,286 |
++| 4 | 0.850 | 0.685 | 0.163 | 12 | 5,376,868,992 |
++| 8 | 0.883 | 0.711 | 0.169 | 12 | 5,611,492,404 |
++| 16 | 0.927 | 0.748 | 0.177 | 12 | 6,080,739,228 |
++| 32 | 0.953 | 0.766 | 0.184 | 12 | 7,019,232,876 |
++| 64 | 3.696 | 2.800 | 0.890 | 12 | 8,896,220,172 |
++
++### soc-twitter (21.3M verts, 530M edges)
++
++| 并发数 | Traversal(s) | Expand(s) | Inspect(s) | BFS层数 | GPU内存(bytes) |
++|--------|-------------|-----------|------------|---------|---------------|
++| 2 | 1.244 | 1.021 | 0.218 | 12 | 3,271,859,032 |
++| 4 | 1.373 | 1.107 | 0.262 | 12 | 3,314,454,584 |
++| 8 | 1.666 | 1.365 | 0.296 | 12 | 3,399,645,688 |
++| 16 | 1.816 | 1.517 | 0.294 | 12 | 3,570,027,896 |
++| 32 | 2.039 | 1.720 | 0.318 | 12 | 3,910,792,312 |
++| 64 | 2.271 | 1.911 | 0.356 | 12 | 4,592,321,144 |
+diff --git a/COOKBOOK.md b/COOKBOOK.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..62ac6bdf656c59b0a4e3b297cf661bf9106e9620
+--- /dev/null
++++ b/COOKBOOK.md
+@@ -0,0 +1,160 @@
++# iBFS Cookbook
++
++> 自动生成于 2026-05-27，由 /zcf:repro 生成
++
++## 项目信息
++
++| 项目 | 内容 |
++|------|------|
++| 仓库/路径 | `/home/zyl/Projects/ocgp/baselines/iBFS` |
++| 描述 | GPU 上并发执行多源 BFS 的图遍历系统，支持方向切换（top-down/bottom-up） |
++| 论文 | SIGMOD '16: iBFS: Concurrent Breadth-First Search on GPUs (Hang Liu, H. Howie Huang, Yang Hu) |
++| 语言 | C++/CUDA |
++
++## 环境要求
++
++| 依赖 | 版本要求 | 本机版本 |
++|------|---------|---------|
++| CUDA | 5.5–7.5 (原始) | 12.8 |
++| GCC | 4.4.7 / 4.8.5 (原始) | 12.2.0 |
++| MPI | MPICH 3.3+ 或 OpenMPI | mpicxx (GCC 12.2.0) |
++| GPU | Kepler (sm_35) 原始 | Tesla V100-SXM2-32GB × 8 (sm_70) |
++
++## 编译步骤
++
++```bash
++cd /home/zyl/Projects/ocgp/baselines/iBFS
++
++# 基本编译（不启用监控）
++make -j$(nproc)
++
++# 启用逐层监控输出
++make enable_monitor=1 -j$(nproc)
++
++# 启用 BFS 结果校验
++make enable_check=1 -j$(nproc)
++
++# 清理
++make clean
++```
++
++### 编译注意事项
++
++1. **GPU 架构兼容性（关键）**：原始代码使用 `-arch=sm_35`（Kepler），在 Volta+ GPU 上需要使用 `-arch=compute_60 -code=sm_70`。**不能**直接改为 `-arch=sm_70`，也不能将 `__shfl`/`__shfl_xor`/`__all`/`__any` 替换为 `_sync` 版本。原因是代码在条件分支内调用 warp 级原语（如 `extract_depth` kernel 中 `__shfl` 在 `if(change)` 内），Volta 独立线程调度会导致死锁。使用 `compute_60` 虚拟架构可保留 pre-Volta 的 warp 同步模型。
++
++2. **CUDA 头文件路径**：`mpicxx` 编译 `.cpp` 文件时需要 CUDA 头文件路径。原始 Makefile 的 `../include` 路径在 CUDA 12.x conda 安装中不正确，需改为 `targets/x86_64-linux/include`。
++
++3. **CUDA 运行时库路径**：链接时 `-lcudart` 的库目录需指向 `$CUDA_BASE/lib`（非原始的 `lib64`）。
++
++4. **GPU 设备选择**：`main.cpp` 硬编码 `#define USE_GPU_ID 4`，需确保该 GPU ID 存在。若要使用其他 GPU，需修改此宏或使用 `CUDA_VISIBLE_DEVICES` 环境变量。
++
++## 运行示例
++
++### 数据准备
++
++iBFS 使用二进制 CSR 格式：`_beg_pos.bin`（uint64 行指针数组）和 `_csr.bin`（uint64 列索引数组）。
++
++**从已有 int32 CSR 数据转换：**
++
++```bash
++python3 -c "
++import struct
++# 转换 csr_vlist.bin (int32 → int64)
++for inf, outf in [
++    ('/path/to/csr_vlist.bin', '/path/to/DATASET_beg_pos.bin'),
++    ('/path/to/csr_elist.bin', '/path/to/DATASET_csr.bin'),
++]:
++    with open(inf, 'rb') as fi, open(outf, 'wb') as fo:
++        data = fi.read()
++        n = len(data) // 4
++        vals = struct.unpack(f'{n}i', data)
++        for v in vals:
++            fo.write(struct.pack('q', v))
++    print(f'{outf}: {n} elements converted')
++"
++```
++
++**从文本边列表转换（使用自带工具）：**
++
++```bash
++cd tuple_text_to_binary_csr
++# 注意：该工具的 Makefile 引用了 ../../lib/ 目录，可能需要手动调整
++./text_to_bin.bin <edge_list_file> <is_reverse: 0 or 1> <lines_to_skip>
++# 生成 <edge_list_file>_beg_pos.bin 和 <edge_list_file>_csr.bin
++```
++
++### 运行命令
++
++```bash
++# 基本运行（MPI 单进程）
++mpirun --allow-run-as-root -np 1 ./gpu-ibfs \
++    <beg_pos_file> <csr_file> <concurrent_count> <switch_level> <bfs_count>
++
++# 示例：cit-Patents，128 并发 BFS，第 8 层切换方向，共 128 个源
++mpirun --allow-run-as-root -np 1 ./gpu-ibfs \
++    /home/zyl/data/csr_data/cit-Patents/cit-Patents_beg_pos.bin \
++    /home/zyl/data/csr_data/cit-Patents/cit-Patents_csr.bin \
++    128 8 128
++```
++
++### 参数说明
++
++| 参数 | 含义 | 建议值 |
++|------|------|--------|
++| `beg_pos_file` | CSR 行指针二进制文件路径（uint64） | 必选 |
++| `csr_file` | CSR 列索引二进制文件路径（uint64） | 必选 |
++| `concurrent_count` | 并发 BFS 数量 | **128**（README 推荐） |
++| `switch_level` | BFS 方向切换层级（td → bu） | 8（取决于图直径） |
++| `bfs_count` | 总 BFS 源顶点数（需能被 concurrent_count 整除） | 128 |
++
++### 性能参考（Tesla V100-SXM2-32GB, cit-Patents）
++
++| 配置 | 耗时 | BFS 层数 |
++|------|------|---------|
++| 1 并发 × 1 源 | 40ms | 12 层 |
++| 128 并发 × 128 源 | 91ms | 22 层 |
++
++## 输出格式
++
++### 标准输出
++
++```
++Input: /path/to/exe /path/to/beg /path/to/csr concurrent-count switch-level bfs_count
++Graph load (success): 3774768 verts, 33037895 edges 0.32 second(s)
++...
++Traversal-iter-0: 0.09 second(s)
++```
++
++### 监控模式输出（enable_monitor=1）
++
++每层输出：
++```
++@Level-<N>-<mode>-nextq-insp-expd-step: <queue_size> <inspect_time> <expand_time> <total_time>
++```
++
++- `<mode>`: `td`（top-down）、`sw`（切换层）、`bu`（bottom-up）
++- 结尾输出：`Break-fq-sz`（最终队列大小）、`Total-insp-expd`（总 inspect/expand 时间）
++
++## 数据格式
++
++### CSR 二进制格式
++
++| 文件 | 类型 | 大小 | 说明 |
++|------|------|------|------|
++| `*_beg_pos.bin` | uint64 | (V+1) × 8 bytes | 行指针数组，`beg_pos[i]` 到 `beg_pos[i+1]` 为顶点 i 的邻居范围 |
++| `*_csr.bin` | uint64 | E × 8 bytes | 列索引数组，存储所有邻居顶点 ID |
++
++注意：虽然文件存储为 uint64，但加载后会转换为 int32 进行处理。因此图的最大顶点数和边数受 int32 范围限制（~21 亿）。
++
++## 可用算法/程序
++
++| 程序名 | 算法 | 说明 |
++|--------|------|------|
++| `gpu-ibfs` | 并发多源 BFS | 主程序，MPI 启动，支持 top-down/bottom-up 方向切换 |
++
++## 已知限制
++
++1. **Volta+ GPU 兼容性**：必须使用 `-arch=compute_60 -code=sm_70` 编译，不能使用原生 sm_70 arch
++2. **GPU 设备硬编码**：`main.cpp` 中 `USE_GPU_ID=4`，需手动修改或确保设备可用
++3. **数据格式**：仅支持 uint64 CSR 二进制格式，需从其他格式转换
++4. **源顶点生成**：随机生成源顶点，通过 `input.dat` 文件可指定固定源（但代码中相关逻辑被注释）
+diff --git a/ISSUES.md b/ISSUES.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..dad33f5d0c5c9b8579218d035305d1c48cad4902
+--- /dev/null
++++ b/ISSUES.md
+@@ -0,0 +1,54 @@
++# iBFS 环境配置问题记录
++
++> 自动生成于 2026-05-27，由 /zcf:repro 生成
++
++## 问题 1: CUDA arch flag 不匹配当前 GPU
++
++- **现象**: 原始 Makefile 使用 `-arch=sm_35`（Kepler），V100 需 sm_70
++- **原因**: 代码为 2016 年 Kepler 时代编写，不兼容 Volta+ GPU
++- **解决方案**: Makefile 中 `-arch=sm_35` 改为 `-arch=compute_60 -code=sm_70`
++  - **关键**：必须使用 `compute_60` 虚拟架构而非直接 `sm_70`，否则 warp 级原语死锁（见问题 3）
++- **修改文件**: `Makefile` 第 6 行
++- **适用条件**: 在 Volta (sm_70) 及以上 GPU 上运行
++
++## 问题 2: mpicxx 找不到 CUDA 头文件和运行时库
++
++- **现象**: `main.cpp:3: fatal error: cuda.h: No such file or directory`；链接时 `cannot find -lcudart`
++- **原因**: CUDA 12.x conda 安装的 include/lib 路径与原始 Makefile 假设不同
++  - 原始路径: `$(dirname nvcc)/../include` 和 `../lib64`
++  - 实际路径: `targets/x86_64-linux/include` 和 `lib`
++- **解决方案**: Makefile 中 MPCFLAGS 修改为:
++  ```makefile
++  CUDA_BASE := $(shell dirname $(CUCC))/..
++  MPCFLAGS  = -Wall -I"$(CUDA_BASE)/targets/x86_64-linux/include" -L"$(CUDA_BASE)/lib" -lcudart -fopenmp
++  ```
++- **修改文件**: `Makefile` 第 10-11 行
++- **适用条件**: CUDA 12.x 通过 conda 安装的场景
++
++## 问题 3: Volta+ 独立线程调度导致 warp 级原语死锁
++
++- **现象**: 编译成功但运行时卡死在第一个 BFS 层级，GPU 100% 利用率但无输出
++- **原因**: 代码在条件分支内调用 warp 级 shuffle/vote 原语（如 `extract_depth` kernel 中 `__shfl()` 在 `if(change)` 条件内）。Volta+ 架构引入独立线程调度（Independent Thread Scheduling），warp 内线程可以独立收敛/发散，导致：
++  - 若改用 `__shfl_sync(0xFFFFFFFF, ...)`：要求所有 32 线程同时调用，条件分支内的调用会死锁
++  - 若用 `-arch=sm_70` 直接编译旧 API：`__shfl` 等已从 PTX 中移除，编译报错
++  - **正确做法**：使用 `-arch=compute_60 -code=sm_70`，生成 compute_60 PTX（保留 warp 同步语义），由驱动 JIT 编译为 sm_70
++- **解决方案**: Makefile 中使用 `-arch=compute_60 -code=sm_70`
++- **修改文件**: `Makefile` 第 6 行
++- **适用条件**: 在 Volta (sm_70)、Turing (sm_75)、Ampere (sm_80) 等 Volta+ GPU 上运行此 2016 年代码
++
++## 问题 4: GPU 设备 ID 硬编码
++
++- **现象**: 程序始终使用 GPU 4
++- **原因**: `main.cpp` 第 6 行 `#define USE_GPU_ID 4` 硬编码
++- **解决方案**: 修改 `USE_GPU_ID` 为目标 GPU ID，或使用 `CUDA_VISIBLE_DEVICES` 限制可见设备
++- **修改文件**: `main.cpp` 第 6 行
++- **适用条件**: 需要使用非 GPU 4 的设备时
++
++## 修改文件清单
++
++| 原始文件 | 备份文件 | 修改内容 |
++|---------|---------|---------|
++| `Makefile` | `Makefile.bak` | arch flag、CUDA 路径 |
++| `expander.cuh` | `expander.cuh.bak` | 未修改（恢复为原始版本） |
++| `expander.cu` | `expander.cu.bak` | 未修改（恢复为原始版本） |
++| `inspector.cuh` | `inspector.cuh.bak` | 未修改（恢复为原始版本） |
+diff --git a/Makefile b/Makefile
+index 21d709cc0fe024496be2d37f224d192184e2f5cc..d90640d81a497b2309a1113b1a7a9e0f4cdacae4 100644
+--- a/Makefile
++++ b/Makefile
+@@ -3,12 +3,13 @@ EXE=gpu-ibfs
+ COMMFLAGS=-O3 --compiler-options -Wall -Xptxas -v
+ CUCC= "$(shell which nvcc)"
+ 
+-CUFLAGS= -arch=sm_35  ${COMMFLAGS}#-Xptxas -dlcm=cg#disable l1 cache
++CUFLAGS= -arch=compute_60 -code=sm_70  ${COMMFLAGS}#-Xptxas -dlcm=cg#disable l1 cache
+ CUFLAGS+= -ccbin=g++ -Xcompiler -fopenmp
+ 
+ 
+ MPC    = "$(shell which mpicxx)"
+-MPCFLAGS  = -Wall -I"$(shell dirname $(CUCC))/../include" -L"$(shell dirname $(CUCC))/../lib64" -lcudart -fopenmp
++CUDA_BASE := $(shell dirname $(CUCC))/..
++MPCFLAGS  = -Wall -I"$(CUDA_BASE)/targets/x86_64-linux/include" -L"$(CUDA_BASE)/lib" -lcudart -fopenmp
+ 
+ 
+ ifeq ($(enable_monitor), 1)
+@@ -33,6 +34,8 @@ DEPS= 	Makefile \
+ 		expander.cuh \
+ 		inspector.cuh \
+ 		comm.h \
++		graph_reader.h \
++		graph_reader.cuh \
+ 		graph.cuh \
+ 		bfs_gpu_opt.cuh \
+ 		wtime.h \
+diff --git a/graph.cuh b/graph.cuh
+index 89f9a9b24cbd0d65b1f7822a24335911c9960390..e34db502ec17531d6bd7582fd6e5a3b66e2f2dc9 100644
+--- a/graph.cuh
++++ b/graph.cuh
+@@ -293,7 +293,14 @@ graph<vertex_t, index_t, depth_t>
+ 	//		ggraph->beg_pos);
+ 	std::cout<<"Loading edges time: "<<wtime()-timer<<" second(s)\n";
+ 	std::cout<<"Assuming source vertices are stored in input.dat\n";
+-	if(true){
++	if(read_src_v<vertex_t, index_t>(glb_src_list, glb_src_count, "input.dat") == FILE_EXIST){
++		if(glb_src_count != num_groups * num_agg_bfs){
++			std::cout<<"input.dat source count "<<glb_src_count
++				<<" does not match expected "<<num_groups * num_agg_bfs<<"\n";
++			exit(-1);
++		}
++		std::cout<<"Read input.dat: "<<glb_src_count<<" source vertices\n";
++	}else{
+ 		std::cout<<"input.dat is not detected.\n"
+ 		<<"Generating source vertices with rand()%vert_count\n";
+ 	
+diff --git a/graph_reader.cuh b/graph_reader.cuh
+index 2d4e74267a0f49f581cd44d9e12b30fb391e42fb..d0ce41689168eababac4f50aa21a51eea2375104 100644
+--- a/graph_reader.cuh
++++ b/graph_reader.cuh
+@@ -118,6 +118,142 @@ graph_reader::graph_reader(
+ 		<<edge_count<<" edges "<<wtime()-tm<<" second(s)\n";
+ }
+ 
++graph_reader::graph_reader(
++		const char *gr_file,
++		const index_t src_count
++):src_count(src_count)
++{
++	double tm=wtime();
++
++	uint64_t header[4];
++	FILE *file=fopen(gr_file, "rb");
++	if(file==NULL)
++	{
++		std::cout<<gr_file<<" cannot open\n";
++		exit(-1);
++	}
++
++	size_t ret=fread(header, sizeof(uint64_t), 4, file);
++	if(ret!=4)
++	{
++		std::cout<<gr_file<<" has an incomplete .gr header\n";
++		fclose(file);
++		exit(-1);
++	}
++
++	const uint64_t version=header[0];
++	const uint64_t size_edge_ty=header[1];
++	const uint64_t nvtxs=header[2];
++	const uint64_t nedges=header[3];
++
++	if(version!=1)
++	{
++		std::cout<<gr_file<<" has unsupported .gr version "<<version<<"\n";
++		fclose(file);
++		exit(-1);
++	}
++	if(nvtxs>static_cast<uint64_t>(std::numeric_limits<index_t>::max()) ||
++			nedges>static_cast<uint64_t>(std::numeric_limits<index_t>::max()))
++	{
++		std::cout<<gr_file<<" is too large for this iBFS build "
++			<<"(index_t/vertex_t are 32-bit signed integers)\n";
++		fclose(file);
++		exit(-1);
++	}
++
++	src_list = new vertex_t[src_count];
++	vert_count=static_cast<index_t>(nvtxs);
++	edge_count=static_cast<index_t>(nedges);
++	beg_pos = new index_t[vert_count+1];
++	csr = new vertex_t[edge_count];
++
++	beg_pos[0]=0;
++	const uint64_t chunk_entries=1<<20;
++	uint64_t *tmp_beg_pos = new uint64_t[chunk_entries];
++	uint64_t last_offset=0;
++	for(uint64_t done=0; done<nvtxs; )
++	{
++		uint64_t batch=nvtxs-done;
++		if(batch>chunk_entries)
++			batch=chunk_entries;
++		ret=fread(tmp_beg_pos, sizeof(uint64_t), batch, file);
++		if(ret!=batch)
++		{
++			std::cout<<gr_file<<" ended while reading .gr row_start\n";
++			delete[] tmp_beg_pos;
++			fclose(file);
++			exit(-1);
++		}
++		for(uint64_t i=0;i<batch;++i)
++		{
++			if(tmp_beg_pos[i]>static_cast<uint64_t>(std::numeric_limits<index_t>::max()))
++			{
++				std::cout<<gr_file<<" has a row_start offset too large for index_t\n";
++				delete[] tmp_beg_pos;
++				fclose(file);
++				exit(-1);
++			}
++			if(tmp_beg_pos[i]<last_offset || tmp_beg_pos[i]>nedges)
++			{
++				std::cout<<gr_file<<" has an invalid .gr row_start offset\n";
++				delete[] tmp_beg_pos;
++				fclose(file);
++				exit(-1);
++			}
++			beg_pos[done+i+1]=static_cast<index_t>(tmp_beg_pos[i]);
++			last_offset=tmp_beg_pos[i];
++		}
++		done+=batch;
++	}
++	delete[] tmp_beg_pos;
++
++	if(beg_pos[vert_count]!=edge_count)
++	{
++		std::cout<<gr_file<<" row_start last entry "<<beg_pos[vert_count]
++			<<" does not match header edge count "<<edge_count<<"\n";
++		fclose(file);
++		exit(-1);
++	}
++
++	const uint64_t edge_chunk_entries=1<<20;
++	uint32_t *tmp_csr = new uint32_t[edge_chunk_entries];
++	for(uint64_t done=0; done<nedges; )
++	{
++		uint64_t batch=nedges-done;
++		if(batch>edge_chunk_entries)
++			batch=edge_chunk_entries;
++		ret=fread(tmp_csr, sizeof(uint32_t), batch, file);
++		if(ret!=batch)
++		{
++			std::cout<<gr_file<<" ended while reading .gr edge_dst\n";
++			delete[] tmp_csr;
++			fclose(file);
++			exit(-1);
++		}
++		for(uint64_t i=0;i<batch;++i)
++		{
++			if(tmp_csr[i]>=nvtxs)
++			{
++				std::cout<<gr_file<<" has an edge destination outside vertex range\n";
++				delete[] tmp_csr;
++				fclose(file);
++				exit(-1);
++			}
++			csr[done+i]=static_cast<vertex_t>(tmp_csr[i]);
++		}
++		done+=batch;
++	}
++	delete[] tmp_csr;
++
++	fclose(file);
++
++	std::cout<<"Graph load (success): "<<vert_count<<" verts, "
++		<<edge_count<<" edges from .gr";
++	if(size_edge_ty!=0)
++		std::cout<<" (ignored edge data type size "<<size_edge_ty<<")";
++	std::cout<<" "<<wtime()-tm<<" second(s)\n";
++}
++
+ void
+ graph_reader::
+ gen_src()
+diff --git a/graph_reader.h b/graph_reader.h
+index 524ccd26b119473c98e3267d558a44b3f07dccd9..37453601c1de80e05571faee6993f1a3ef95db77 100644
+--- a/graph_reader.h
++++ b/graph_reader.h
+@@ -36,6 +36,7 @@
+ #include <string.h>
+ #include "wtime.h"
+ #include <stdint.h>
++#include <limits>
+ #include <sys/stat.h>
+ #include <stdio.h>
+ 
+@@ -63,6 +64,8 @@ class graph_reader
+ 		graph_reader(const char *beg_file, 
+ 				const char *csr_file,
+ 				index_t src_count);
++		graph_reader(const char *gr_file,
++				index_t src_count);
+ 
+ 		void gen_src();
+ 		void groupby();
+diff --git a/ibfs.cu b/ibfs.cu
+index 775d1e1a4b9514df8c343e3cec88f19b3c44027c..f529135e5c1c562bcc312db0ca7b88d4162625c6 100644
+--- a/ibfs.cu
++++ b/ibfs.cu
+@@ -55,17 +55,39 @@ int ibfs(int world_sz, int my_id, int gpu_id, int args, char *argv[]) {
+ 	//typedef 	unsigned char 	depth_t;
+ 	//typedef 	uint4 comp_t;
+ 	
+-	std::cout<<"Input: /path/to/exe /path/to/beg "
+-				<<"/path/to/csr concurrent-count " 
+-				<<"switch-level bfs_count\n";
+-	if(args != 6){std::cout<<"Wrong input\n";exit(-1);}
+-	
+-	const char *beg_file=argv[1];
+-	const char *csr_file=argv[2];
+-	const int concurrent_count=atoi(argv[3]);
+-	const depth_t sw_level=atoi(argv[4]);
+-	const index_t src_count=atoi(argv[5]);
+-	graph_reader *g=new graph_reader(beg_file, csr_file, src_count);
++	std::cout<<"Input CSR: /path/to/exe /path/to/beg "
++				<<"/path/to/csr concurrent-count "
++				<<"switch-level bfs_count\n"
++				<<"Input GR:  /path/to/exe /path/to/graph.gr "
++				<<"concurrent-count switch-level bfs_count\n";
++	if(args != 5 && args != 6){std::cout<<"Wrong input\n";exit(-1);}
++
++	graph_reader *g=NULL;
++	int concurrent_count=0;
++	depth_t sw_level=0;
++	index_t src_count=0;
++	if(args == 5)
++	{
++		const char *gr_file=argv[1];
++		concurrent_count=atoi(argv[2]);
++		sw_level=atoi(argv[3]);
++		src_count=atoi(argv[4]);
++		g=new graph_reader(gr_file, src_count);
++	}
++	else
++	{
++		const char *beg_file=argv[1];
++		const char *csr_file=argv[2];
++		concurrent_count=atoi(argv[3]);
++		sw_level=atoi(argv[4]);
++		src_count=atoi(argv[5]);
++		g=new graph_reader(beg_file, csr_file, src_count);
++	}
++	if(concurrent_count<=0 || src_count<=0)
++	{
++		std::cout<<"concurrent-count and bfs_count must be positive\n";
++		exit(-1);
++	}
+ 
+ 	cudaSetDeviceFlags(cudaDeviceMapHost);
+ 	const index_t sml_shed 	= 32; 
+diff --git a/run_bench.sh b/run_bench.sh
+new file mode 100644
+index 0000000000000000000000000000000000000000..dbc39f024d8687be5226f69504e7105b6de567ba
+--- /dev/null
++++ b/run_bench.sh
+@@ -0,0 +1,47 @@
++#!/bin/bash
++# iBFS benchmark script
++# Usage: bash run_bench.sh > bench_results.log 2>&1
++cd "$(dirname "$0")"
++
++run_test() {
++    local DATASET=$1
++    local BEG=$2
++    local CSR=$3
++    local CONC=$4
++    local LABEL="${DATASET}_c${CONC}"
++    echo "===== ${LABEL} ====="
++    timeout 600 mpirun --allow-run-as-root -np 1 ./gpu-ibfs "$BEG" "$CSR" "$CONC" 8 "$CONC" 2>&1
++    echo ""
++}
++
++# cit-Patents: 3.8M verts, 33M edges
++CIT_BEG="/home/zyl/data/csr_data/cit-Patents/cit-Patents_beg_pos.bin"
++CIT_CSR="/home/zyl/data/csr_data/cit-Patents/cit-Patents_csr.bin"
++
++# soc-orkut: 3.0M verts, 213M edges
++ORK_BEG="/home/zyl/data/csr_data/soc-orkut/soc-orkut_beg_pos.bin"
++ORK_CSR="/home/zyl/data/csr_data/soc-orkut/soc-orkut_csr.bin"
++
++# soc-sinaweibo_rabbit: 58.7M verts, 523M edges
++SW_BEG="/home/zyl/data/csr_data/soc-sinaweibo_rabbit/soc-sinaweibo_rabbit_beg_pos.bin"
++SW_CSR="/home/zyl/data/csr_data/soc-sinaweibo_rabbit/soc-sinaweibo_rabbit_csr.bin"
++
++# soc-twitter: 21.3M verts, 530M edges
++TW_BEG="/home/zyl/data/csr_data/soc-twitter/soc-twitter_beg_pos.bin"
++TW_CSR="/home/zyl/data/csr_data/soc-twitter/soc-twitter_csr.bin"
++
++for C in 2 4 8 16 32 64; do
++    run_test cit-Patents "$CIT_BEG" "$CIT_CSR" "$C"
++done
++
++for C in 2 4 8 16 32 64; do
++    run_test soc-orkut "$ORK_BEG" "$ORK_CSR" "$C"
++done
++
++for C in 2 4 8 16 32 64; do
++    run_test soc-sinaweibo "$SW_BEG" "$SW_CSR" "$C"
++done
++
++for C in 2 4 8 16 32 64; do
++    run_test soc-twitter "$TW_BEG" "$TW_CSR" "$C"
++done

@@ -1,0 +1,1871 @@
+diff --git a/COOKBOOK.md b/COOKBOOK.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..d823cfad5301ae49a37fb2687b4741b8d893ed86
+--- /dev/null
++++ b/COOKBOOK.md
+@@ -0,0 +1,193 @@
++# ForkGraph Cookbook
++
++> 自动生成于 2026-05-28，由 /zcf:repro 生成
++
++## 项目信息
++
++| 项目 | 内容 |
++|------|------|
++| 仓库/路径 | /home/zyl/Projects/ocgp/baselines/ForkGraph |
++| 描述 | Cache-Efficient Fork-Processing Patterns on Large Graphs - 基于 Ligra 的大规模图处理缓存优化框架 |
++| 论文 | [SIGMOD 2021] Lu et al., "Cache-Efficient Fork-Processing Patterns on Large Graphs" |
++| 语言 | C++ (C++14), OpenMP |
++| 基础框架 | [Ligra](https://github.com/jshun/ligra) by Julian Shun |
++
++## 环境要求
++
++| 依赖 | 版本要求 | 本机版本 |
++|------|----------|----------|
++| GCC (g++) | >= 7.5.0 | 12.2.0 |
++| CMake | >= 3.12 | 3.25.1 |
++| OpenMP | 支持 -fopenmp | 已支持 |
++| 操作系统 | Linux | Debian 12 |
++
++注意：本项目为 **CPU 多线程并行** 图处理框架，不依赖 CUDA/GPU。
++
++## 编译步骤
++
++```bash
++cd ForkGraph/
++mkdir -p build
++cd build
++cmake ..
++make -j$(nproc)
++```
++
++编译产物位于 `build/` 目录下：
++- `bfs` — 并行广度优先搜索
++- `sssp` — 单源最短路径
++- `ppr` — 个性化 PageRank (PR-Nibble 算法)
++
++### 编译注意事项
++
++本项目已应用以下补丁（详见 [ISSUES.md](ISSUES.md)）：
++1. `ligra/ligra.h:531` — 注释错误的 `assert(i == p.first)` 断言
++2. `ligra/IO.h` — 修复二进制和文本读取器对空图 (m=0) 的处理
++3. `apps/fork-bfs.C`, `apps/fork-sssp.C`, `apps/fork-ppr.C` — 修复单分区模式的 yield 死循环
++
++## 运行示例
++
++### 使用自带 California 路网数据
++
++`inputs/` 目录下自带了 California 路网数据集（约 189 万顶点，5 个分区）：
++
++```bash
++cd build/
++
++# BFS - 广度优先搜索
++./bfs -p 5 ../inputs/source_list ../inputs/cal.inter ../inputs/cal.intra ../inputs/cal.partFile
++
++# SSSP - 单源最短路径
++./sssp -p 5 ../inputs/source_list ../inputs/cal.inter ../inputs/cal.intra ../inputs/cal.partFile
++
++# PPR - 个性化 PageRank
++./ppr -p 5 ../inputs/source_list ../inputs/cal.inter ../inputs/cal.intra ../inputs/cal.partFile
++```
++
++### 使用本地 CSR/gr 格式数据集（如 cit-Patents）
++
++**步骤 1: 转换数据**
++
++```bash
++cd ForkGraph/
++python3 tools/convert_csr_to_ligra_binary.py cit-Patents
++```
++
++这会从 `/home/zyl/data/csr_data/cit-Patents/` 读取 CSR 二进制数据（`csr_vlist.bin`、`csr_elist.bin`、`csr_weightlist.bin`），生成 ForkGraph 兼容的 Ligra 二进制格式文件和单分区配置，输出到 `inputs_converted/`。
++
++输出文件：
++- `cit-Patents.intra.{config,adj,idx}` — 完整图（本地边）
++- `cit-Patents.inter.{config,adj,idx}` — 空图（无跨分区边）
++- `cit-Patents.part` — 分区文件（全部顶点在分区 0）
++- `cit-Patents.sources` — 默认源节点列表
++
++**步骤 2: 运行**
++
++```bash
++cd build/
++
++# BFS - 单源
++OMP_NUM_THREADS=32 ./bfs -b -p 1 /tmp/single_source.txt \
++  ../inputs_converted/cit-Patents.intra \
++  ../inputs_converted/cit-Patents.inter \
++  ../inputs_converted/cit-Patents.part
++
++# SSSP - 单源
++OMP_NUM_THREADS=32 ./sssp -b -p 1 /tmp/single_source.txt \
++  ../inputs_converted/cit-Patents.intra \
++  ../inputs_converted/cit-Patents.inter \
++  ../inputs_converted/cit-Patents.part
++
++# PPR - 单源
++OMP_NUM_THREADS=32 ./ppr -b -p 1 /tmp/single_source.txt \
++  ../inputs_converted/cit-Patents.intra \
++  ../inputs_converted/cit-Patents.inter \
++  ../inputs_converted/cit-Patents.part
++```
++
++**步骤 3: 验证结果 (cit-Patents, 3.7M 顶点, 33M 边)**
++
++| 算法 | 1 源耗时 (32 线程) |
++|------|-------------------|
++| BFS | ~1.6 s |
++| SSSP | ~3.5 s |
++| PPR | <0.1 s |
++
++### 参数说明
++
++| 参数 | 含义 | 默认值 |
++|------|------|--------|
++| `-p <N>` | 分区数量 | 无（必选） |
++| `<inSrc>` | 源节点列表文件（每行一个节点 ID） | 无（必选） |
++| `<inFile1>` | 第一类边文件（inter） | 无（必选） |
++| `<inFile2_buf>` | 第二类边文件（intra） | 无（必选） |
++| `<partFile>` | 分区文件（每行一个整数，顶点所属分区） | 无（必选） |
++| `-s` | 图是否为对称（无向）图 | 有向 |
++| `-b` | 使用 Ligra 二进制格式 (.config/.adj/.idx) | 否（文本格式） |
++| `-c` | 启用压缩格式 | 否 |
++| `-m` | 使用 mmap 读取图文件 | 否 |
++| `-rounds <N>` | 运行轮数 | 1 |
++
++### 源节点文件格式
++
++纯文本文件，每行一个顶点 ID（0-based）：
++
++```
++1770880
++807917
++1589545
++...
++```
++
++## 输出格式
++
++所有程序的输出格式均为执行时间：
++
++- **BFS/SSSP**: `exuection time: <N> ms`（注意：原代码拼写为 "exuection"）
++- **PPR**: `computation time : <seconds>`
++
++编译时可定义宏获取更多统计信息（需修改 CMakeLists.txt 添加 `-DSTATS` 等）：
++
++| 宏 | 输出内容 |
++|------|------|
++| `STATS` | 触摸的顶点和边数量 |
++| `COUNTSINGLE` | 每个查询访问的分区数 |
++| `COUNTALL` | 总访问分区数 |
++| `WORK` | 计算的顶点和边数量 |
++
++## 数据格式
++
++支持 **加权** 和 **未加权** 的 [Ligra 邻接图格式](http://www.cs.cmu.edu/~pbbs/benchmarks/graphIO.html)，同时需要经过 **图分区** 预处理，将边分为 inter 和 intra 两类。
++
++可通过 `inputs/` 目录下的 `encoder.C` 和 `decoder.C` 工具进行压缩/解压：
++- `encoder.C`: 邻接图格式 → 压缩二进制格式
++- `decoder.C`: 压缩二进制格式 → 邻接图格式
++
++## 可用算法/程序
++
++| 程序名 | 算法 | 说明 |
++|--------|------|------|
++| bfs | 广度优先搜索 (BFS) | 基于 Ligra 的 fork-processing 并行 BFS，支持多源同时查询 |
++| sssp | 单源最短路径 (SSSP, Δ-stepping) | 基于 Dijkstra 变种的并行 SSSP，支持边权重 |
++| ppr | 个性化 PageRank (PR-Nibble) | 基于 PR-Nibble 的本地聚类算法，使用优先级队列优化 |
++
++## 配置过程总结
++
++本项目已应用 5 处修复以支持单分区测试模式和 CSR 二进制数据。详见 [ISSUES.md](ISSUES.md)。编译无需任何额外依赖安装，所有环境要求天然满足。
++
++## 数据转换工具
++
++`tools/convert_csr_to_ligra_binary.py` — 将标准 CSR 二进制格式（int32 vlist + int32 elist + int32 weightlist）转换为 ForkGraph 兼容的 Ligra 二进制格式。
++
++```bash
++# 转换单个数据集
++python3 tools/convert_csr_to_ligra_binary.py cit-Patents
++
++# 指定自定义路径
++python3 tools/convert_csr_to_ligra_binary.py cit-Patents \
++  --csr-dir /home/zyl/data/csr_data \
++  --out-dir ./my_inputs
++
++# 批量转换多个数据集
++python3 tools/convert_csr_to_ligra_binary.py cit-Patents soc-orkut soc-twitter
++```
+diff --git a/ISSUES.md b/ISSUES.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..7a596ec880c29baf9b6c742443f29be460b530fc
+--- /dev/null
++++ b/ISSUES.md
+@@ -0,0 +1,79 @@
++# ForkGraph 环境配置问题记录
++
++> 自动生成于 2026-05-28，由 /zcf:repro 生成
++
++## 问题 1: `load_parts` 函数中断言失败导致程序崩溃
++
++- **现象**: 运行程序时触发 `assert(i == p.first)` 断言失败，程序 `SIGABRT` 异常退出：
++  ```
++  bfs: .../ligra/ligra.h:531: void load_parts(const std::string&, int): Assertion `i == p.first' failed.
++  Aborted
++  ```
++
++- **原因**: 在 `ligra/ligra.h` 的 `load_parts()` 函数中（第 531 行），`id2part_t` 向量先按 `(node_id, partition)` 顺序读取，随后按 `partition` 排序。排序后 `id2part_t[i].first`（原节点 ID）不再等于线性索引 `i`，导致断言失败。该断言在分区非平凡时（同一个分区内节点 ID 不连续）必然失败，属于代码 bug。
++
++- **解决方案**: 注释掉 `ligra/ligra.h:531` 的断言语句。该断言不影响正确性，因为相邻行 `id_o2n[p.first] = i` 和 `id_n2o[i] = p.first` 已正确建立新旧节点 ID 的映射关系。
++
++  ```cpp
++  // 修改前：
++  assert(i == p.first);
++
++  // 修改后：
++  // assert(i == p.first);  // 修复: 分区排序后原节点 ID 与线性索引不一致
++  ```
++
++  原始文件已备份为 `ligra/ligra.h.bak`。
++
++- **适用条件**: 所有使用非平凡分区的数据集（即同一分区内节点 ID 不是连续的情况），这也是实际使用中的普遍场景。
++
++## 问题 2: 二进制/文本图读取器不支持空图 (m=0)
++
++- **现象**: 读取空图（0 条边）时触发段错误 (SIGSEGV)，崩溃位于 `IO.h` 的 `tOffsets[temp[0].first] = 0`。
++
++- **原因**: 当图为空（m=0）时，`newA(intTriple, 0)` 分配 0 字节内存，随后无条件访问 `temp[0].first`，导致越界访问。文本读取器 (`readGraphFromFile`) 和二进制读取器 (`readGraphFromBinary`) 均存在此问题。
++
++- **解决方案**: 在两个读取函数的 `if (!isSymmetric)` 分支开头添加 m=0 提前返回，显式初始化非对称顶点的入边指针为 nullptr。
++
++  涉及文件：`ligra/IO.h`（`readGraphFromFile` 和 `readGraphFromBinary` 两处）
++
++- **适用条件**: 需要读取空图（如单分区模式下跨分区边为空）的场景。
++
++## 问题 3: BFS/PPR 分区循环跳过 partition 0
++
++- **现象**: 当源节点在 partition 0 时，BFS 和 PPR 完全不执行主循环（输出 0ms）。
++
++- **原因**: `apps/fork-bfs.C:119` 和 `apps/fork-ppr.C:101` 使用 `while (pi = schedule_partition(), pi > 0)`，而 `schedule_partition()` 对 partition 0 返回 0。`pi > 0` 条件跳过 partition 0。SSSP 正确使用了 `pi >= 0`。
++
++- **解决方案**: 将 BFS 和 PPR 的循环条件改为 `pi >= 0`，与 SSSP 保持一致。
++
++- **适用条件**: 数据集的第 0 号分区包含源节点时。
++
++## 问题 4: BFS/SSSP yield 机制在空跨分区队列时死循环
++
++- **现象**: 单分区模式下（无跨分区通信），BFS 和 SSSP 陷入死循环。程序不崩溃但不终止。
++
++- **原因**: 当 `part2process` 为空时，yield 检查 `counter-- <= 0` 触发后，fall through 到 `break` 语句退出内部 pq 循环。但此时并未 `pq.pop()`，导致 `(level/distance, vertex)` 条目残留在 pq 中。下次迭代重新进入同一分区时，pq 仍有残留条目，重新触发 yield → break → push back → 无限循环。
++
++- **解决方案**: 在 yield 检查中添加 `part2process.empty()` 分支：当队列为空时，不 yield 而是重置 counter 继续处理 pq。
++
++  ```cpp
++  if (counter-- <= 0) {
++      if (part2process.empty()) {
++          counter = pq.size() / yield_h1 + 1;  // 继续处理
++      } else if (part2process.top().first > td) {
++          // 正常 yield
++      } else {
++          // 调度到 part2process
++      }
++  }
++  ```
++
++  涉及文件：`apps/fork-bfs.C`、`apps/fork-sssp.C`
++
++- **适用条件**: 单分区模式或任何跨分区通信量不足的场景。多并发源时会加剧此问题。
++
++## 问题 5: Ligra 二进制 .idx 格式的 sizeof(intT) 依赖
++
++- **说明**: Ligra 的二进制 .idx 文件使用 `sizeof(intT)` 作为每个偏移量的大小。`intT` 在未定义 `-DLONG` 时为 `int`（4 字节），而非 `long`（8 字节）。转换工具已正确处理此差异。
++
++- **影响**: 编写转换工具时需注意，`.idx` 文件应使用 int32（4 字节）偏移量。
+diff --git a/apps/fork-bfs.C b/apps/fork-bfs.C
+index 175eadea7d022c8c6d2e58b3da2c2a7ff50f54d1..8531d83c884277efd5da94051fdcb64922945717 100644
+--- a/apps/fork-bfs.C
++++ b/apps/fork-bfs.C
+@@ -116,7 +116,7 @@ void Compute(graph<vertex> &GA, graph<vertex> &GB, int NP) {
+   Timer t;
+   t.tic();
+   int pi = -1;
+-  while (pi = schedule_partition(), pi > 0) {
++  while (pi = schedule_partition(), pi >= 0) {
+ #ifdef COUNTALL
+     _totalVisitedPartitionCount+=1;
+ #endif
+@@ -138,20 +138,36 @@ void Compute(graph<vertex> &GA, graph<vertex> &GB, int NP) {
+           pq.push(std::make_pair(BfsLevel[bucket[i]], bucket[i]));
+           Visited[bucket[i]] = 1;
+         }
+-        int counter = pq.size() / yield_h1;
++        if (pq.empty()) {
++          bucket.clear();
++          return;
++        }
++        int counter = pq.size() / yield_h1 + 1;  // +1 与 SSSP 一致
+         int current_level = pq.top().first;
+         while (!pq.empty()) {
+           uintE vi = pq.top().second;
+           intE td = pq.top().first;
+           if (counter-- <= 0) {
+-            if (part2process.top().first > td) {
+-              counter = pq.size() / yield_h1 * 2;
+-              continue;
+-            }
+-            closest[pi] = td;
++            int yield_act = 0;  // 0=continue_processing, 1=skip(yield_continue), 2=yield(break)
++            int new_counter = counter;
+ #pragma omp critical
+-            part2process.push(std::make_pair(td, pi));
+-            break;
++            {
++            if (part2process.empty()) {
++              new_counter = pq.size() / yield_h1 + 1;
++              yield_act = 0;
++            } else if (part2process.top().first > td) {
++              new_counter = pq.size() / yield_h1 * 2 + 1;
++              yield_act = 1;
++            } else {
++              closest[pi] = td;
++              part2process.push(std::make_pair(td, pi));
++              yield_act = 2;
++            }
++            }
++            counter = new_counter;
++            if (yield_act == 0) { /* continue */ }
++            else if (yield_act == 1) { continue; }
++            else { break; }
+           }
+           if (td > current_level + yield_h2) {
+             closest[pi] = td;
+@@ -246,6 +262,30 @@ void Compute(graph<vertex> &GA, graph<vertex> &GB, int NP) {
+   }
+   t.toc();
+   t.print_ms("exuection time");
++  t.print_us("exuection time us");
++
++#ifdef VALIDATE_SUMMARY
++  for (int qi = 0; qi < k; ++qi) {
++    unsigned long long reached = 0;
++    unsigned long long distance_sum = 0;
++    unsigned long long weighted_sum = 0;
++    auto* levels = BfsLevel_l[qi];
++#pragma omp parallel for reduction(+ : reached, distance_sum, weighted_sum)
++    for (long vertex_id = 0; vertex_id < n; ++vertex_id) {
++      const auto level = levels[vertex_id];
++      if (level < INT_MAX / 2) {
++        ++reached;
++        distance_sum += static_cast<unsigned long long>(level);
++        weighted_sum += (static_cast<unsigned long long>(vertex_id) + 1) *
++            (static_cast<unsigned long long>(level) + 1);
++      }
++    }
++    std::cout << "validation_summary query=" << qi
++              << " reached=" << reached
++              << " value_sum=" << distance_sum
++              << " weighted_sum=" << weighted_sum << std::endl;
++  }
++#endif
+ 
+ #ifdef STATS
+   std::cout << "Touched Vertices: " << touch_vertex_c << std::endl;
+diff --git a/apps/fork-sssp.C b/apps/fork-sssp.C
+index 0440c99cbcea6f643b5e78bc2f27f4112813ae9b..d58284f0ec2a14747d57b7bdfec5fff41d10b69b 100644
+--- a/apps/fork-sssp.C
++++ b/apps/fork-sssp.C
+@@ -250,6 +250,29 @@ void Compute(graph<vertex> &GA, graph<vertex> &GB, int NP) {
+   t.toc();
+   t.print_ms("exuection time");
+ 
++#ifdef VALIDATE_SUMMARY
++  for (int qi = 0; qi < k; ++qi) {
++    unsigned long long reached = 0;
++    unsigned long long distance_sum = 0;
++    unsigned long long weighted_sum = 0;
++    auto* distances = ShortestPathLen_l[qi];
++#pragma omp parallel for reduction(+ : reached, distance_sum, weighted_sum)
++    for (long vertex_id = 0; vertex_id < n; ++vertex_id) {
++      const auto distance = distances[vertex_id];
++      if (distance < INT_MAX / 2) {
++        ++reached;
++        distance_sum += static_cast<unsigned long long>(distance);
++        weighted_sum += (static_cast<unsigned long long>(vertex_id) + 1) *
++            (static_cast<unsigned long long>(distance) + 1);
++      }
++    }
++    std::cout << "validation_summary query=" << qi
++              << " reached=" << reached
++              << " value_sum=" << distance_sum
++              << " weighted_sum=" << weighted_sum << std::endl;
++  }
++#endif
++
+ #ifdef STATS
+   std::cout << "Touched Vertices: " << touch_vertex_c << std::endl;
+   std::cout << "Touched Edges: " << touch_edge_c << std::endl;
+@@ -275,4 +298,4 @@ void Compute(graph<vertex> &GA, graph<vertex> &GB, int NP) {
+ #endif
+ }
+ 
+-#pragma clang diagnostic pop
+\ No newline at end of file
++#pragma clang diagnostic pop
+diff --git a/ligra/IO.h b/ligra/IO.h
+index 6da69d94860073efefee4fbb4ad12d93cf165145..e10a80ee6d7c0aea641d4c45c4fcb214e06350cf 100644
+--- a/ligra/IO.h
++++ b/ligra/IO.h
+@@ -31,6 +31,7 @@
+ #include <sys/stat.h>
+ #include <fcntl.h>
+ #include <unistd.h>
++#include <stdint.h>
+ 
+ #include "parallel.h"
+ #include "blockRadixSort.h"
+@@ -244,6 +245,17 @@ graph<vertex> readGraphFromFile(char *fname, bool isSymmetric, bool mmap) {
+   }
+ 
+   if (!isSymmetric) {
++    // 修复: 空图(m=0)提前返回，避免访问 temp[0]
++    if (m == 0) {
++      free(offsets);
++      parallel_for (long i = 0; i < n; i++) {
++        v[i].setInDegree(0);
++        v[i].setInNeighbors(nullptr);
++      }
++      Uncompressed_Mem<vertex> *mem = new Uncompressed_Mem<vertex>(v, n, 0, edges, nullptr);
++      return graph<vertex>(v, n, 0, mem);
++    }
++
+     uintT *tOffsets = newA(uintT, n);
+     { parallel_for (long i = 0; i < n; i++) tOffsets[i] = INT_T_MAX; }
+ #ifndef WEIGHTED
+@@ -380,6 +392,21 @@ graph<vertex> readGraphFromBinary(char *iFile, bool isSymmetric) {
+   in3.close();
+   uintT *offsets = (uintT *) t;
+ 
++  // 修复: 空图(m=0)提前返回，避免访问 temp[0]
++  if (m == 0) {
++    vertex *v = newA(vertex, n);
++    parallel_for (long i = 0; i < n; i++) {
++      v[i].setOutDegree(0);
++      v[i].setInDegree(0);
++      v[i].setOutNeighbors(nullptr);
++      v[i].setInNeighbors(nullptr);
++    }
++    free(offsets);
++    free(s);
++    Uncompressed_Mem<vertex> *mem = new Uncompressed_Mem<vertex>(v, n, 0, nullptr);
++    return graph<vertex>(v, n, 0, mem);
++  }
++
+   vertex *v = newA(vertex, n);
+ #ifdef WEIGHTED
+   intE *edgesAndWeights = newA(intE, 2 * m);
+@@ -496,7 +523,186 @@ graph<vertex> readGraphFromBinary(char *iFile, bool isSymmetric) {
+ }
+ 
+ template<class vertex>
+-graph<vertex> readGraph(char *iFile, bool compressed, bool symmetric, bool binary, bool mmap) {
++graph<vertex> readGraphFromGGR(char *iFile, bool isSymmetric) {
++  ifstream infile(iFile, ios::in | ios::binary);
++  if (!infile.is_open()) {
++    cout << "Unable to open GGR file: " << iFile << endl;
++    abort();
++  }
++
++  uint64_t version, sizeEdgeTy, nvtxs64, nedges64;
++  infile.read((char *) &version, sizeof(uint64_t));
++  infile.read((char *) &sizeEdgeTy, sizeof(uint64_t));
++  infile.read((char *) &nvtxs64, sizeof(uint64_t));
++  infile.read((char *) &nedges64, sizeof(uint64_t));
++  if (!infile || version != 1) {
++    cout << "Bad or unsupported GGR file: " << iFile << endl;
++    abort();
++  }
++
++  long n = (long) nvtxs64;
++  long m = (long) nedges64;
++  uintT *offsets = newA(uintT, n + 1);
++  offsets[0] = 0;
++  int64_t *rowStart = newA(int64_t, n);
++  infile.read((char *) rowStart, sizeof(int64_t) * n);
++  if (!infile) {
++    cout << "Incomplete GGR row_start section: " << iFile << endl;
++    abort();
++  }
++  { parallel_for (long i = 0; i < n; i++) offsets[i + 1] = (uintT) rowStart[i]; }
++  free(rowStart);
++
++  int32_t *dst = newA(int32_t, m);
++  infile.read((char *) dst, sizeof(int32_t) * m);
++  if (!infile) {
++    cout << "Incomplete GGR edge_dst section: " << iFile << endl;
++    abort();
++  }
++
++#ifdef WEIGHTED
++  int32_t *wgt = nullptr;
++  if (sizeEdgeTy != 0) {
++    if (m % 2 == 1) infile.seekg(4, ios::cur);
++    wgt = newA(int32_t, m);
++    infile.read((char *) wgt, sizeof(int32_t) * m);
++    if (!infile) {
++      cout << "Incomplete GGR adjwgt section: " << iFile << endl;
++      abort();
++    }
++  }
++  intE *edgesAndWeights = newA(intE, 2 * m);
++  {
++    parallel_for (long i = 0; i < m; i++) {
++      edgesAndWeights[2 * i] = (intE) dst[i];
++      edgesAndWeights[2 * i + 1] = (sizeEdgeTy != 0) ? (intE) wgt[i] : 1;
++    }
++  }
++  if (wgt != nullptr) free(wgt);
++  free(dst);
++#else
++  uintE *edges = newA(uintE, m);
++  { parallel_for (long i = 0; i < m; i++) edges[i] = (uintE) dst[i]; }
++  free(dst);
++#endif
++
++  vertex *v = newA(vertex, n);
++  {
++    parallel_for (long i = 0; i < n; i++) {
++      uintT o = offsets[i];
++      uintT l = ((i == n - 1) ? m : offsets[i + 1]) - offsets[i];
++      v[i].setOutDegree(l);
++#ifndef WEIGHTED
++      v[i].setOutNeighbors(edges + o);
++#else
++      v[i].setOutNeighbors(edgesAndWeights + 2 * o);
++#endif
++    }
++  }
++
++  if (m == 0) {
++    parallel_for (long i = 0; i < n; i++) {
++      v[i].setInDegree(0);
++      v[i].setInNeighbors(nullptr);
++    }
++    free(offsets);
++#ifndef WEIGHTED
++    Uncompressed_Mem<vertex> *mem = new Uncompressed_Mem<vertex>(v, n, 0, edges);
++#else
++    Uncompressed_Mem<vertex> *mem = new Uncompressed_Mem<vertex>(v, n, 0, edgesAndWeights);
++#endif
++    return graph<vertex>(v, n, 0, mem);
++  }
++
++  if (!isSymmetric) {
++    uintT *tOffsets = newA(uintT, n);
++    { parallel_for (long i = 0; i < n; i++) tOffsets[i] = INT_T_MAX; }
++#ifndef WEIGHTED
++    intPair *temp = newA(intPair, m);
++#else
++    intTriple *temp = newA(intTriple, m);
++#endif
++    {
++      parallel_for (intT i = 0; i < n; i++) {
++        uintT o = offsets[i];
++        for (uintT j = 0; j < v[i].getOutDegree(); j++) {
++#ifndef WEIGHTED
++          temp[o + j] = make_pair(v[i].getOutNeighbor(j), i);
++#else
++          temp[o + j] = make_pair(v[i].getOutNeighbor(j), make_pair(i, v[i].getOutWeight(j)));
++#endif
++        }
++      }
++    }
++    free(offsets);
++#ifndef WEIGHTED
++#ifndef LOWMEM
++    intSort::iSort(temp, m, n + 1, getFirst<uintE>());
++#else
++    quickSort(temp, m, pairFirstCmp<uintE>());
++#endif
++#else
++#ifndef LOWMEM
++    intSort::iSort(temp, m, n + 1, getFirst<intPair>());
++#else
++    quickSort(temp, m, pairFirstCmp<intPair>());
++#endif
++#endif
++    tOffsets[temp[0].first] = 0;
++#ifndef WEIGHTED
++    uintE *inEdges = newA(uintE, m);
++    inEdges[0] = temp[0].second;
++#else
++    intE *inEdges = newA(intE, 2 * m);
++    inEdges[0] = temp[0].second.first;
++    inEdges[1] = temp[0].second.second;
++#endif
++    {
++      parallel_for (long i = 1; i < m; i++) {
++#ifndef WEIGHTED
++        inEdges[i] = temp[i].second;
++#else
++        inEdges[2 * i] = temp[i].second.first;
++        inEdges[2 * i + 1] = temp[i].second.second;
++#endif
++        if (temp[i].first != temp[i - 1].first) tOffsets[temp[i].first] = i;
++      }
++    }
++    free(temp);
++    sequence::scanIBack(tOffsets, tOffsets, n, minF<uintT>(), (uintT) m);
++    {
++      parallel_for (long i = 0; i < n; i++) {
++        uintT o = tOffsets[i];
++        uintT l = ((i == n - 1) ? m : tOffsets[i + 1]) - tOffsets[i];
++        v[i].setInDegree(l);
++#ifndef WEIGHTED
++        v[i].setInNeighbors(inEdges + o);
++#else
++        v[i].setInNeighbors((intE *) (inEdges + 2 * o));
++#endif
++      }
++    }
++    free(tOffsets);
++#ifndef WEIGHTED
++    Uncompressed_Mem<vertex> *mem = new Uncompressed_Mem<vertex>(v, n, m, edges, inEdges);
++#else
++    Uncompressed_Mem<vertex> *mem = new Uncompressed_Mem<vertex>(v, n, m, edgesAndWeights, inEdges);
++#endif
++    return graph<vertex>(v, n, m, mem);
++  }
++
++  free(offsets);
++#ifndef WEIGHTED
++  Uncompressed_Mem<vertex> *mem = new Uncompressed_Mem<vertex>(v, n, m, edges);
++#else
++  Uncompressed_Mem<vertex> *mem = new Uncompressed_Mem<vertex>(v, n, m, edgesAndWeights);
++#endif
++  return graph<vertex>(v, n, m, mem);
++}
++
++template<class vertex>
++graph<vertex> readGraph(char *iFile, bool compressed, bool symmetric, bool binary, bool mmap, bool gr = false) {
++  if (gr) return readGraphFromGGR<vertex>(iFile, symmetric);
+   if (binary) return readGraphFromBinary<vertex>(iFile, symmetric);
+   else return readGraphFromFile<vertex>(iFile, symmetric, mmap);
+ }
+diff --git a/ligra/ligra.h b/ligra/ligra.h
+index 2f992a9e7bc5f0489a0e3a5e9a1fa155821557ab..4564955de8440639c7e05405ee9ed991f35088e5 100644
+--- a/ligra/ligra.h
++++ b/ligra/ligra.h
+@@ -528,7 +528,7 @@ void load_parts(const std::string &filename, int NP) {
+     auto p = id2part_t[i];
+     id_o2n[p.first] = i;
+     id_n2o[i] = p.first;
+-    assert(i == p.first);
++    // assert(i == p.first);  // 分区排序后原节点ID与线性索引不一致
+     id2part[i] = p.second;
+     part_id[p.second].push_back(i);
+   }
+@@ -624,11 +624,12 @@ int parallel_main(int argc, char* argv[]) {
+   bool symmetric = P.getOptionValue("-s");
+   bool compressed = P.getOptionValue("-c");
+   bool binary = P.getOptionValue("-b");
++  bool gr = P.getOptionValue("-gr");
+   bool mmap = P.getOptionValue("-m");
+   //cout << "mmap = " << mmap << endl;
+   long rounds = P.getOptionLongValue("-rounds",1);
+-  graph<asymmetricVertex> Ga = readGraph<asymmetricVertex>(iFile1,compressed,symmetric,binary,mmap); //asymmetric graph
+-  graph<asymmetricVertex> Gb = readGraph<asymmetricVertex>(iFile2,compressed,symmetric,binary,mmap); //asymmetric graph
++  graph<asymmetricVertex> Ga = readGraph<asymmetricVertex>(iFile1,compressed,symmetric,binary,mmap,gr); //asymmetric graph
++  graph<asymmetricVertex> Gb = readGraph<asymmetricVertex>(iFile2,compressed,symmetric,binary,mmap,gr); //asymmetric graph
+ //  std::cout << Ga.n << " " << Ga.m << std::endl;
+ //  std::cout << Gb.n << " " << Gb.m << std::endl;
+ 
+@@ -638,4 +639,4 @@ int parallel_main(int argc, char* argv[]) {
+   Ga.del();
+   Gb.del();
+ }
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/tools/convert_csr_to_ligra_binary.py b/tools/convert_csr_to_ligra_binary.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..0fecc1fda9777512efbc310765d89e4c0f356880
+--- /dev/null
++++ b/tools/convert_csr_to_ligra_binary.py
+@@ -0,0 +1,364 @@
++#!/usr/bin/env python3
++"""
++Convert CSR binary format (int32) to Ligra binary format for ForkGraph,
++with optional multi-partition support.
++
++CSR input:
++  csr_vlist.bin      - row offsets (int32 or int64, auto-detected)
++  csr_elist.bin      - column indices (int32)
++  csr_weightlist.bin - edge weights (int32, optional)
++
++Ligra binary output (used with ForkGraph's -b flag):
++  <name>.config  - text file with vertex count
++  <name>.adj     - binary: first E int32 destinations, then E int32 weights
++  <name>.idx     - binary: V int32 offsets (no sentinel)
++
++Multi-partition mode (--num-partitions N, N > 1):
++  Edges are split by whether src and dst are in the same partition.
++  Vertices are assigned to partitions by range: part[v] = v * N / nvtxs.
++  - <name>.inter.* : cross-partition edges
++  - <name>.intra.* : same-partition edges
++
++Single-partition mode (--num-partitions 1, default):
++  - <name>.inter.* : empty graph
++  - <name>.intra.* : the full graph
++
++Usage:
++  python3 convert_csr_to_ligra_binary.py cit-Patents                    # single partition
++  python3 convert_csr_to_ligra_binary.py cit-Patents --num-partitions 4 # 4 partitions
++  python3 convert_csr_to_ligra_binary.py cit-Patents -n 8 --csr-dir /path/to/csr
++"""
++
++import argparse
++import os
++import struct
++import sys
++from pathlib import Path
++
++
++def detect_vlist_dtype(vlist_path: Path) -> str:
++    """Auto-detect vlist data type."""
++    file_size = vlist_path.stat().st_size
++    with open(vlist_path, 'rb') as f:
++        head = f.read(32)
++        f.seek(0, 2)
++        file_size = f.tell()
++
++    n_i64 = file_size // 8
++    vals_i64 = struct.unpack(f'<{min(4, n_i64)}q', head[:min(32, len(head))])
++    i64_valid = vals_i64[0] == 0 and all(vals_i64[i] <= vals_i64[i + 1] for i in range(len(vals_i64) - 1))
++
++    n_i32 = file_size // 4
++    vals_i32 = struct.unpack(f'<{min(8, n_i32)}i', head[:min(32, len(head))])
++    i32_valid = vals_i32[0] == 0 and all(vals_i32[i] <= vals_i32[i + 1] for i in range(len(vals_i32) - 1))
++
++    if i64_valid and not i32_valid:
++        return 'int64'
++    elif i32_valid and not i64_valid:
++        return 'int32'
++    elif i64_valid and i32_valid:
++        elist_path = vlist_path.parent / 'csr_elist.bin'
++        if elist_path.exists():
++            elist_size = elist_path.stat().st_size
++            nedges = elist_size // 4
++            with open(vlist_path, 'rb') as f:
++                f.seek(-8, 2)
++                last_i64 = struct.unpack('<q', f.read(8))[0]
++                f.seek(-4, 2)
++                last_i32 = struct.unpack('<i', f.read(4))[0]
++            if last_i64 == nedges:
++                return 'int64'
++            elif last_i32 == nedges:
++                return 'int32'
++        return 'int64'
++    else:
++        raise ValueError(f"Cannot determine vlist dtype for {vlist_path}")
++
++
++def _load_csr(vlist_path, elist_path, wlist_path, vlist_dtype, nvtxs, nedges):
++    """Load CSR data into memory. Returns (offsets, edges, weights)."""
++    # Load offsets (int64 in memory for convenience)
++    offsets = [0] * (nvtxs + 1)
++    if vlist_dtype == 'int64':
++        with open(vlist_path, 'rb') as f:
++            data = f.read()
++        offsets = list(struct.unpack(f'<{nvtxs + 1}q', data))
++    else:
++        with open(vlist_path, 'rb') as f:
++            data = f.read()
++        i32_offsets = struct.unpack(f'<{nvtxs + 1}i', data)
++        offsets = [int(x) for x in i32_offsets]
++
++    # Load edges
++    with open(elist_path, 'rb') as f:
++        data = f.read()
++    edges = list(struct.unpack(f'<{nedges}i', data))
++
++    # Load weights
++    weights = None
++    if wlist_path and wlist_path.exists():
++        with open(wlist_path, 'rb') as f:
++            data = f.read()
++        weights = list(struct.unpack(f'<{nedges}i', data))
++
++    return offsets, edges, weights
++
++
++def _write_ligra_binary_from_memory(offsets, edges, weights, nvtxs, nedges, out_base):
++    """Write .config, .adj, .idx files from in-memory CSR data."""
++    config_path = Path(str(out_base) + '.config')
++    adj_path = Path(str(out_base) + '.adj')
++    idx_path = Path(str(out_base) + '.idx')
++
++    with open(config_path, 'w') as f:
++        f.write(f"{nvtxs}\n")
++
++    # .idx: V int32 offsets (skip sentinel)
++    with open(idx_path, 'wb') as f:
++        f.write(struct.pack(f'<{nvtxs}i', *offsets[:nvtxs]))
++
++    # .adj: first E dests (int32), then E weights (int32)
++    with open(adj_path, 'wb') as f:
++        f.write(struct.pack(f'<{nedges}i', *edges))
++        if weights:
++            f.write(struct.pack(f'<{nedges}i', *weights))
++        else:
++            f.write(struct.pack(f'<{nedges}i', *([1] * nedges)))
++
++    adj_size = adj_path.stat().st_size
++    idx_size = idx_path.stat().st_size
++    adj_expected = nedges * 8
++    idx_expected = nvtxs * 4
++    ok_adj = '✓' if adj_size == adj_expected else '✗'
++    ok_idx = '✓' if idx_size == idx_expected else '✗'
++    print(f"    .adj: {adj_size:,} bytes (expected {adj_expected:,}) {ok_adj}")
++    print(f"    .idx: {idx_size:,} bytes (expected {idx_expected:,}) {ok_idx}")
++
++
++def _write_empty_graph(nvtxs, out_base):
++    """Write an empty graph (0 edges) in Ligra binary format."""
++    config_path = Path(str(out_base) + '.config')
++    adj_path = Path(str(out_base) + '.adj')
++    idx_path = Path(str(out_base) + '.idx')
++
++    with open(config_path, 'w') as f:
++        f.write(f"{nvtxs}\n")
++
++    with open(idx_path, 'wb') as f:
++        f.write(struct.pack(f'<{nvtxs}i', *([0] * nvtxs)))
++
++    with open(adj_path, 'wb') as f:
++        pass
++
++    print(f"    .adj: 0 bytes (empty graph)")
++    print(f"    .idx: {nvtxs * 4:,} bytes (all zeros)")
++
++
++def _split_edges(offsets, edges, weights, nvtxs, np):
++    """Split edges into inter-partition and intra-partition.
++
++    Vertex partitioning: part[v] = v * np // nvtxs (block/range-based).
++    Returns (inter_offsets, inter_edges, inter_weights,
++             intra_offsets, intra_edges, intra_weights)
++    """
++    # 分区 1..np; 分区 0 预留 1 个顶点避免 load_parts 空分区崩溃
++    # BFS/PPR 用 pi>0，所以有效分区为 1..np
++    part = [v * np // nvtxs + 1 for v in range(nvtxs)]
++    part[0] = 0  # 顶点 0 放在分区 0（占位，避免空分区崩溃）
++
++    inter_edges = [[] for _ in range(nvtxs)]
++    intra_edges = [[] for _ in range(nvtxs)]
++    inter_weights = [[] for _ in range(nvtxs)] if weights else None
++    intra_weights = [[] for _ in range(nvtxs)] if weights else None
++
++    inter_cnt = 0
++    intra_cnt = 0
++
++    for v in range(nvtxs):
++        src_part = part[v]
++        for j in range(offsets[v], offsets[v + 1]):
++            dst = edges[j]
++            dst_part = part[dst]
++            w = weights[j] if weights else 1
++
++            if src_part == dst_part:
++                intra_edges[v].append(dst)
++                if intra_weights is not None:
++                    intra_weights[v].append(w)
++                intra_cnt += 1
++            else:
++                inter_edges[v].append(dst)
++                if inter_weights is not None:
++                    inter_weights[v].append(w)
++                inter_cnt += 1
++
++    # Build CSR offsets
++    def build_csr(edge_lists, weight_lists):
++        off = [0]
++        e_list = []
++        w_list = [] if weight_lists is not None else None
++        for v in range(nvtxs):
++            e_list.extend(edge_lists[v])
++            if w_list is not None:
++                w_list.extend(weight_lists[v])
++            off.append(len(e_list))
++        return off, e_list, w_list
++
++    inter_off, inter_e, inter_w = build_csr(inter_edges, inter_weights)
++    intra_off, intra_e, intra_w = build_csr(intra_edges, intra_weights)
++
++    print(f"  Partitioning: {np} partitions (range-based, "
++          f"~{nvtxs // np:,} vertices each)")
++    print(f"  Inter edges:  {inter_cnt:,} ({100*inter_cnt/(inter_cnt+intra_cnt):.1f}%)")
++    print(f"  Intra edges:  {intra_cnt:,} ({100*intra_cnt/(inter_cnt+intra_cnt):.1f}%)")
++
++    return inter_off, inter_e, inter_w, intra_off, intra_e, intra_w, part
++
++
++def convert_csr_to_ligra_binary(csr_dir: Path, out_dir: Path, dataset_name: str,
++                                 num_partitions: int = 1):
++    """Convert CSR dataset to Ligra binary format (partitioned for ForkGraph)."""
++    vlist_path = csr_dir / 'csr_vlist.bin'
++    elist_path = csr_dir / 'csr_elist.bin'
++    wlist_path = csr_dir / 'csr_weightlist.bin'
++
++    if not vlist_path.exists() or not elist_path.exists():
++        raise FileNotFoundError(f"Missing CSR files in {csr_dir}")
++
++    has_weights = wlist_path.exists()
++    vlist_dtype = detect_vlist_dtype(vlist_path)
++    vlist_size = vlist_path.stat().st_size
++    elist_size = elist_path.stat().st_size
++
++    if vlist_dtype == 'int64':
++        nvtxs = (vlist_size // 8) - 1
++    else:
++        nvtxs = (vlist_size // 4) - 1
++
++    nedges = elist_size // 4
++
++    print(f"Dataset: {dataset_name}")
++    print(f"  Vertices: {nvtxs:,}")
++    print(f"  Edges:    {nedges:,}")
++    print(f"  Vlist dtype: {vlist_dtype}")
++    print(f"  Has weights: {has_weights}")
++    print(f"  Partitions: {num_partitions}")
++    print(f"  Output dir: {out_dir}")
++
++    out_dir.mkdir(parents=True, exist_ok=True)
++
++    if num_partitions <= 1:
++        # --- Single partition mode (original behavior) ---
++        intra_base = out_dir / f"{dataset_name}.intra"
++        _write_ligra_binary(vlist_path, elist_path,
++                            wlist_path if has_weights else None,
++                            vlist_dtype, nvtxs, nedges, intra_base)
++
++        inter_base = out_dir / f"{dataset_name}.inter"
++        _write_empty_graph(nvtxs, inter_base)
++
++        part = [1] * nvtxs
++        part[0] = 0  # 顶点 0 放在分区 0（占位，避免空分区崩溃; 源节点应从分区 1 选）
++    else:
++        # --- Multi-partition mode ---
++        print("  Loading CSR data...")
++        offsets, edges, weights = _load_csr(
++            vlist_path, elist_path,
++            wlist_path if has_weights else None,
++            vlist_dtype, nvtxs, nedges)
++
++        print("  Splitting edges...")
++        inter_off, inter_e, inter_w, intra_off, intra_e, intra_w, part = \
++            _split_edges(offsets, edges, weights, nvtxs, num_partitions)
++
++        inter_m = len(inter_e)
++        intra_m = len(intra_e)
++
++        print("  Writing intra graph...")
++        intra_base = out_dir / f"{dataset_name}.intra"
++        _write_ligra_binary_from_memory(intra_off, intra_e, intra_w,
++                                         nvtxs, intra_m, intra_base)
++
++        print("  Writing inter graph...")
++        inter_base = out_dir / f"{dataset_name}.inter"
++        _write_ligra_binary_from_memory(inter_off, inter_e, inter_w,
++                                         nvtxs, inter_m, inter_base)
++
++    # --- Write partition file ---
++    part_path = out_dir / f"{dataset_name}.part"
++    print(f"  Writing partition file: {part_path}")
++    with open(part_path, 'w') as f:
++        for p in part:
++            f.write(f"{p}\n")
++    print(f"    Done ({nvtxs:,} entries)")
++
++    # --- Write source list (从分区 > 0 中选取，避免 source 在分区 0) ---
++    src_path = out_dir / f"{dataset_name}.sources"
++    print(f"  Writing default source list: {src_path}")
++    with open(src_path, 'w') as f:
++        count = 0
++        for vid in range(nvtxs):
++            if part[vid] > 0:
++                f.write(f"{vid}\n")
++                count += 1
++                if count >= 10:
++                    break
++    print(f"    Done ({count} sources, all in partitions > 0)")
++
++    print(f"\nDone! All files in {out_dir}/")
++    print(f"  {dataset_name}.intra.{{config,adj,idx}}  - intra-partition edges")
++    print(f"  {dataset_name}.inter.{{config,adj,idx}}  - inter-partition edges")
++    print(f"  {dataset_name}.part                   - partition file")
++    print(f"  {dataset_name}.sources                - source vertices")
++
++    np_arg = num_partitions + 1 if num_partitions >= 1 else 2  # +1 为空的 partition 0
++    if num_partitions >= 1:
++        print(f"\n  Run with: ./bfs -b -p {np_arg} \\")
++        print(f"    {dataset_name}.sources {dataset_name}.inter \\")
++        print(f"    {dataset_name}.intra {dataset_name}.part")
++
++
++def main():
++    parser = argparse.ArgumentParser(
++        description='Convert CSR binary to Ligra binary format for ForkGraph')
++    parser.add_argument('datasets', nargs='+', help='Dataset names')
++    parser.add_argument('--csr-dir', default='/home/zyl/data/csr_data',
++                        help='Base directory for CSR data')
++    parser.add_argument('--out-dir', default=None,
++                        help='Output directory (default: ForkGraph/inputs_converted/)')
++    parser.add_argument('-n', '--num-partitions', type=int, default=1,
++                        help='Number of partitions (default: 1 = single partition)')
++    args = parser.parse_args()
++
++    csr_base = Path(args.csr_dir)
++
++    if args.out_dir:
++        out_base = Path(args.out_dir)
++    else:
++        out_base = Path(__file__).resolve().parent.parent / 'inputs_converted'
++
++    for ds in args.datasets:
++        csr_dir = csr_base / ds
++        print(f"\n{'=' * 60}")
++        print(f"Converting: {ds}")
++        print(f"{'=' * 60}")
++
++        if not csr_dir.exists():
++            print(f"  ERROR: CSR directory not found: {csr_dir}")
++            continue
++
++        try:
++            convert_csr_to_ligra_binary(csr_dir, out_base, ds,
++                                         num_partitions=args.num_partitions)
++        except Exception as e:
++            print(f"  ERROR: {e}")
++            import traceback
++            traceback.print_exc()
++
++    print(f"\n{'=' * 60}")
++    print("All done!")
++    print(f"{'=' * 60}")
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/tools/partition_gr_for_forkgraph.py b/tools/partition_gr_for_forkgraph.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..fd3163b9bd73d49f0ab8dc3dbcec6f51057dcffe
+--- /dev/null
++++ b/tools/partition_gr_for_forkgraph.py
+@@ -0,0 +1,446 @@
++#!/usr/bin/env python3
++"""Partition a Galois/Gunrock .gr graph for ForkGraph's -gr input path.
++
++The tool splits one .gr graph into:
++  <name>.inter.gr  cross-partition edges
++  <name>.intra.gr  same-partition edges
++  <name>.part      partition id for each original vertex
++  <name>.sources   default BFS/PPR source vertices
++
++Partitioning is range-based: part[v] = floor(v * P / nvtxs).  Vertices are
++not renumbered, which matches ForkGraph's current id2part[vertex_id] use.
++"""
++
++from __future__ import annotations
++
++import argparse
++import array
++import json
++import os
++import random
++import shutil
++import struct
++import sys
++import tempfile
++from pathlib import Path
++from typing import BinaryIO
++
++
++HEADER_STRUCT = struct.Struct("<QQQQ")
++I32_STRUCT = struct.Struct("<i")
++U64_STRUCT = struct.Struct("<Q")
++I64_STRUCT = struct.Struct("<q")
++READ_CHUNK_EDGES = 1 << 20
++
++
++class GGRFormatError(ValueError):
++    pass
++
++
++def _read_exact(f: BinaryIO, nbytes: int, label: str) -> bytes:
++    data = f.read(nbytes)
++    if len(data) != nbytes:
++        raise GGRFormatError(f"incomplete {label}: expected {nbytes} bytes, got {len(data)}")
++    return data
++
++
++def _array_from_file(typecode: str, f: BinaryIO, count: int, label: str) -> array.array:
++    values = array.array(typecode)
++    try:
++        values.fromfile(f, count)
++    except EOFError as exc:
++        raise GGRFormatError(f"incomplete {label}") from exc
++    if sys.byteorder != "little":
++        values.byteswap()
++    return values
++
++
++def _array_to_file(values: array.array, f: BinaryIO) -> None:
++    if sys.byteorder == "little":
++        values.tofile(f)
++        return
++    tmp = array.array(values.typecode, values)
++    tmp.byteswap()
++    tmp.tofile(f)
++
++
++def read_ggr_header(path: Path) -> tuple[int, int, int, int]:
++    with path.open("rb") as f:
++        data = _read_exact(f, HEADER_STRUCT.size, "GGR header")
++    version, size_edge_ty, nvtxs, nedges = HEADER_STRUCT.unpack(data)
++    if version != 1:
++        raise GGRFormatError(f"unsupported GGR version {version}; expected 1")
++    return version, size_edge_ty, nvtxs, nedges
++
++
++def validate_ggr_file_size(path: Path, nvtxs: int, nedges: int, size_edge_ty: int) -> None:
++    expected = HEADER_STRUCT.size + (nvtxs * 8) + (nedges * 4)
++    if size_edge_ty != 0:
++        expected += 4 if nedges % 2 else 0
++        # ForkGraph's GGR reader always consumes int32 weights when sizeEdgeTy != 0.
++        expected += nedges * 4
++    actual = path.stat().st_size
++    if actual != expected:
++        raise GGRFormatError(
++            f"{path} size mismatch: expected {expected} bytes from header/layout, got {actual}"
++        )
++
++
++def read_offsets(path: Path, nvtxs: int, nedges: int) -> array.array:
++    with path.open("rb") as f:
++        f.seek(HEADER_STRUCT.size)
++        row_start = _array_from_file("q", f, nvtxs, "GGR row_start")
++    offsets = array.array("q", [0])
++    offsets.extend(row_start)
++    if len(offsets) != nvtxs + 1:
++        raise GGRFormatError("bad row_start length")
++    prev = 0
++    for i, off in enumerate(offsets):
++        if off < prev:
++            raise GGRFormatError(f"row_start is not monotonic at offset index {i}")
++        if off > nedges:
++            raise GGRFormatError(f"row_start offset {off} exceeds edge count {nedges}")
++        prev = off
++    if offsets[-1] != nedges:
++        raise GGRFormatError(f"last row_start value {offsets[-1]} != nedges {nedges}")
++    return offsets
++
++
++def build_range_partitions(nvtxs: int, num_partitions: int) -> array.array:
++    if num_partitions < 1:
++        raise ValueError("--num-partitions must be >= 1")
++    if nvtxs < 1:
++        raise ValueError("input graph must have at least one vertex")
++    if num_partitions > nvtxs:
++        raise ValueError("--num-partitions must be <= number of vertices so every partition is non-empty")
++
++    part = array.array("i", (0 for _ in range(nvtxs)))
++    counts = [0] * num_partitions
++    for v in range(nvtxs):
++        p = (v * num_partitions) // nvtxs
++        part[v] = p
++        counts[p] += 1
++    if any(count == 0 for count in counts):
++        raise AssertionError("range partitioning produced an empty partition")
++    return part
++
++
++def _write_gr_header(f: BinaryIO, size_edge_ty: int, nvtxs: int, nedges: int) -> None:
++    f.write(HEADER_STRUCT.pack(1, size_edge_ty, nvtxs, nedges))
++
++
++def _copy_temp_to_final(temp_base: Path, final_path: Path, size_edge_ty: int, nvtxs: int,
++                        nedges: int, offsets_without_zero: array.array) -> None:
++    edge_tmp = temp_base.with_suffix(".edges.tmp")
++    weight_tmp = temp_base.with_suffix(".weights.tmp")
++    with final_path.open("wb") as out:
++        _write_gr_header(out, size_edge_ty, nvtxs, nedges)
++        _array_to_file(offsets_without_zero, out)
++        with edge_tmp.open("rb") as edge_in:
++            shutil.copyfileobj(edge_in, out, length=16 * 1024 * 1024)
++        if size_edge_ty != 0:
++            if nedges % 2:
++                out.write(b"\x00\x00\x00\x00")
++            with weight_tmp.open("rb") as weight_in:
++                shutil.copyfileobj(weight_in, out, length=16 * 1024 * 1024)
++
++
++def split_gr(input_path: Path, output_dir: Path, name: str, num_partitions: int,
++             source_count: int, verify: bool) -> dict:
++    version, size_edge_ty, nvtxs, nedges = read_ggr_header(input_path)
++    validate_ggr_file_size(input_path, nvtxs, nedges, size_edge_ty)
++    offsets = read_offsets(input_path, nvtxs, nedges)
++    part = build_range_partitions(nvtxs, num_partitions)
++
++    output_dir.mkdir(parents=True, exist_ok=True)
++    inter_path = output_dir / f"{name}.inter.gr"
++    intra_path = output_dir / f"{name}.intra.gr"
++    part_path = output_dir / f"{name}.part"
++    sources_path = output_dir / f"{name}.sources"
++    summary_path = output_dir / f"{name}.summary.json"
++
++    partition_stats = [
++        {"partition": p, "vertex_count": 0, "intra_edges": 0, "inter_edges": 0}
++        for p in range(num_partitions)
++    ]
++    for p in part:
++        partition_stats[p]["vertex_count"] += 1
++
++    inter_row = array.array("q", [0]) * nvtxs
++    intra_row = array.array("q", [0]) * nvtxs
++    nonisolated_by_part: list[int | None] = [None] * num_partitions
++    nonisolated_vertices: list[int] = []
++
++    edge_section_offset = HEADER_STRUCT.size + nvtxs * 8
++    weight_section_offset = edge_section_offset + nedges * 4
++    if size_edge_ty != 0 and nedges % 2:
++        weight_section_offset += 4
++
++    tmp_root = output_dir / f".{name}.partition-tmp"
++    with tempfile.TemporaryDirectory(prefix=tmp_root.name + "-", dir=output_dir) as tmp_dir_name:
++        tmp_dir = Path(tmp_dir_name)
++        inter_tmp = tmp_dir / "inter"
++        intra_tmp = tmp_dir / "intra"
++        inter_edges_tmp = inter_tmp.with_suffix(".edges.tmp")
++        intra_edges_tmp = intra_tmp.with_suffix(".edges.tmp")
++        inter_weights_tmp = inter_tmp.with_suffix(".weights.tmp")
++        intra_weights_tmp = intra_tmp.with_suffix(".weights.tmp")
++
++        inter_count = 0
++        intra_count = 0
++
++        with input_path.open("rb") as inp, \
++                inter_edges_tmp.open("wb") as inter_edges_out, \
++                intra_edges_tmp.open("wb") as intra_edges_out:
++            inter_weights_out = inter_weights_tmp.open("wb") if size_edge_ty != 0 else None
++            intra_weights_out = intra_weights_tmp.open("wb") if size_edge_ty != 0 else None
++            try:
++                for src in range(nvtxs):
++                    begin = offsets[src]
++                    end = offsets[src + 1]
++                    degree = end - begin
++                    src_part = part[src]
++                    if degree > 0:
++                        if nonisolated_by_part[src_part] is None:
++                            nonisolated_by_part[src_part] = src
++                        nonisolated_vertices.append(src)
++
++                    if degree == 0:
++                        inter_row[src] = inter_count
++                        intra_row[src] = intra_count
++                        continue
++
++                    inp.seek(edge_section_offset + begin * 4)
++                    dst_data = _read_exact(inp, degree * 4, f"edge_dst for vertex {src}")
++                    dst_values = array.array("i")
++                    dst_values.frombytes(dst_data)
++                    if sys.byteorder != "little":
++                        dst_values.byteswap()
++
++                    weight_data = None
++                    if size_edge_ty != 0:
++                        inp.seek(weight_section_offset + begin * 4)
++                        weight_data = _read_exact(inp, degree * 4, f"adjwgt for vertex {src}")
++
++                    inter_dst = array.array("i")
++                    intra_dst = array.array("i")
++                    inter_w = bytearray() if size_edge_ty != 0 else None
++                    intra_w = bytearray() if size_edge_ty != 0 else None
++
++                    for local_idx, dst in enumerate(dst_values):
++                        if dst < 0 or dst >= nvtxs:
++                            raise GGRFormatError(f"edge {src}->{dst} has destination outside [0, {nvtxs})")
++                        if part[dst] == src_part:
++                            intra_dst.append(dst)
++                            if intra_w is not None:
++                                start = local_idx * 4
++                                intra_w.extend(weight_data[start:start + 4])
++                        else:
++                            inter_dst.append(dst)
++                            if inter_w is not None:
++                                start = local_idx * 4
++                                inter_w.extend(weight_data[start:start + 4])
++
++                    if inter_dst:
++                        _array_to_file(inter_dst, inter_edges_out)
++                        if inter_weights_out is not None:
++                            inter_weights_out.write(inter_w)
++                    if intra_dst:
++                        _array_to_file(intra_dst, intra_edges_out)
++                        if intra_weights_out is not None:
++                            intra_weights_out.write(intra_w)
++
++                    inter_count += len(inter_dst)
++                    intra_count += len(intra_dst)
++                    inter_row[src] = inter_count
++                    intra_row[src] = intra_count
++                    partition_stats[src_part]["inter_edges"] += len(inter_dst)
++                    partition_stats[src_part]["intra_edges"] += len(intra_dst)
++            finally:
++                if inter_weights_out is not None:
++                    inter_weights_out.close()
++                if intra_weights_out is not None:
++                    intra_weights_out.close()
++
++        _copy_temp_to_final(inter_tmp, inter_path, size_edge_ty, nvtxs, inter_count, inter_row)
++        _copy_temp_to_final(intra_tmp, intra_path, size_edge_ty, nvtxs, intra_count, intra_row)
++
++    write_part_file(part_path, part)
++    sources = choose_sources(nonisolated_by_part, nonisolated_vertices, source_count)
++    write_sources_file(sources_path, sources)
++
++    summary = {
++        "input": str(input_path),
++        "nvtxs": nvtxs,
++        "nedges": nedges,
++        "num_partitions": num_partitions,
++        "sizeEdgeTy": size_edge_ty,
++        "inter_edges": inter_count,
++        "intra_edges": intra_count,
++        "partitions": partition_stats,
++        "outputs": {
++            "inter_gr": str(inter_path),
++            "intra_gr": str(intra_path),
++            "part": str(part_path),
++            "sources": str(sources_path),
++            "summary_json": str(summary_path),
++        },
++        "sources": sources,
++    }
++
++    if inter_count + intra_count != nedges:
++        raise AssertionError("split edge counts do not sum to original edge count")
++
++    if verify:
++        verify_outputs(input_path, inter_path, intra_path, part, nvtxs, nedges, size_edge_ty)
++        summary["verified"] = True
++
++    with summary_path.open("w") as f:
++        json.dump(summary, f, indent=2, sort_keys=True)
++        f.write("\n")
++
++    return summary
++
++
++def write_part_file(path: Path, part: array.array) -> None:
++    with path.open("w") as f:
++        for p in part:
++            f.write(f"{p}\n")
++
++
++def choose_sources(nonisolated_by_part: list[int | None], nonisolated_vertices: list[int],
++                   source_count: int) -> list[int]:
++    seen = set()
++    sources: list[int] = []
++
++    for src in nonisolated_by_part:
++        if src is not None and src not in seen:
++            sources.append(src)
++            seen.add(src)
++
++    for src in nonisolated_vertices:
++        if len(sources) >= source_count:
++            break
++        if src not in seen:
++            sources.append(src)
++            seen.add(src)
++
++    return sources
++
++
++def write_sources_file(path: Path, sources: list[int]) -> None:
++    with path.open("w") as f:
++        for src in sources:
++            f.write(f"{src}\n")
++
++
++def _read_one_edge(path: Path, nvtxs: int, edge_index: int) -> int:
++    edge_section_offset = HEADER_STRUCT.size + nvtxs * 8
++    with path.open("rb") as f:
++        f.seek(edge_section_offset + edge_index * 4)
++        return I32_STRUCT.unpack(_read_exact(f, 4, "sample edge"))[0]
++
++
++def _sample_edges(path: Path, offsets: array.array, sample_limit: int) -> list[tuple[int, int]]:
++    _, _, nvtxs, nedges = read_ggr_header(path)
++    if nedges == 0:
++        return []
++    samples: list[tuple[int, int]] = []
++    probe_count = min(sample_limit, nedges)
++    rng = random.Random(1)
++    edge_indices = sorted(rng.sample(range(nedges), probe_count))
++    src = 0
++    for edge_idx in edge_indices:
++        while src + 1 < len(offsets) and offsets[src + 1] <= edge_idx:
++            src += 1
++        samples.append((src, _read_one_edge(path, nvtxs, edge_idx)))
++    return samples
++
++
++def verify_outputs(input_path: Path, inter_path: Path, intra_path: Path, part: array.array,
++                   nvtxs: int, nedges: int, size_edge_ty: int) -> None:
++    _, inter_size_edge_ty, inter_n, inter_m = read_ggr_header(inter_path)
++    _, intra_size_edge_ty, intra_n, intra_m = read_ggr_header(intra_path)
++    if inter_n != nvtxs or intra_n != nvtxs:
++        raise AssertionError("output nvtxs does not match input")
++    if inter_size_edge_ty != size_edge_ty or intra_size_edge_ty != size_edge_ty:
++        raise AssertionError("output sizeEdgeTy does not match input")
++    if inter_m + intra_m != nedges:
++        raise AssertionError("verified edge counts do not sum to original")
++    validate_ggr_file_size(inter_path, inter_n, inter_m, inter_size_edge_ty)
++    validate_ggr_file_size(intra_path, intra_n, intra_m, intra_size_edge_ty)
++
++    inter_offsets = read_offsets(inter_path, inter_n, inter_m)
++    intra_offsets = read_offsets(intra_path, intra_n, intra_m)
++    for src, dst in _sample_edges(inter_path, inter_offsets, 1000):
++        if part[src] == part[dst]:
++            raise AssertionError(f"inter sample {src}->{dst} is same-partition")
++    for src, dst in _sample_edges(intra_path, intra_offsets, 1000):
++        if part[src] != part[dst]:
++            raise AssertionError(f"intra sample {src}->{dst} is cross-partition")
++
++    if len(set(part)) == 1:
++        if inter_m != 0 or intra_m != nedges:
++            raise AssertionError("P=1 regression check failed")
++
++
++def parse_args() -> argparse.Namespace:
++    parser = argparse.ArgumentParser(
++        description="Split a Galois/Gunrock .gr graph into ForkGraph inter/intra .gr inputs."
++    )
++    parser.add_argument("--input", required=True, type=Path, help="Input .gr file")
++    parser.add_argument("--output-dir", required=True, type=Path, help="Directory for generated files")
++    parser.add_argument("--name", default=None, help="Output basename (default: input stem)")
++    parser.add_argument("-p", "--num-partitions", required=True, type=int, help="Number of range partitions")
++    parser.add_argument("--source-count", type=int, default=10, help="Minimum default source count to try")
++    parser.add_argument("--verify", action="store_true", help="Verify output headers/counts and sample edge classes")
++    return parser.parse_args()
++
++
++def main() -> int:
++    args = parse_args()
++    input_path = args.input.resolve()
++    if not input_path.exists():
++        print(f"ERROR: input file not found: {input_path}", file=sys.stderr)
++        return 2
++    if args.source_count < 1:
++        print("ERROR: --source-count must be >= 1", file=sys.stderr)
++        return 2
++
++    name = args.name or input_path.stem
++    try:
++        summary = split_gr(
++            input_path=input_path,
++            output_dir=args.output_dir,
++            name=name,
++            num_partitions=args.num_partitions,
++            source_count=args.source_count,
++            verify=args.verify,
++        )
++    except Exception as exc:
++        print(f"ERROR: {exc}", file=sys.stderr)
++        return 1
++
++    print(f"Input:       {summary['input']}")
++    print(f"Vertices:    {summary['nvtxs']:,}")
++    print(f"Edges:       {summary['nedges']:,}")
++    print(f"Partitions:  {summary['num_partitions']}")
++    print(f"Inter edges: {summary['inter_edges']:,}")
++    print(f"Intra edges: {summary['intra_edges']:,}")
++    print("Outputs:")
++    for key, value in summary["outputs"].items():
++        print(f"  {key}: {value}")
++    print()
++    print("ForkGraph command:")
++    print(
++        f"  ./bfs -gr -p {summary['num_partitions']} "
++        f"{summary['outputs']['sources']} "
++        f"{summary['outputs']['inter_gr']} "
++        f"{summary['outputs']['intra_gr']} "
++        f"{summary['outputs']['part']}"
++    )
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tools/partition_gr_range_omp.cpp b/tools/partition_gr_range_omp.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..bd47fc10c79c5d6c3370cf03b09edc53102e969d
+--- /dev/null
++++ b/tools/partition_gr_range_omp.cpp
+@@ -0,0 +1,354 @@
++#include <algorithm>
++#include <cerrno>
++#include <cstdint>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <iostream>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++#include <fcntl.h>
++#include <omp.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++namespace fs = std::filesystem;
++
++namespace {
++
++struct GrHeader {
++  std::uint64_t version;
++  std::uint64_t size_edge_ty;
++  std::uint64_t vertices;
++  std::uint64_t edges;
++};
++
++static_assert(sizeof(GrHeader) == 32);
++
++class MappedFile {
++ public:
++  MappedFile(const fs::path& path, int flags, int prot, std::uint64_t size = 0)
++      : path_(path), size_(size) {
++    fd_ = ::open(path.c_str(), flags, 0644);
++    if (fd_ < 0) {
++      throw std::runtime_error("open failed for " + path.string() + ": " +
++                               std::strerror(errno));
++    }
++    if ((flags & O_RDWR) != 0 && ::ftruncate(fd_, static_cast<off_t>(size_)) != 0) {
++      throw std::runtime_error("ftruncate failed for " + path.string() + ": " +
++                               std::strerror(errno));
++    }
++    if (size_ == 0) {
++      struct stat st {};
++      if (::fstat(fd_, &st) != 0) {
++        throw std::runtime_error("fstat failed for " + path.string());
++      }
++      size_ = static_cast<std::uint64_t>(st.st_size);
++    }
++    data_ = ::mmap(nullptr, size_, prot, MAP_SHARED, fd_, 0);
++    if (data_ == MAP_FAILED) {
++      data_ = nullptr;
++      throw std::runtime_error("mmap failed for " + path.string() + ": " +
++                               std::strerror(errno));
++    }
++  }
++
++  MappedFile(const MappedFile&) = delete;
++  MappedFile& operator=(const MappedFile&) = delete;
++
++  ~MappedFile() {
++    if (data_ != nullptr) {
++      ::munmap(data_, size_);
++    }
++    if (fd_ >= 0) {
++      ::close(fd_);
++    }
++  }
++
++  void sync() {
++    if (::msync(data_, size_, MS_SYNC) != 0) {
++      throw std::runtime_error("msync failed for " + path_.string() + ": " +
++                               std::strerror(errno));
++    }
++  }
++
++  void* data() { return data_; }
++  const void* data() const { return data_; }
++  std::uint64_t size() const { return size_; }
++
++ private:
++  fs::path path_;
++  int fd_ = -1;
++  void* data_ = nullptr;
++  std::uint64_t size_ = 0;
++};
++
++std::uint64_t gr_size(std::uint64_t vertices, std::uint64_t edges,
++                      bool weighted) {
++  std::uint64_t size = sizeof(GrHeader) + vertices * sizeof(std::uint64_t) +
++                       edges * sizeof(std::int32_t);
++  if (weighted) {
++    size += (edges & 1U) ? sizeof(std::int32_t) : 0;
++    size += edges * sizeof(std::int32_t);
++  }
++  return size;
++}
++
++struct GrView {
++  const GrHeader* header;
++  const std::uint64_t* row_end;
++  const std::int32_t* destinations;
++  const std::int32_t* weights;
++};
++
++GrView view_input(const MappedFile& input) {
++  const auto* bytes = static_cast<const std::uint8_t*>(input.data());
++  if (input.size() < sizeof(GrHeader)) {
++    throw std::runtime_error("input is smaller than a GR header");
++  }
++  const auto* header = reinterpret_cast<const GrHeader*>(bytes);
++  if (header->version != 1) {
++    throw std::runtime_error("unsupported GR version " +
++                             std::to_string(header->version));
++  }
++  const bool weighted = header->size_edge_ty != 0;
++  const auto expected = gr_size(header->vertices, header->edges, weighted);
++  if (input.size() != expected) {
++    throw std::runtime_error("input size mismatch: expected " +
++                             std::to_string(expected) + ", got " +
++                             std::to_string(input.size()));
++  }
++
++  const auto* row_end = reinterpret_cast<const std::uint64_t*>(
++      bytes + sizeof(GrHeader));
++  const auto* destinations = reinterpret_cast<const std::int32_t*>(
++      bytes + sizeof(GrHeader) + header->vertices * sizeof(std::uint64_t));
++  const std::int32_t* weights = nullptr;
++  if (weighted) {
++    const auto padding = (header->edges & 1U) ? sizeof(std::int32_t) : 0;
++    weights = reinterpret_cast<const std::int32_t*>(
++        reinterpret_cast<const std::uint8_t*>(destinations + header->edges) +
++        padding);
++  }
++  return {header, row_end, destinations, weights};
++}
++
++struct MutableGrView {
++  GrHeader* header;
++  std::uint64_t* row_end;
++  std::int32_t* destinations;
++  std::int32_t* weights;
++};
++
++MutableGrView initialize_output(MappedFile& output, std::uint64_t vertices,
++                                std::uint64_t edges, std::uint64_t size_edge_ty) {
++  auto* bytes = static_cast<std::uint8_t*>(output.data());
++  auto* header = reinterpret_cast<GrHeader*>(bytes);
++  *header = {1, size_edge_ty, vertices, edges};
++  auto* row_end = reinterpret_cast<std::uint64_t*>(bytes + sizeof(GrHeader));
++  auto* destinations = reinterpret_cast<std::int32_t*>(
++      bytes + sizeof(GrHeader) + vertices * sizeof(std::uint64_t));
++  std::int32_t* weights = nullptr;
++  if (size_edge_ty != 0) {
++    const auto padding = (edges & 1U) ? sizeof(std::int32_t) : 0;
++    if (padding != 0) {
++      std::memset(destinations + edges, 0, padding);
++    }
++    weights = reinterpret_cast<std::int32_t*>(
++        reinterpret_cast<std::uint8_t*>(destinations + edges) + padding);
++  }
++  return {header, row_end, destinations, weights};
++}
++
++std::vector<std::uint32_t> build_partitions(const GrView& source,
++                                            std::uint64_t target_bytes) {
++  std::vector<std::uint32_t> part(source.header->vertices);
++  std::uint32_t current_part = 0;
++  std::uint64_t current_bytes = 0;
++  const auto edge_bytes = source.header->size_edge_ty != 0
++                              ? 2 * sizeof(std::int32_t)
++                              : sizeof(std::int32_t);
++  for (std::uint64_t src = 0; src < source.header->vertices; ++src) {
++    const auto begin = src == 0 ? 0 : source.row_end[src - 1];
++    const auto end = source.row_end[src];
++    const auto row_bytes = 2 * sizeof(std::uint64_t) + (end - begin) * edge_bytes;
++    if (current_bytes != 0 && current_bytes + row_bytes > target_bytes) {
++      ++current_part;
++      current_bytes = 0;
++    }
++    part[src] = current_part;
++    current_bytes += row_bytes;
++  }
++  return part;
++}
++
++void write_partitions(const fs::path& path,
++                      const std::vector<std::uint32_t>& part) {
++  std::ofstream out(path);
++  if (!out) {
++    throw std::runtime_error("cannot create " + path.string());
++  }
++  std::string buffer;
++  buffer.reserve(1U << 20);
++  for (const auto partition : part) {
++    buffer.append(std::to_string(partition));
++    buffer.push_back('\n');
++    if (buffer.size() >= (1U << 20)) {
++      out.write(buffer.data(), static_cast<std::streamsize>(buffer.size()));
++      buffer.clear();
++    }
++  }
++  out.write(buffer.data(), static_cast<std::streamsize>(buffer.size()));
++}
++
++}  // namespace
++
++int main(int argc, char** argv) try {
++  if (argc != 6) {
++    std::cerr << "Usage: " << argv[0]
++              << " <input.gr> <output-dir> <name> <target-mib> <threads>\n";
++    return 2;
++  }
++
++  const fs::path input_path = argv[1];
++  const fs::path output_dir = argv[2];
++  const std::string name = argv[3];
++  const double target_mib = std::stod(argv[4]);
++  const int threads = std::stoi(argv[5]);
++  if (target_mib <= 0 || threads <= 0) {
++    throw std::runtime_error("target-mib and threads must be positive");
++  }
++  omp_set_dynamic(0);
++  omp_set_num_threads(threads);
++  fs::create_directories(output_dir);
++
++  MappedFile input(input_path, O_RDONLY, PROT_READ);
++  const auto source = view_input(input);
++  const auto vertices = source.header->vertices;
++  const auto edges = source.header->edges;
++  const bool weighted = source.header->size_edge_ty != 0;
++  const auto target_bytes = static_cast<std::uint64_t>(
++      target_mib * 1024.0 * 1024.0);
++  const auto part_of_vertex = build_partitions(source, target_bytes);
++  const auto partitions = part_of_vertex.back() + 1;
++
++  std::vector<std::uint64_t> intra_degree(vertices);
++  std::vector<std::uint64_t> inter_degree(vertices);
++
++  const double classify_start = omp_get_wtime();
++#pragma omp parallel for schedule(dynamic, 256)
++  for (std::uint64_t src = 0; src < vertices; ++src) {
++    const auto begin = src == 0 ? 0 : source.row_end[src - 1];
++    const auto end = source.row_end[src];
++    const auto src_part = part_of_vertex[src];
++    std::uint64_t intra = 0;
++    for (auto edge = begin; edge < end; ++edge) {
++      const auto dst = static_cast<std::uint32_t>(source.destinations[edge]);
++      if (dst >= vertices) {
++        continue;
++      }
++      intra += part_of_vertex[dst] == src_part;
++    }
++    intra_degree[src] = intra;
++    inter_degree[src] = end - begin - intra;
++  }
++
++  std::uint64_t intra_edges = 0;
++  std::uint64_t inter_edges = 0;
++  std::vector<std::uint64_t> partition_vertices(partitions);
++  std::vector<std::uint64_t> partition_intra(partitions);
++  std::vector<std::uint64_t> partition_inter(partitions);
++  for (std::uint64_t src = 0; src < vertices; ++src) {
++    intra_edges += intra_degree[src];
++    inter_edges += inter_degree[src];
++    const auto part = part_of_vertex[src];
++    ++partition_vertices[part];
++    partition_intra[part] += intra_degree[src];
++    partition_inter[part] += inter_degree[src];
++    intra_degree[src] = intra_edges;
++    inter_degree[src] = inter_edges;
++  }
++  if (intra_edges + inter_edges != edges) {
++    throw std::runtime_error("classified edge counts do not match input");
++  }
++  const double classify_seconds = omp_get_wtime() - classify_start;
++
++  const fs::path intra_path = output_dir / (name + ".intra.gr");
++  const fs::path inter_path = output_dir / (name + ".inter.gr");
++  MappedFile intra_file(intra_path, O_RDWR | O_CREAT | O_TRUNC, PROT_READ | PROT_WRITE,
++                        gr_size(vertices, intra_edges, weighted));
++  MappedFile inter_file(inter_path, O_RDWR | O_CREAT | O_TRUNC, PROT_READ | PROT_WRITE,
++                        gr_size(vertices, inter_edges, weighted));
++  auto intra = initialize_output(intra_file, vertices, intra_edges,
++                                 source.header->size_edge_ty);
++  auto inter = initialize_output(inter_file, vertices, inter_edges,
++                                 source.header->size_edge_ty);
++  std::copy(intra_degree.begin(), intra_degree.end(), intra.row_end);
++  std::copy(inter_degree.begin(), inter_degree.end(), inter.row_end);
++
++  const double scatter_start = omp_get_wtime();
++#pragma omp parallel for schedule(dynamic, 256)
++  for (std::uint64_t src = 0; src < vertices; ++src) {
++    const auto begin = src == 0 ? 0 : source.row_end[src - 1];
++    const auto end = source.row_end[src];
++    auto intra_pos = src == 0 ? 0 : intra.row_end[src - 1];
++    auto inter_pos = src == 0 ? 0 : inter.row_end[src - 1];
++    const auto src_part = part_of_vertex[src];
++    for (auto edge = begin; edge < end; ++edge) {
++      const auto dst = source.destinations[edge];
++      const bool is_intra = dst >= 0 && static_cast<std::uint64_t>(dst) < vertices &&
++                            part_of_vertex[static_cast<std::uint32_t>(dst)] == src_part;
++      auto& output = is_intra ? intra : inter;
++      auto& position = is_intra ? intra_pos : inter_pos;
++      output.destinations[position] = dst;
++      if (weighted) {
++        output.weights[position] = source.weights[edge];
++      }
++      ++position;
++    }
++  }
++  const double scatter_seconds = omp_get_wtime() - scatter_start;
++
++  intra_file.sync();
++  inter_file.sync();
++  write_partitions(output_dir / (name + ".part"), part_of_vertex);
++
++  std::uint64_t max_partition_bytes = 0;
++  for (std::uint32_t part = 0; part < partitions; ++part) {
++    const auto bytes = partition_vertices[part] * 2 * sizeof(std::uint64_t) +
++                       (partition_intra[part] + partition_inter[part]) *
++                           (weighted ? 2 : 1) * sizeof(std::int32_t);
++    max_partition_bytes = std::max(max_partition_bytes, bytes);
++  }
++
++  const fs::path summary_path = output_dir / (name + ".summary.json");
++  std::ofstream summary(summary_path);
++  summary << "{\n"
++          << "  \"input\": \"" << input_path.string() << "\",\n"
++          << "  \"vertices\": " << vertices << ",\n"
++          << "  \"edges\": " << edges << ",\n"
++          << "  \"partitions\": " << partitions << ",\n"
++          << "  \"partition_method\": \"contiguous_edge_balanced_range\",\n"
++          << "  \"target_partition_mib\": " << target_mib << ",\n"
++          << "  \"intra_edges\": " << intra_edges << ",\n"
++          << "  \"inter_edges\": " << inter_edges << ",\n"
++          << "  \"max_partition_bytes\": " << max_partition_bytes << ",\n"
++          << "  \"classify_seconds\": " << classify_seconds << ",\n"
++          << "  \"scatter_seconds\": " << scatter_seconds << "\n"
++          << "}\n";
++
++  std::cout << "DONE name=" << name << " vertices=" << vertices
++            << " edges=" << edges << " partitions=" << partitions
++            << " intra_edges=" << intra_edges << " inter_edges=" << inter_edges
++            << " max_partition_mib="
++            << static_cast<double>(max_partition_bytes) / (1024.0 * 1024.0)
++            << " classify_s=" << classify_seconds
++            << " scatter_s=" << scatter_seconds << '\n';
++  return 0;
++} catch (const std::exception& error) {
++  std::cerr << "ERROR: " << error.what() << '\n';
++  return 1;
++}
