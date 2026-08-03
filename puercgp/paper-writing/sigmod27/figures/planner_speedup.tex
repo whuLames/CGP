@@ -1,0 +1,36 @@
+\begin{figure*}[t]
+  \centering
+  \begin{tikzpicture}
+    \begin{groupplot}[
+        group style={group size=2 by 1, horizontal sep=1.2cm},
+        width=0.47\textwidth,
+        height=0.26\textwidth,
+        ybar,
+        /pgf/bar width=7pt,
+        symbolic x coords={Indo,Twitter,LJ,Orkut,Patents,Sina},
+        xtick=data,
+        x tick label style={rotate=25,anchor=east,font=\scriptsize},
+        tick label style={font=\scriptsize},
+        label style={font=\small},
+        grid=major,
+        grid style={gray!20},
+        enlarge x limits=0.12
+      ]
+      \nextgroupplot[ymin=1,ymax=2.5,ylabel={Speedup},
+                     title={End-to-end scheduling benefit}]
+        \addplot[fill=blue!55,draw=blue!75!black]
+          coordinates {(Indo,2.309) (Twitter,1.983) (LJ,1.489)
+                       (Orkut,1.342) (Patents,1.290) (Sina,1.152)};
+        \draw[dashed,black] (axis cs:Indo,1) -- (axis cs:Sina,1);
+      \nextgroupplot[ymin=0,ymax=1,ylabel={Online/base union edges},
+                     title={Remaining topology work}]
+        \addplot[fill=orange!60,draw=orange!80!black]
+          coordinates {(Indo,0.356) (Twitter,0.428) (LJ,0.601)
+                       (Orkut,0.698) (Patents,0.707) (Sina,0.845)};
+        \draw[dashed,black] (axis cs:Indo,1) -- (axis cs:Sina,1);
+    \end{groupplot}
+  \end{tikzpicture}
+  \caption{Existing all-push BFS result for $N=128,Q=32$ and seed 42.  Online grouping and offsets improve end-to-end time by $1.15\times$--$2.31\times$ (left); the largest gains coincide with the largest reductions in union-edge work (right).  Scheduling time is included and index construction is excluded.}
+  \Description{Two bar charts for six graphs. The left chart shows scheduling speedups from 1.15 to 2.31. The right chart shows the remaining union-edge ratios from 0.356 to 0.845, with lower ratios generally corresponding to higher speedups.}
+  \label{fig:planner-result}
+\end{figure*}

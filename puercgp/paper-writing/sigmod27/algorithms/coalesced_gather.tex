@@ -1,0 +1,21 @@
+\begin{algorithm}[t]
+  \caption{\coalescedgather: access-efficient destination aggregation}
+  \label{alg:coalesced-gather}
+  \footnotesize
+  \begin{algorithmic}[1]
+    \Require Incoming CSR $G^{\mathsf T}$; masks $N,V$; values $X$; active $A$
+    \ForAll{destinations $v$ in parallel}
+      \ForAll{queries $q=0,\ldots,Q-1$ in vertex-major order}
+        \If{$2^q\land A=0$} \State \textbf{continue} \EndIf
+        \State $a_q\gets P.\mathit{identity}$
+        \ForAll{$(u,v)\in G^{\mathsf T}$}
+          \State $c\gets P.\Call{Relax}{X[u,q],w(u,v)}$
+          \State $a_q\gets P.\Call{Reduce}{a_q,c}$
+        \EndFor
+        \State $b_q\gets P.\Call{Update}{X[v,q],a_q}$ ? $2^q$ : $0$
+      \EndFor
+      \State $M\gets b_0\lor\cdots\lor b_{Q-1}$
+      \State $N[v]\gets M$; $V[v]\gets V[v]\lor M$
+    \EndFor
+  \end{algorithmic}
+\end{algorithm}

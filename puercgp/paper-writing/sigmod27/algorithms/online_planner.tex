@@ -1,0 +1,29 @@
+\begin{algorithm}[t]
+  \caption{Sharing-aware batching and bounded start-offset search}
+  \label{alg:online-planner}
+  \footnotesize
+  \begin{algorithmic}[1]
+    \Require Sources $S$; phase index $I$; batch size $Q$; delay bound $D$
+    \ForAll{source pairs $(s_i,s_j)$}
+      \State build weighted relative-level scores $H_{ij}[-D{:}D]$
+      \State affinity $W_{ij}\gets\max_{\delta}H_{ij}(\delta)$
+    \EndFor
+    \While{an unassigned source remains}
+      \State seed a batch with maximum remaining total affinity
+      \State greedily add the source with maximum marginal $W$ score
+    \EndWhile
+    \Repeat
+      \State apply the positive-gain cross-batch swap with largest gain
+    \Until{no positive swap exists or the swap budget is exhausted}
+    \ForAll{batches $B$}
+      \State initialize offsets from zero, completion alignment, and six seeds
+      \ForAll{initial offset vectors $o$}
+        \Repeat
+          \ForAll{$q\in B$} \State choose $o_q\in[0,D]$ maximizing pair score \EndFor
+        \Until{a pass makes no change or eight passes finish}
+      \EndFor
+      \State retain the highest-score normalized offset vector
+    \EndFor
+    \Ensure Ordered batches and per-query start offsets
+  \end{algorithmic}
+\end{algorithm}

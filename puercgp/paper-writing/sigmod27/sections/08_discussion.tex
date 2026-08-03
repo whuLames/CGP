@@ -1,0 +1,42 @@
+\section{Discussion and Limitations}
+\label{sec:limitations}
+
+\subsection{Lessons for Concurrent Graph Queries}
+
+\paragraph{A shared graph is not yet shared execution.}
+Two queries may eventually visit the same vertex, but access is saved only when those visits occur together and the execution state records both query identities.  The meaningful quantity is therefore realized, iteration-local vertex overlap rather than graph co-residency or eventual reachability.
+
+\paragraph{Reuse has both a count and a cost dimension.}
+Vertex sharing removes repeated neighborhood access, but it does not remove query-specific state work.  Broad aggregation may perform more logical edge inspection yet incur lower effective state-access cost.  A CGQ system should report both neighborhood count and state-access behavior instead of treating either edge count or bandwidth as a complete explanation.
+
+\paragraph{Scheduling should optimize a downstream quantity.}
+A source-similarity score is useful only if it changes the overlap consumed by execution.  This is why \system evaluates predicted phase compatibility against exact $S_{\mathrm{share}}$, data movement, and time.  The same principle applies to future learned schedulers: prediction quality is secondary to the realized execution effect.
+
+\paragraph{More concurrency is not always more throughput.}
+Increasing $Q$, replenishing slots immediately, or launching multiple batches exposes more work but also enlarges resident state and contention for the memory system.  Concurrency degree is therefore a workload parameter to be selected, not an unconditional optimization.  Throughput must be paired with query latency and a fixed memory budget.
+
+\paragraph{Approximate coordination requires an exact boundary.}
+Phase summaries may make poor performance decisions, but exact masks and typed updates remain the semantic authority.  This separation allows inexpensive heuristics or learned scheduling without weakening correctness and provides a safe input-order fallback.
+
+\subsection{Scope and Limitations}
+
+\paragraph{When sharing should lose.}
+If query frontiers are disjoint, $E_{\mathrm{union}}\approx E_{\mathrm{ind}}$ and mask maintenance adds overhead without saving graph access.  Small batches may not contain enough query-level regularity for \coalescedgather, while sparse frontiers on high-diameter graphs make broad incoming inspection wasteful.  These are expected boundaries that the selector and fallback must expose.
+
+\paragraph{Algorithm scope.}
+Typed min/max traversal policies fit the exact frontier model.  Dense sum algorithms such as PageRank have a related batched reduction path but little union-frontier selectivity, so they are excluded from the central claim.  The current phase index models unweighted distance.  Until algorithm-specific estimators are evaluated, scheduling claims should remain BFS-specific even if exact execution supports BFS, SSSP, and SSWP.
+
+\paragraph{Static, single-GPU windows.}
+The design assumes a static graph that, together with $V\!\times\!Q$ state and incoming adjacency, fits on one GPU.  Updates would require snapshot semantics and phase-index maintenance; multi-GPU execution would add partition and communication choices; continuous arrivals would require admission and slot-lifecycle policies.  These are meaningful extensions but are not validated here.
+
+\paragraph{Preprocessing amortization.}
+The serial CPU index builder can take tens of seconds and gigabytes.  It is justified only when reused over enough query windows.  A production system could reduce landmark count, parallelize construction, or learn from executed queries, but the paper must report the measured break-even point.
+
+\paragraph{Negative design results.}
+Immediate slot replenishment mixes traversal phases and is slower than closed-batch execution in current tests.  Splitting $Q=64$ into two concurrent $Q=32$ groups also usually loses because both groups compete for the memory hierarchy, although selected underutilized cases improve.  A tiled aggregation variant is slower than the direct vertex--query organization in current $Q=16/32/64$ BFS tests.  These results delimit where additional concurrency or local reuse fails to lower total memory overhead.
+
+\paragraph{Threats to validity.}
+Most current data comes from one V100, one or a few source seeds, and evolving code.  Some external baseline runs have unequal repetitions or out-of-memory outcomes at $Q=64$, and the best-per-graph mode is an oracle.  The final paper therefore requires one fixed commit and policy, common-capacity comparisons, multiple devices and seeds, confidence intervals, and a same-engine prior-work decomposition.  At present, the memory-access model is more mature than the end-to-end performance claim.
+
+\paragraph{Artifact and disclosure.}
+The artifact should include source lists, graph checksums and converters, serialized-index metadata, exact commands, raw repetitions, correctness fingerprints, profiling scripts, and a manifest mapping every paper number to a file.  Because language-model assistance was used to organize and draft text, the authors must verify every statement and follow the ACM policy in force at submission.

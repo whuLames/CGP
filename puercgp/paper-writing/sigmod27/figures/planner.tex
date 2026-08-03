@@ -1,0 +1,20 @@
+\begin{figure}[t]
+  \centering
+  \begin{tikzpicture}[
+      font=\scriptsize,
+      box/.style={draw, rounded corners, align=center, minimum height=7mm, minimum width=24mm, fill=gray!7},
+      arrow/.style={-{Latex[length=1.7mm]}, thick}
+    ]
+    \node[box] (lm) {landmark\\distances};
+    \node[box, right=4mm of lm] (hist) {pairwise relative-\\phase histograms};
+    \node[box, below=5mm of hist] (cluster) {greedy groups\\+ local swaps};
+    \node[box, left=4mm of cluster] (offset) {bounded offset\\coordinate search};
+    \draw[arrow] (lm) -- (hist);
+    \draw[arrow] (hist) -- (cluster);
+    \draw[arrow] (cluster) -- (offset);
+    \node[below=3mm of offset, align=center] {batch order and start delays};
+  \end{tikzpicture}
+  \caption{The scheduler estimates relative traversal phases rather than predicting an exact execution trace.  Approximation errors remain safe because exact masks govern execution.}
+  \Description{Landmark distances feed pairwise relative-phase histograms, which feed greedy grouping and local swaps, followed by a bounded coordinate search that returns batch order and start delays.}
+  \label{fig:planner}
+\end{figure}

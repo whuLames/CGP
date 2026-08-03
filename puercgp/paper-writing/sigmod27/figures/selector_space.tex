@@ -1,0 +1,19 @@
+\begin{figure}[t]
+  \centering
+  \begin{tikzpicture}[font=\scriptsize, x=3.5cm, y=2.5cm]
+    \draw[-{Latex[length=1.6mm]}, thick] (0,0) -- (1.08,0)
+      node[below left=1pt, align=center] {broader frontier /\\higher query activity};
+    \draw[-{Latex[length=1.6mm]}, thick] (0,0) -- (0,1.08)
+      node[above, align=center] {topology\\overlap};
+    \fill[blue!10] (0,0) -- (0,1) -- (0.58,1) -- (0.34,0) -- cycle;
+    \fill[green!12] (0.34,0) -- (0.58,1) -- (1,1) -- (1,0) -- cycle;
+    \draw[dashed, thick] (0.34,0) -- (0.58,1);
+    \node[align=center] at (0.24,0.62) {\sharedexpand\\shared neighborhoods};
+    \node[align=center] at (0.76,0.48) {\coalescedgather\\regular state access};
+    \node[align=center, text=red!70!black] at (0.47,-0.22)
+      {boundary must be calibrated};
+  \end{tikzpicture}
+  \caption{Conceptual strategy space, not a measured decision boundary.  Exact topology overlap favors \sharedexpand; broad frontiers and high query activity favor \coalescedgather.  The final selector must learn the crossover on held-out workloads.}
+  \Description{A conceptual two-dimensional space has topology overlap on the vertical axis and frontier breadth or query activity on the horizontal axis. A dashed boundary separates VertexShare and AlignedGather regions.}
+  \label{fig:selector-space}
+\end{figure}

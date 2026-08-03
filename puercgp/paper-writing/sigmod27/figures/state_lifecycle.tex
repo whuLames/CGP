@@ -1,0 +1,20 @@
+\begin{figure}[t]
+  \centering
+  \begin{tikzpicture}[
+      font=\scriptsize,
+      box/.style={draw, rounded corners, align=center, minimum height=7mm, minimum width=22mm},
+      arrow/.style={-{Latex[length=1.5mm]}, thick}
+    ]
+    \node[box, fill=blue!8] (front) {frontier mask\\$F_t[v]=0011$};
+    \node[box, fill=gray!8, right=4mm of front] (op) {typed\\relaxations};
+    \node[box, fill=green!8, right=4mm of op] (next) {next mask\\$F_{t+1}[u]=0110$};
+    \draw[arrow] (front) -- (op);
+    \draw[arrow] (op) -- (next);
+    \node[box, fill=orange!10, below=5mm of op] (visited) {cumulative state\\$V_t[v]=1011$};
+    \draw[arrow] (visited) -- (op);
+    \draw[arrow] (next.south) |- node[below, near start] {compact + swap} (front.south);
+  \end{tikzpicture}
+  \caption{Masks have different meanings and lifetimes.  The current mask drives work, the cumulative mask rejects invalid rediscovery where required, and successful typed updates form the exact next mask.}
+  \Description{The current frontier mask and cumulative visited mask feed typed relaxations.  Successful relaxations create a next-frontier mask, which is compacted and swapped into the next iteration.}
+  \label{fig:state-lifecycle}
+\end{figure}

@@ -1,0 +1,58 @@
+\section{System Overview}
+\label{sec:overview}
+
+\input{figures/system_overview}
+
+\system accepts a GPU-resident graph, a set of source-based graph queries, and a resident batch limit $Q$.  Figure~\ref{fig:overview} follows the same three principles derived in Section~\ref{sec:background}.  The scheduler exposes more simultaneous overlap (P3); exact query-aware state identifies which neighborhood accesses can be shared (P1); and the execution engine chooses between vertex sharing and access-efficient aggregation for the remaining work (P2).
+
+The phase index is built once per graph and reused across query windows.  All remaining work is query dependent.  Batching, offsets, exact frontier generation, and strategy selection count toward online cost.
+
+\subsection{Execution Workflow}
+
+\paragraph{1. Estimate relative traversal phases.}
+The reusable index stores distances from a small set of landmarks.  For each source pair, the online scheduler constructs a histogram over relative levels.  The histogram estimates when the two queries are likely to expose common high-degree vertices.  It is an overlap hint, not an approximation of the actual frontier.
+
+\paragraph{2. Form and align query batches.}
+The scheduler places sources with compatible phase overlap into batches of at most $Q$ queries.  It improves the initial grouping with pair swaps and selects a bounded start offset for each query.  When $N>Q$, the procedure produces several independent batches that reuse the same resident workspace.
+
+\paragraph{3. Construct exact query-aware frontiers.}
+At global iteration $t$, the engine activates scheduled queries and materializes $U_t$ together with $\querymask_t$.  Current frontier, next frontier, cumulative state, and typed query values remain distinct.  Consequently, an incorrect overlap estimate may reduce sharing, but it cannot add or remove a legal query update.
+
+\paragraph{4. Select the access strategy.}
+The engine measures exact frontier size, active query--edge pairs, and neighborhood work.  It chooses \sharedexpand when current vertex overlap can remove substantial repeated topology access.  It chooses \coalescedgather when frontiers are broad and regular query-state aggregation is expected to reduce effective access cost.  The current prototype uses a threshold rule; Section~\ref{sec:selector} specifies the calibrated selector required by the final system.
+
+\paragraph{5. Advance every query exactly.}
+The selected strategy applies the algorithm's relaxation rule, records the queries whose values changed, and produces the exact union for the next iteration.  Completed queries contribute no further work.  The process terminates when every query converges and returns an ordinary per-query value vector.
+
+Algorithm~\ref{alg:execute-batch} summarizes the workflow.  The scheduler provides only $(q,s_q,o_q)$ descriptors before execution; later decisions use exact state.  Two online costs remain explicit: feature collection and next-union construction.
+
+\input{algorithms/execute_batch}
+
+\subsection{Decision Scope and Semantic Authority}
+
+\system makes decisions at three timescales (Table~\ref{tab:timescales}).  This separation lets inexpensive graph summaries guide scheduling without becoming part of the query semantics.
+
+\begin{table}[t]
+  \centering
+  \caption{Decision scope and semantic authority in \system.}
+  \label{tab:timescales}
+  \small
+  \setlength{\tabcolsep}{3pt}
+  \begin{tabular}{p{0.18\columnwidth}p{0.30\columnwidth}p{0.40\columnwidth}}
+    \toprule
+    Time & Decision & State allowed to determine results \\
+    \midrule
+    graph reuse & phase index & none; summary only \\
+    query batch & grouping and offsets & sources and start times only \\
+    iteration & strategy and next frontier & exact masks, values, and policy \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+At graph-reuse time, index error affects only later overlap scores.  At query-window time, grouping determines which queries may share resident state and offsets insert idle global iterations before a query starts.  At iteration time, the runtime may reorder legal relaxations, but it may not approximate frontier membership, cumulative state, or a policy update.
+
+This boundary also provides safe fallbacks.  Without a phase index, \system uses input-order batches and zero offsets.  Without incoming adjacency, it uses only \sharedexpand.  If an algorithm lacks a validated phase summary, scheduling is bypassed while exact multi-query execution remains available.  Each missing component therefore removes an optimization rather than changing an answer.
+
+\subsection{Illustrative Example}
+
+Suppose queries $q_0$, $q_1$, and $q_3$ all contain high-degree vertex $v$ in their current frontier.  Independent execution accesses the neighbor list of $v$ three times.  \system stores $v$ once in $U_t$ and records membership mask $1011_2$.  \sharedexpand accesses the list once and applies relaxations for exactly those three queries.  Later, if the frontiers become broad, \coalescedgather visits destinations and evaluates the values of $q_0,q_1,\ldots$ for each predecessor as one regular batch.  Start offsets increase the chance of the first situation; adaptive execution determines which access strategy is appropriate for the current iteration.

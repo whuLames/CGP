@@ -1,0 +1,5 @@
+\section{Conclusion}
+
+Concurrent graph queries repeatedly access the same topology, yet their performance on GPUs is constrained by both redundant neighborhood access and irregular query-state access.
+\system follows one principle---share repeated accesses and regularize the remainder---through exact vertex sharing, access-efficient aggregation, and phase-aware scheduling whose predictions affect performance but not correctness.
+The current prototype demonstrates the computation model and promising BFS access reductions; fixed-policy results, controlled memory evidence, and same-engine prior-work decomposition remain necessary for a submission-level performance claim.

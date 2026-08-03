@@ -1,0 +1,189 @@
+\section{Design}
+\label{sec:design}
+
+This section describes \system at the graph-computation level.  It first defines the shared state that preserves query identity, then presents one strategy for reducing neighborhood-access count and another for reducing the cost of broad query-state access.  Section~\ref{sec:implementation} describes how these strategies are parallelized on a GPU.
+
+\subsection{A Query-Aware Computation Model}
+
+Let the active work at global iteration $t$ be
+\begin{equation}
+  \mathcal{A}_t=\{(v,q)\mid q\text{ is active and }v\in F_{\ell_q(t)}^q\},
+  \label{eq:active-work}
+\end{equation}
+where $F_i^q$ is the frontier of query $q$ at its logical level $i$, and $\ell_q(t)$ maps a global iteration to that level.  Query identity is part of the work item: two queries may share a graph access, but their values and convergence conditions remain independent.  Projecting $\mathcal{A}_t$ onto vertices gives the union frontier $U_t$; the multiplicity of $v$ records how many queries can reuse its neighborhood.
+
+Independent execution enumerates the outgoing adjacency of $v$ once for every pair $(v,q)\in\mathcal{A}_t$.  The resulting candidate work can be written as
+\begin{equation}
+  \mathcal{C}_t=\{(v,u,q)\mid(v,q)\in\mathcal{A}_t\land (v,u)\in E\}.
+  \label{eq:candidate-work}
+\end{equation}
+This formulation exposes two distinct opportunities.  First, candidate generation can be factored by $v$: access the neighborhood once, then apply it to exactly the queries associated with $v$.  Second, when $\mathcal{C}_t$ is broad, the same legal candidates can be enumerated by destination and query so that accesses to query-specific state follow a regular order.  These are the logical foundations of \sharedexpand and \coalescedgather, respectively.
+
+Scheduling operates one level earlier.  It changes the mappings $\ell_q(t)$ so queries with compatible phases contribute to the same $\mathcal{A}_t$, increasing the multiplicity of useful vertices.  It never changes the order of logical levels within a query.  Thus, scheduling controls \emph{when} reusable work appears, vertex sharing controls \emph{how often} neighborhoods are accessed, and aligned aggregation controls \emph{how} the remaining state is accessed.
+
+Table~\ref{tab:policies} instantiates this model for the traversal policies used in the paper.  The shared work sets are independent of the value type; only candidate generation and acceptance are policy-specific.  This separation is what permits cross-query sharing without reducing the system to a BFS-only representation.
+
+\begin{table}[t]
+  \centering
+  \caption{Example query policies supported by the computation model.}
+  \label{tab:policies}
+  \small
+  \setlength{\tabcolsep}{3pt}
+  \begin{tabular}{llll}
+    \toprule
+    Query & Value & Edge candidate & Accept \\
+    \midrule
+    BFS & $d_q(v)$ & $d_q(v)+1$ & first discovery \\
+    SSSP & $x_q(v)$ & $x_q(v)+w(v,u)$ & smaller \\
+    SSWP & $x_q(v)$ & $\min(x_q(v),w(v,u))$ & larger \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\subsection{Exact Query-Aware State}
+
+\system stores query values in a vertex-major matrix:
+\begin{equation}
+  \mathrm{pos}(v,q)=v\cdot Q+q.
+\end{equation}
+Thus, all resident query values associated with one graph vertex form one contiguous row.  A compact active-query set disables completed or not-yet-started queries without changing the matrix shape.
+
+Three per-vertex masks have different meanings and lifetimes.  The \emph{frontier mask} is $\querymask_t(v)$ for the current iteration.  The \emph{next-frontier mask} records queries whose values change for the next iteration.  The \emph{visited mask} is cumulative and is used by algorithms such as BFS to reject repeated discovery.  A compact vertex list contains exactly the vertices with a nonempty current frontier mask, allowing execution to enumerate $U_t$ without scanning all of $V$.
+
+Figure~\ref{fig:state-lifecycle} shows why the masks cannot be collapsed.  Frontier membership is a per-level work predicate, visited membership is historical algorithm state, and the next mask is the result of typed updates.  Combining frontier and visited state would reprocess inactive vertices; discarding query membership would force unrelated queries to inspect every union vertex.
+
+\input{figures/state_lifecycle}
+
+The masks expose sharing without changing the value domain of an individual query.  For an active vertex $v$, the engine enumerates exactly the queries in $\querymask_t(v)$ and invokes their typed relaxation rule.  BFS uses first discovery, SSSP uses weighted minimum, and widest path uses bottleneck maximum.  The mask determines \emph{which queries share the vertex}; the policy determines \emph{what each query computes}.
+
+\paragraph{Exactness invariant.}
+At the start of a logical level, bit $q$ is present in $F_t[v]$ if and only if independent execution of query $q$ would process $v$ at level $\ell_q(t)$.  The compact union contains $v$ if and only if $F_t[v]$ contains at least one active query.  Parallel insertion may change the order of vertices in the compact list, but it cannot change the membership relation.  Both traversal strategies consume this invariant.
+
+\subsection{Reducing Access Count: Vertex Sharing}
+\label{sec:sharedexpand}
+
+\sharedexpand is a source-oriented traversal over the exact union frontier.  For each $v\in U_t$, it accesses the outgoing neighbor list of $v$ once, obtains $M=\querymask_t(v)$, and applies the relaxation of each query in $M$ to every edge $(v,u)$.  Only successful query updates are inserted into the next-frontier mask of $u$.
+
+Algorithm~\ref{alg:shared-expand} gives the logical procedure.  It separates a shared topology action---accessing the neighbor list---from query-specific value updates.  A query cannot participate merely because another query contains $v$: it must be named by the exact mask.
+
+\input{algorithms/shared_expand}
+
+The neighborhood-access count is $E_{\mathrm{union}}$, compared with $E_{\mathrm{ind}}$ under independent execution.  The strategy still performs up to $E_{\mathrm{pair}}$ typed relaxations; these are necessary query work and are not counted as eliminated accesses.  Its logical work is
+\begin{equation}
+  O(|U_t|+E_{\mathrm{union}}+E_{\mathrm{pair}}),
+\end{equation}
+with $O(|V|)$ auxiliary mask and compaction state shared by the batch.  The benefit is therefore a reduction in repeated row metadata and neighbor access, not a change in the worst-case number of query-specific relaxations.
+
+\paragraph{BFS specialization.}
+Visited bits remove queries that already discovered the destination.  The remaining query bits share the same edge traversal.  This retains the principal reuse opportunity of \textsc{iBFS}~\cite{liu_ibfs_2016}, while keeping current frontier, cumulative state, and typed values separate so the computation model extends to weighted min/max traversals.
+
+\subsection{Reducing Access Cost: Aligned Aggregation}
+\label{sec:gather}
+
+Vertex sharing is selective when frontiers are sparse and overlapping, but its destination updates become irregular as many queries and vertices are active.  \coalescedgather addresses this second regime with a destination-oriented computation.  The graph additionally stores incoming adjacency.  For a destination $v$, the strategy visits each predecessor $u$ and evaluates the resident query values
+\begin{equation}
+  X[u,0],X[u,1],\ldots,X[u,Q_t-1]
+\end{equation}
+as a contiguous group.  It reduces candidates separately for every query, compares them with $X[v,q]$, and records exactly the queries whose destination value changes.
+
+Algorithm~\ref{alg:coalesced-gather} describes this computation without committing to a hardware mapping.  The essential choice is to hold the graph vertex fixed while varying the query identifier.  The vertex-major state layout then turns the query dimension into a regular access sequence.  The graph semantics remain the same as ordinary destination-oriented traversal; the contribution is its organization across concurrent queries.
+
+\input{algorithms/coalesced_gather}
+
+Without early termination, \coalescedgather examines $O(Q_t|E|)$ predecessor pairs and performs $O(Q_t|V|)$ final comparisons.  It therefore does not improve the worst-case work bound and may lose badly on sparse frontiers.  It becomes attractive when frontiers are broad, many resident queries remain active, and the lower effective cost of regular state access outweighs the extra edge inspection.  This trade-off is why \coalescedgather complements rather than replaces \sharedexpand.
+
+\subsection{Traversal Semantics and Correctness}
+
+A query policy defines a value type, an identity or infinity value, an edge relaxation, and an order predicate for accepting an update.  BFS uses integer distance and first discovery; SSSP uses addition followed by minimum; widest path uses minimum along an edge followed by maximum at a destination.  Both strategies reuse the same query-aware state.  Dense sum algorithms such as PageRank require a separate double-buffered path and are outside the primary traversal claim.
+
+\paragraph{Level equivalence.}
+Assume a level-synchronous algorithm whose candidates are combined with an associative policy reduction.  At iteration $t$, exact $\querymask_t(v)$ contains $(v,q)$ if and only if independent query $q$ would process $v$ at logical level $\ell_q(t)$.  \sharedexpand enumerates the same outgoing edges and candidates while sharing the neighborhood access.  \coalescedgather enumerates the corresponding predecessor candidates in a different order.  The policy reduction produces the same level result, and the next mask records exactly the queries whose values change.  Induction over logical levels therefore yields the same fixed point as independent execution.
+
+\paragraph{Why strategy switching is safe.}
+Suppose the invariant holds before iteration $t$.  Both strategies evaluate the legal candidates for the same logical level and set query $q$ in the next mask exactly when $x_q(v)$ changes.  They differ only in traversal order and data-access organization.  The runtime may consequently choose a strategy independently at every level without converting query state or approximating a frontier.
+
+\paragraph{Start offsets and termination.}
+A start offset inserts inactive global iterations before a query's logical level zero; it does not alter the query's internal level sequence.  BFS terminates when it discovers no new vertex, while min/max traversals terminate when no value improves.  Terminating one query removes only its active membership; the state of other queries is unaffected.  Non-associative floating-point policies may not be bitwise reproducible, so the evaluation declares their tolerance separately.
+
+\subsection{Sharing-Aware Query Scheduling}
+\label{sec:planner}
+
+\input{figures/planner}
+
+The scheduler increases the input opportunity for \sharedexpand by placing compatible high-cost traversal phases in the same global iterations.  It has a reusable graph-analysis stage and a query-window stage.
+
+\paragraph{Reusable phase index.}
+The index selects up to $L=4$ landmarks using a farthest-point procedure seeded by a high-degree vertex and degree-biased samples.  A traversal from each landmark stores a 16-bit distance per vertex.  Build complexity is $O(L(|V|+|E|))$ and principal storage is approximately $2L|V|$ bytes.  Distances that exceed the representation are saturated, and unreachable vertices receive a sentinel.
+
+For sources $s_i$ and $s_j$, landmark distances produce a histogram $H_{ij}(\delta)$ over likely overlap at relative level $\delta$.  Vertex samples are degree-weighted so that aligning a shared high-degree region scores more than aligning isolated vertices.  Pairwise histograms preserve source-pair-specific offsets that a single global source order cannot express.
+
+\paragraph{Batch construction.}
+The scheduler greedily adds the source with the largest marginal compatibility to a batch and then applies pair swaps across batches.  The batch score sums pairwise overlap under the current offsets.  Deterministic restarts reduce sensitivity to the first seed.  This is an online heuristic for a combinatorial problem; \system does not claim optimal grouping.
+
+\paragraph{Offset selection.}
+Each batch uses bounded coordinate search to select a delay in $[0,D]$ for every query; $D=16$ by default.  Each step changes one delay to maximize histogram mass at the induced pairwise offsets.  One query is anchored at zero to remove translation-equivalent schedules.  A delay penalty can account for query latency and must be calibrated on held-out workloads.
+
+\paragraph{Fallback.}
+Scheduling is bypassed when the query type lacks a meaningful phase estimator, the reusable index is unavailable, or a conservative benefit check predicts that planning cost exceeds expected access savings.  The current runner enables scheduling only for selected BFS workloads.  Existing SSSP and widest-path runs therefore establish safe execution, not cross-algorithm scheduling benefit.
+
+Algorithm~\ref{alg:online-planner} summarizes the implemented procedure.  Batch formation uses offset-aware pair affinity, after which each batch receives bounded coordinate search.  Cross-batch swaps partially repair the fact that grouping and final offsets are not solved jointly.
+
+\input{algorithms/online_planner}
+
+\subsection{Adaptive Strategy Selection}
+\label{sec:selector}
+
+The desired selector estimates the memory-related cost of both strategies from exact counters already produced by execution:
+\begin{align}
+ C_{\mathrm{VS}} &= a_0 + a_1 E_{\mathrm{union}}
+                    +a_2 E_{\mathrm{pair}}+a_3 A_t, \\
+ C_{\mathrm{AG}} &= b_0 + b_1 E_{\mathrm{in}}
+                    +b_2 R_{\mathrm{state}}(Q_t)+b_3 |V|,
+\end{align}
+where $A_t$ counts active destination--query pairs, $E_{\mathrm{in}}$ is incoming edge inspection, and $R_{\mathrm{state}}$ estimates the cost of regular batched state access.  Coefficients may depend on deployment hardware and value width, but should transfer across graphs on the same platform.  Hysteresis prevents unstable switching near the crossover.
+
+Figure~\ref{fig:selector-space} shows the qualitative boundary.  High exact overlap favors \sharedexpand; broad frontiers and high query activity amortize the fixed inspection cost of \coalescedgather.  The boundary is deliberately conceptual because its measured position depends on graph structure, value width, and platform.
+
+\input{figures/selector_space}
+
+\paragraph{Current implementation.}
+The checked-in selector does not yet implement this calibrated model.  It chooses \coalescedgather when
+\begin{equation}
+ E_{\mathrm{virtual}} \geq \tau Q_t|E|,
+\end{equation}
+with default $\tau=0.20$; BFS remains in that strategy after switching.  $E_{\mathrm{virtual}}$ counts query-weighted expansion work.  The threshold is interpretable but does not separately model neighborhood-access savings and regular state-access cost.  \drafttodo{Fit the two-strategy model on a disjoint training subset; freeze coefficients; compare it with the threshold, fixed strategies, and a per-iteration oracle on held-out graph/query pairs.}
+
+\subsection{Alternatives Considered}
+
+\paragraph{Independent query execution.}
+It preserves per-query simplicity but does not remove repeated neighborhood access or organize state across queries.  It remains an essential baseline.
+
+\paragraph{One global union without exact membership.}
+It accesses a neighborhood once but evaluates every query for every union vertex, replacing repeated topology access with false query--edge work.  Exact masks avoid this failure mode.
+
+\paragraph{One fixed traversal strategy.}
+Always using vertex sharing is inefficient for broad phases with irregular destination state access; always using aligned aggregation examines too much topology for sparse phases.  A selector is necessary only if its saved cost exceeds measurement and switching overhead.
+
+\paragraph{Single scalar source order.}
+Sorting sources by distance to one landmark is inexpensive but cannot express pair-specific relative phases.  It is included as a \textsc{Glign}-compatible ablation rather than treated as sufficient scheduling.
+
+\paragraph{Immediate query replenishment.}
+Reusing a resident slot as soon as a query completes can increase occupancy, but current measurements show that mixing traversal phases often increases total access work.  \system therefore executes a closed, phase-aligned batch by default.
+
+\begin{table*}[t]
+  \centering
+  \caption{Logical design choices and the evidence required to justify them.}
+  \label{tab:design-alternatives}
+  \small
+  \begin{tabular}{p{0.20\textwidth}p{0.20\textwidth}p{0.27\textwidth}p{0.23\textwidth}}
+    \toprule
+    Decision & \system choice & Alternative and trade-off & Required evidence \\
+    \midrule
+    query-aware state & exact level mask + typed value & query-oblivious union adds false work; BFS-only bits restrict algorithms & query--edge work and multi-algorithm correctness \\
+    access-count reduction & one traversal per union vertex & per-query execution repeatedly accesses shared neighborhoods & neighborhood bytes at fixed query--edge work \\
+    access-cost reduction & vertex-major batched aggregation & independent query order produces irregular state access & requests and exposed stalls per useful value \\
+    temporal coordination & pairwise phases + bounded offsets & scalar source order misses pair-specific alignment & predicted versus realized overlap over many seeds \\
+    adaptive execution & exact counters + calibrated model & one fixed mode is simpler but phase-sensitive & held-out regret against a strategy oracle \\
+    \bottomrule
+  \end{tabular}
+\end{table*}

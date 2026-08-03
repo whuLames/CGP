@@ -1,0 +1,36 @@
+\section{Related Work}
+\label{sec:related}
+
+\begin{table*}[t]
+  \centering
+  \caption{Positioning against representative database and concurrent graph systems.  The systems optimize different sources of graph-processing cost; entries describe scope rather than performance.}
+  \label{tab:positioning}
+  \small
+  \setlength{\tabcolsep}{4pt}
+  \begin{tabular}{p{0.09\textwidth}p{0.15\textwidth}p{0.22\textwidth}p{0.25\textwidth}p{0.18\textwidth}}
+    \toprule
+    System & Workload & Reuse or bottleneck & Main approach & Algorithm/platform scope \\
+    \midrule
+    TGraph & one analytic & accelerator portability & tensor-centric model and tensor graph operations & multiple analytics, multiple accelerators \\
+    CGgraph & one analytic & cross-iteration graph reuse and limited device memory & retain reusable subgraph; cooperative processing & multiple analytics, CPU--GPU \\
+    Compress\-Graph & one analytic & repeated neighbor sequences & rule-based compression and direct execution & multiple analytics, CPU/GPU \\
+    iBFS & concurrent BFS & cross-query frontier overlap & shared BFS state and direction selection & BFS, GPU \\
+    Glign & concurrent traversals & temporal phase misalignment & landmark affinity, grouping, and delayed starts & iterative traversals \\
+    \system & concurrent queries & repeated neighborhoods and irregular query-state access & exact vertex sharing, aligned aggregation, and phase scheduling & BFS/SSSP/SSWP, GPU \\
+    \bottomrule
+  \end{tabular}
+\end{table*}
+
+\paragraph{Database graph analytics systems.}
+Recent SIGMOD/VLDB systems begin from a graph-processing limitation and introduce a computation model before hardware optimization.  TGraph uses tensor computation runtimes to provide one graph model across accelerator backends and adds tensor-based compression and out-of-memory processing~\cite{zhang_tgraph_2025}.  CGgraph addresses limited GPU memory and CPU--GPU imbalance by retaining a reusable subgraph and allocating tasks on demand~\cite{cui_cggraph_2024}.  CompressGraph represents repeated neighbor sequences as rules and reuses intermediate results while executing directly on the compressed graph~\cite{chen_compressgraph_2023}.  Gunrock provides a programmable frontier abstraction and efficient single-query GPU graph execution~\cite{wang_gunrock_2016}, while direction-optimizing BFS reduces examined edges by changing traversal direction~\cite{beamer_direction_2013}.  These systems motivate our abstraction-first presentation and strong single-query baselines.  Their primary workload is one analytic, whereas \system studies reuse and access organization across a window of independent queries.
+
+\paragraph{Concurrent BFS and traversal alignment.}
+\textsc{iBFS} jointly executes multiple BFS instances with shared frontier and status state and supports both traversal directions~\cite{liu_ibfs_2016}.  It is the closest BFS baseline and already demonstrates cross-query neighborhood reuse.  \system retains exact current-query membership separately from cumulative state, supports typed min/max policies, and connects sharing with phase scheduling and broad state aggregation.  These differences require a same-engine decomposition rather than a claim based only on external runtimes.
+
+\textsc{Glign} observes that queries reach expensive graph regions at different times and uses high-degree landmarks, affinity grouping, and delayed starts~\cite{yin_glign_2022}.  \system adopts temporal alignment but estimates pair-specific relative phases and optimizes realized neighborhood access.  More importantly, scheduling is one component of a memory-access design that also determines how shared and non-shared state is executed.  A \textsc{Glign}-compatible policy on the same engine isolates this incremental value.
+
+\paragraph{General concurrent graph processing.}
+MITra formalizes multi-instance traversal and synthesizes shared algorithms from ranks and edge functions~\cite{li_mitra_2023}; AutoMI automates vectorized distributed graph computation~\cite{zhao_automating_2024}; and Krill uses compiler and runtime support for concurrent graph processing~\cite{chen_krill_2021}.  Seraph separates graph structure, runtime state, and computation so cluster jobs can share graph resources~\cite{xue_seraph_2014,xue_processing_2017}.  GraphM improves storage throughput~\cite{zhao_graphm_2019}; Congra schedules shared-memory queries~\cite{pan_congra_2017}; Q-Graph preserves query locality in distributed partitions~\cite{mayer_qgraph_2018}; and MultiLyra and BEAD batch iterative queries to amortize communication and synchronization~\cite{mazloumi_multilyra_2019,mazloumi_bead_2020}.  The survey by Li et al. organizes these opportunities by sharing, scheduling, and optimization~\cite{li_survey_2024}.  \system focuses specifically on memory-access latency for a resident graph and derives all three components from that bottleneck.
+
+\paragraph{Sharing across analytical queries.}
+Database engines share scans, common subexpressions, and intermediate results across concurrent analytical queries.  Psaroudakis et al. show that simultaneous pipelining and global sharing have concurrency-dependent trade-offs~\cite{psaroudakis_sharing_2013}.  CGQ has a related but dynamic opportunity: the shared vertex set changes at every graph level, and the system must retain query identity through every reuse decision.  \system therefore uses approximate coordination only to expose opportunities and exact masks to authorize actual sharing.

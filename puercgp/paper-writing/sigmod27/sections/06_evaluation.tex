@@ -1,0 +1,205 @@
+\section{Evaluation}
+\label{sec:evaluation}
+
+The evaluation tests whether the memory-access view yields an effective CGQ system.  It separates three mechanisms from end-to-end performance: neighborhood sharing, regular state access, and scheduling-induced reuse.  Blue text denotes reproducible but preliminary measurements from the current repository; red text marks experiments still required before submission.
+
+We organize the section around six questions:
+\begin{description}
+  \item[RQ1: Overall performance.] Does one fixed \system configuration improve query-window throughput and latency over strong graph-system and CGQ baselines?
+  \item[RQ2: Memory behavior.] Do fewer neighborhood accesses and lower state-access stalls explain performance?
+  \item[RQ3: Component effectiveness.] What does vertex sharing, aligned aggregation, adaptive selection, and scheduling contribute individually?
+  \item[RQ4: Scheduling quality.] Do grouping and offsets increase realized vertex sharing after online cost and query delay?
+  \item[RQ5: Generality and scaling.] Do the benefits persist across graph structure, query count, batch size, algorithms, and devices?
+  \item[RQ6: Overhead and correctness.] What preprocessing, online, memory, and semantic costs does \system introduce?
+\end{description}
+
+\subsection{Experimental Setup}
+
+\paragraph{Platform.}
+Existing measurements use one NVIDIA Tesla V100-SXM2 with 32~GiB HBM2, CUDA 12.8, and release compilation.  Unless stated otherwise, query sources are distinct, reusable index construction is excluded, online scheduling is included, and correctness is checked against per-query fingerprints.  The online runner uses two warmups, five measured repetitions, alternating method order, and reports the median.  Final experiments will add a recent GPU generation and at least seven measured repetitions with confidence intervals.
+
+\paragraph{Datasets.}
+Table~\ref{tab:datasets} spans citation, web, and social graphs with different degree distributions.  The final suite should add a long-diameter road graph and a synthetic family with controlled degree skew and source overlap.  Directed inputs retain their directions; \coalescedgather materializes incoming adjacency.
+
+\begin{table}[t]
+  \centering
+  \caption{Graphs in existing experiments.  B and M denote billions and millions.}
+  \label{tab:datasets}
+  \small
+  \begin{tabular}{lrr}
+    \toprule
+    Graph & $|V|$ & $|E|$ \\
+    \midrule
+    cit-Patents & 3.77M & 33.04M \\
+    soc-Orkut & 3.00M & 212.70M \\
+    soc-LiveJournal1 & 4.85M & 137.99M \\
+    indochina-2004 & 7.41M & 304.47M \\
+    soc-Twitter & 21.30M & 530.05M \\
+    soc-SinaWeibo & 58.66M & 522.64M \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\paragraph{Queries.}
+We evaluate BFS, SSSP with nonnegative weights, and single-source widest path (SSWP).  Main experiments use $N=256,Q=64$ and sweep $N\in\{64,128,256,512,1024\}$ and $Q\in\{1,2,4,8,16,32,64\}$.  Query latency begins at window admission, so scheduling delay remains visible.  Uniform distinct sources are the reproducible default; high-degree-biased, community-local, and adversarial low-overlap sources exercise different sharing regimes.  Every family uses at least ten stored source vectors.
+
+\paragraph{Baselines.}
+The main comparison includes: independent execution in the same engine; independent concurrent execution; Gunrock~\cite{wang_gunrock_2016} and TGraph~\cite{zhang_tgraph_2025} where their artifacts support the same graph and algorithm; \textsc{iBFS} for BFS~\cite{liu_ibfs_2016}; and a \textsc{Glign}-compatible grouping and delay policy on \system's execution engine~\cite{yin_glign_2022}.  The same-engine baselines isolate CGQ mechanisms from language and implementation differences.  CGgraph and CompressGraph address out-of-memory and compressed single-query execution, respectively, so they provide design context rather than a universal speedup denominator.
+
+\paragraph{Metrics and fairness.}
+Window throughput is $N/T_{\mathrm{wall}}$ and includes query-dependent scheduling.  We report absolute time, queries/s, P50/P95 query latency, peak memory, and out-of-memory outcomes.  Access metrics include $E_{\mathrm{ind}}$, $E_{\mathrm{union}}$, $E_{\mathrm{pair}}$, device memory bytes, requests per useful value, and exposed data-access stalls.  Every main result uses one frozen policy rather than the best configuration selected separately for each graph.  Systems receive the same orientation, weights, sources, semantics, memory limit, warmups, and repetitions.  \drafttodo{Rerun all systems from one clean commit on an exclusive machine and publish source vectors, raw repetitions, checksums, clocks, and commands.}
+
+\subsection{RQ1: Overall CGQ Performance}
+
+\paragraph{Hypothesis.}
+If access savings exceed mask maintenance, frontier construction, and scheduling cost, one fixed \system configuration should improve query-window throughput without hiding delay in its constituent queries.  The primary result will report queries/s and absolute time over all graph--algorithm pairs, normalized to the strongest applicable baseline, with a separate common-capacity comparison for systems that cannot hold $Q=64$.
+
+\drafttodo{Produce the fixed-policy $N=256,Q=64$ main table after implementing and freezing the selector.  Include independent execution, Gunrock/TGraph where applicable, iBFS, the Glign-compatible schedule, GraphWeft, scheduling time, total time, queries/s, P50/P95 latency, and peak device memory.}
+
+The current external result is not yet a positive end-to-end claim.  Table~\ref{tab:ibfs-gap} compares the fixed online-hybrid BFS path with \textsc{iBFS} at $N=256,Q=64$.  \preliminary{Its geometric-mean speedup is only $0.49\times$.}  This result shows that the current combination of sharing and scheduling does not compensate for the maturity and BFS specialization of \textsc{iBFS} at this batch size.
+
+\begin{table}[t]
+  \centering
+  \caption{Preliminary fixed-$Q=64$ BFS comparison.  Speedup is iBFS time divided by \system time; higher favors \system.}
+  \label{tab:ibfs-gap}
+  \small
+  \begin{tabular}{lrrr}
+    \toprule
+    Graph & \system (ms) & iBFS (ms) & Speedup \\
+    \midrule
+    cit-Patents & 967.87 & 298.36 & 0.31$\times$ \\
+    soc-Orkut & 1679.54 & 1030.02 & 0.61$\times$ \\
+    soc-Twitter & 10268.30 & 3463.27 & 0.34$\times$ \\
+    soc-SinaWeibo & 5704.68 & 5180.71 & 0.91$\times$ \\
+    \midrule
+    Geometric mean & --- & --- & 0.49$\times$ \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+Two follow-ups gate the final claim.  First, the batch-size sweep must reproduce on the current code the earlier observation that \system is more competitive at $Q=16$ and $Q=32$.  Second, the same engine must compare an iBFS-like bitwise BFS, a \textsc{Glign}-compatible schedule, their combination, and the full \system.  This decomposition distinguishes a general memory-access design from a composition of prior BFS and scheduling techniques.
+
+\paragraph{Current conclusion.}
+The current $Q=64$ evidence rejects end-to-end superiority for BFS.  It narrows the immediate task to locating the batch-size crossover, removing hybrid regressions, and testing whether typed multi-algorithm execution adds value after controlling for an iBFS-like specialization.
+
+\subsection{RQ2: Memory-Access Behavior}
+
+\paragraph{Hypothesis.}
+\sharedexpand should improve time only when it reduces realized neighborhood access, while \coalescedgather should improve time only when regular state access reduces memory requests or exposed stalls enough to offset additional edge inspection.  We test two causal chains:
+\[
+ \text{sharing}\rightarrow E_{\mathrm{union}}/E_{\mathrm{ind}}
+ \rightarrow\text{topology bytes}\rightarrow\text{time},
+\]
+\[
+ \text{aggregation}\rightarrow\text{requests/value}
+ \rightarrow\text{access stalls}\rightarrow\text{time}.
+\]
+The controlled comparison holds the logical query--edge pairs and output values fixed while changing data organization and traversal order.
+
+Existing profiles support the bottleneck diagnosis but not yet the full causal chain.  In one representative $Q=32$ aggregation iteration per graph, achieved bandwidth is 31--62\% of peak while long-latency dependency stalls account for 43--60\% (Table~\ref{tab:ncu}).  Sampling one iteration cannot characterize a complete query window.
+
+\begin{table}[t]
+  \centering
+  \caption{Preliminary profile of one $Q=32$ aggregation iteration per graph.}
+  \label{tab:ncu}
+  \small
+  \begin{tabular}{lrrr}
+    \toprule
+    Graph & GB/s & Peak BW & Access stall \\
+    \midrule
+    cit-Patents & 531.8 & 59.2\% & 59.8\% \\
+    soc-Orkut & 557.3 & 62.0\% & 46.5\% \\
+    soc-Twitter & 278.4 & 31.0\% & 51.7\% \\
+    soc-SinaWeibo & 472.9 & 52.6\% & 43.1\% \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\drafttodo{Collect stratified or full-run profiles; compare vertex-major and query-major state, plus direct and alternative aggregation, for 4-, 8-, and 16-byte values.}
+
+\paragraph{Current conclusion.}
+The samples establish that exposed data-access latency is significant in the target workload, but they do not yet prove that \coalescedgather reduces it relative to a controlled alternative.  That proof requires identical logical work, values, and frontier inputs.
+
+\subsection{RQ3: Component Effectiveness}
+
+\paragraph{Hypothesis.}
+Each component should move the memory quantity it targets: query-aware masks should eliminate false query--edge work, \sharedexpand should reduce neighborhood accesses, \coalescedgather should reduce effective state-access cost in broad phases, and the selector should approach the faster strategy without per-graph tuning.
+
+The ablation compares independent execution; a query-oblivious union; exact masks with fixed \sharedexpand; exact masks with fixed \coalescedgather; the existing threshold; the calibrated selector; and a measured per-iteration oracle.  Controlled frontier replays vary union size, mask population, degree, active query count, and value width independently.  Whole-query runs then test whether the learned crossover transfers to natural frontier sequences.  Selector quality is reported as regret relative to the oracle, switching frequency, and measurement/model overhead.
+
+\drafttodo{Implement the model in Section~\ref{sec:selector}, create graph-disjoint calibration and test splits, and explain the current Twitter hybrid regression.}
+
+\subsection{RQ4: Sharing-Aware Scheduling}
+
+\paragraph{Hypothesis.}
+If the phase estimator captures useful overlap, higher schedule scores should produce lower $E_{\mathrm{union}}/E_{\mathrm{ind}}$ after online cost, without unacceptable query delay.  Table~\ref{tab:planner-prelim} reports the strongest current mechanism result: all-push BFS, $N=128,Q=32$, seed 42, comparing online grouping plus offsets with input-order batches at zero offset.  \preliminary{Speedups range from $1.15\times$ to $2.31\times$, and the largest gains coincide with the largest reductions in union-edge access.}
+
+Figure~\ref{fig:planner-result} places the execution benefit beside the remaining neighborhood work.  The trend is consistent with the access-count hypothesis, but the single seed, BFS-only workload, and per-graph landmark configurations do not establish general scheduling quality.
+
+\input{figures/planner_speedup}
+
+\begin{table*}[t]
+  \centering
+  \caption{Preliminary online scheduling result: all-push BFS, $N=128,Q=32$.  Baseline is input-order batching with zero offsets; scheduling time is included.}
+  \label{tab:planner-prelim}
+  \small
+  \begin{tabular}{lrrrrrr}
+    \toprule
+    Graph & Baseline (ms) & Scheduled (ms) & Speedup & Sched. (ms) & Baseline union edges & Scheduled union edges \\
+    \midrule
+    indochina-2004 & 1116.43 & 483.42 & 2.31$\times$ & 10.69 & 9.278B & 3.302B \\
+    soc-Twitter & 5160.31 & 2602.48 & 1.98$\times$ & 11.87 & 9.462B & 4.054B \\
+    soc-LiveJournal1 & 1032.91 & 693.50 & 1.49$\times$ & 13.14 & 2.367B & 1.422B \\
+    soc-Orkut & 1459.51 & 1087.66 & 1.34$\times$ & 14.49 & 2.887B & 2.016B \\
+    cit-Patents & 1039.62 & 806.09 & 1.29$\times$ & 14.20 & 0.745B & 0.527B \\
+    soc-SinaWeibo & 5571.70 & 4834.70 & 1.15$\times$ & 11.24 & 4.973B & 4.202B \\
+    \bottomrule
+  \end{tabular}
+\end{table*}
+
+The six-graph ordering is monotonic: indochina retains 35.6\% of baseline union-edge work and has the largest speedup, while SinaWeibo retains 84.5\% and has the smallest.  Online scheduling takes 10.7--14.5~ms and is included in the scheduled time.  This small sample supports the proposed mechanism but is not a general correlation result.
+
+The newer $N=256,Q=64$ runner adds a conservative automatic gate (Table~\ref{tab:planner-gating}).  It enables full scheduling for cit-Patents and Twitter and uses the fallback for the other two cases.  The gate avoids regressions in the tested neutral cases, but the four-graph geometric-mean benefit is only $1.064\times$.
+
+\begin{table}[t]
+  \centering
+  \caption{Preliminary automatic scheduling for BFS at $N=256,Q=64$.  Online evaluation is included; disabled rows use the fallback.}
+  \label{tab:planner-gating}
+  \small
+  \begin{tabular}{lrrr}
+    \toprule
+    Graph & Schedule & Speedup & Eval. ms \\
+    \midrule
+    cit-Patents & full & 1.148$\times$ & 26.62 \\
+    soc-Orkut & disabled & 1.000$\times$ & 0.02 \\
+    soc-Twitter & full & 1.119$\times$ & 15.10 \\
+    soc-SinaWeibo & disabled & 1.000$\times$ & 0.11 \\
+    \midrule
+    Geometric mean & auto & 1.064$\times$ & --- \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+The final ablation compares input order, random order, degree grouping, a scalar-landmark \textsc{Glign}-compatible policy, pairwise histograms, pair swaps, zero offsets, completion-aligned offsets, and bounded coordinate search.  It reports predicted score, realized $S_{\mathrm{share}}$, execution and scheduling time, and P50/P95 latency over at least ten source sets, including low-overlap adversarial queries.
+
+\paragraph{Current conclusion.}
+For this all-push BFS sample, lower realized neighborhood access accompanies higher speedup, and a simple gate avoids the tested neutral Q64 cases.  Existing data does not yet establish multi-seed robustness, incremental value over \textsc{Glign}, or scheduling benefit for weighted traversals.
+
+\subsection{RQ5: Generality and Scaling}
+
+\paragraph{Hypothesis.}
+Sharing should initially improve with $Q$ as more overlap becomes available, then flatten or reverse when resident state and query--edge work dominate.  The $N$ sweep separates resident batch size from total window throughput.  Source sets are stratified by predicted and realized overlap; synthetic graphs vary average degree, skew, diameter, and community structure.
+
+Cross-device experiments use the V100 and one recent GPU with a different memory/compute balance.  Selector coefficients may be calibrated once per device, not per graph.  Weighted algorithms use several weight distributions and verify that a BFS phase index is not credited for behavior it cannot predict.  \drafttodo{Design SSSP- and SSWP-appropriate phase summaries, or narrow the scheduling claim to BFS while retaining the general execution model.}
+
+\subsection{RQ6: Overhead and Correctness}
+
+Reusable index and resident state should amortize across repeated query windows before erasing execution savings.  We report memory for CSR, transpose, weights, value matrix, masks, compaction workspace, and phase index.  Online cost is decomposed into index load, histogram construction, grouping, swaps, offset search, exact counters, and union construction.  Break-even analysis finds the minimum sharing level and number of windows required to recover each cost.
+
+The current serial CPU index builder takes about 30.3~s/0.88~GiB for indochina, 45.8~s/0.58~GiB for LiveJournal, and 116.7~s/1.27~GiB for Twitter.  These costs must be reported rather than treated as free preprocessing.
+
+Correctness compares every query result with independent execution.  Existing validation covers 60 real-graph runs and 27 small-graph combinations across BFS/SSSP/SSWP, $Q\in\{1,32,64\}$, and both fixed and hybrid strategies.  The final artifact adds randomized graphs, disconnected components, duplicate sources, unreachable vertices, large distances, weighted ties, saturated landmark distances, $N$ not divisible by $Q$, and maximum offset.  Integral outputs use exact equality; floating-point policies declare tolerance and determinism limits.
+
+\subsection{Evidence Summary}
+
+Current evidence establishes three narrower facts: scheduled exact execution is correct on the tested cases; phase alignment can substantially reduce neighborhood accesses for selected BFS windows; and exposed data-access latency is significant in the sampled aggregation phases.  It does \emph{not} yet establish that a frozen \system configuration beats \textsc{iBFS}, that aligned aggregation causes lower access cost, that the selector transfers across graphs, or that scheduling benefits weighted algorithms.  These are the gating experiments for a defensible SIGMOD/VLDB claim.

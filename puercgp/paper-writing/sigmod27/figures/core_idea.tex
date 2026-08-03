@@ -1,0 +1,29 @@
+\begin{figure}[t]
+  \centering
+  \begin{tikzpicture}[
+      font=\scriptsize,
+      box/.style={draw, rounded corners, align=center, minimum height=6mm},
+      arrow/.style={-{Latex[length=1.5mm]}, thick},
+      cost/.style={font=\scriptsize, align=center}
+    ]
+    \node[box, fill=gray!8] (i0) at (0,0.7) {$q_0$ frontier};
+    \node[box, fill=gray!8] (i1) at (0,-0.05) {$q_1$ frontier};
+    \node[box, fill=red!8, minimum width=16mm] (r0) at (1.65,0.7) {CSR row $v$};
+    \node[box, fill=red!8, minimum width=16mm] (r1) at (1.65,-0.05) {CSR row $v$};
+    \draw[arrow] (i0) -- (r0);
+    \draw[arrow] (i1) -- (r1);
+    \node[cost] at (0.8,-0.65) {independent: two neighborhood accesses};
+
+    \draw[dashed, gray] (2.65,-0.75) -- (2.65,1.05);
+
+    \node[box, fill=blue!8] (mask) at (3.65,0.7) {$v: \querymask(v)=0011_2$};
+    \node[box, fill=green!8] (row) at (5.25,0.7) {one shared access};
+    \node[box, fill=blue!8] (state) at (4.45,-0.05) {$x(v,0{:}Q{-}1)$};
+    \draw[arrow] (mask) -- (row);
+    \draw[arrow] (state) -- (row);
+    \node[cost] at (4.45,-0.65) {\system: share repeats; regularize state};
+  \end{tikzpicture}
+  \caption{The core principle: share repeated accesses and regularize the remainder.  \system represents exact query overlap at a vertex, accesses its neighborhood once, and keeps the associated query states together.}
+  \Description{Two independent query frontiers each access the same adjacency row. GraphWeft combines them into one vertex with an exact query mask, one shared neighborhood access, and a contiguous row of query values.}
+  \label{fig:core-idea}
+\end{figure}

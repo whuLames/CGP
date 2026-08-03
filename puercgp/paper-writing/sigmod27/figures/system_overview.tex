@@ -1,0 +1,35 @@
+\begin{figure*}[t]
+  \centering
+  \begin{tikzpicture}[
+      font=\small,
+      box/.style={draw, rounded corners, minimum height=9mm, align=center, fill=gray!7},
+      stage/.style={box, minimum width=31mm},
+      op/.style={box, minimum width=35mm, fill=blue!7},
+      arrow/.style={-{Latex[length=2mm]}, thick},
+      note/.style={font=\scriptsize, align=center}
+    ]
+    \node[stage] (queries) {query window\\$N$ sources, $Q\!\leq\!64$ slots};
+    \node[stage, right=8mm of queries] (index) {reusable phase index\\landmarks + histograms};
+    \node[stage, right=8mm of index] (planner) {sharing-aware scheduler\\batching + offsets};
+    \node[stage, right=8mm of planner] (state) {query-aware execution\\union + exact masks};
+
+    \node[op, below=12mm of planner, xshift=-22mm] (push) {\sharedexpand\\access each active row once};
+    \node[op, below=12mm of planner, xshift=22mm] (pull) {\coalescedgather\\regular batched state access};
+    \node[stage, right=9mm of pull] (next) {next-frontier masks\\per-query results};
+
+    \draw[arrow] (queries) -- (planner);
+    \draw[arrow] (index) -- (planner);
+    \draw[arrow] (planner) -- (state);
+    \draw[arrow] (state.south) |- node[note, near start, right] {per-iteration\\cost features} (push.north);
+    \draw[arrow] (state.south) |- (pull.north);
+    \draw[arrow] (push) -- (next);
+    \draw[arrow] (pull) -- (next);
+    \draw[arrow] (next.north) |- (state.east);
+
+    \node[note, below=1mm of push] {reduces access count};
+    \node[note, below=1mm of pull] {reduces effective access cost};
+  \end{tikzpicture}
+  \caption{\system follows one memory-access objective across scheduling and execution.  The phase index exposes likely overlap, exact query masks determine what can be shared, and the runtime chooses between reducing neighborhood-access count and regularizing the remaining state access.}
+  \Description{A pipeline from a query window and reusable phase index through an online scheduler and exact query-aware state to either VertexShare or AlignedGather, followed by exact next-frontier masks and query results.}
+  \label{fig:overview}
+\end{figure*}

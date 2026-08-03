@@ -1,0 +1,69 @@
+\documentclass[sigconf,review,anonymous]{acmart}
+
+\usepackage{amsmath}
+\usepackage{algorithm}
+\usepackage[noend]{algpseudocode}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{pgfplots}
+\usepackage{placeins}
+\usepackage{siunitx}
+\usepackage{tikz}
+\usepackage{xspace}
+\usetikzlibrary{arrows.meta,decorations.pathreplacing,fit,positioning,shapes.geometric}
+\usepgfplotslibrary{groupplots}
+\pgfplotsset{compat=1.18}
+
+\setcopyright{none}
+\settopmatter{printacmref=false,printccs=false,printfolios=true}
+\renewcommand\footnotetextcopyrightpermission[1]{}
+
+\newcommand{\system}{\textsc{GraphWeft}\xspace}
+\newcommand{\sharedexpand}{\textsc{Vertex\allowbreak Share}\xspace}
+\newcommand{\coalescedgather}{\textsc{Aligned\allowbreak Gather}\xspace}
+\newcommand{\drafttodo}[1]{\textcolor{red!75!black}{\textbf{[TODO: #1]}}}
+\newcommand{\preliminary}[1]{\textcolor{blue!60!black}{#1}}
+\newcommand{\querymask}{\mathcal{M}}
+\newcommand{\frontier}{\mathcal{F}}
+
+\title{GraphWeft: Mitigating Memory-Access Overhead for Concurrent Graph Query Processing on GPUs}
+
+\acmConference[SIGMOD '27]{ACM SIGMOD International Conference on Management of Data}{June 13--19, 2027}{Huntington Beach, CA, USA}
+\acmYear{2027}
+\copyrightyear{2027}
+
+\author{Anonymous Author(s)}
+\affiliation{\institution{Anonymous Institution}}
+
+\begin{abstract}
+Concurrent graph query processing evaluates many analytics over the same graph, but executing them independently repeatedly accesses common neighborhoods and incurs irregular accesses to query-specific state.
+This problem is particularly costly on GPUs, where graph computation is often limited by exposed memory-access latency; existing concurrent graph systems primarily increase parallelism or align traversal phases without treating memory access as a unified optimization target.
+We present \system, a concurrent graph query engine based on a simple principle: share repeated accesses and regularize the remainder.
+\system combines exact query-aware vertex sharing to reduce neighborhood-access count, access-efficient aggregation to lower the cost of the remaining state accesses, and sharing-aware scheduling to expose more reusable work across queries.
+\drafttodo{Replace this sentence with the final end-to-end headline: fixed policy, current code, at least three algorithms, all graphs, and planner cost included.}
+\end{abstract}
+
+\ccsdesc[500]{Information systems~Graph-based database models}
+\ccsdesc[500]{Information systems~Data analytics}
+\ccsdesc[300]{Computing methodologies~Massively parallel algorithms}
+\keywords{concurrent graph queries, graph analytics, GPU, work sharing, memory access}
+
+\begin{document}
+\maketitle
+
+\input{sections/01_introduction}
+\input{sections/02_background}
+\input{sections/03_overview}
+\input{sections/04_design}
+\input{sections/05_implementation}
+\input{sections/06_evaluation}
+\FloatBarrier
+\input{sections/07_related_work}
+\FloatBarrier
+\input{sections/08_discussion}
+\input{sections/09_conclusion}
+
+\bibliographystyle{ACM-Reference-Format}
+\bibliography{references}
+
+\end{document}

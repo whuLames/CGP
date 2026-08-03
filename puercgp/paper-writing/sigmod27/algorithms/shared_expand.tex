@@ -1,0 +1,23 @@
+\begin{algorithm}[t]
+  \caption{\sharedexpand: exact cross-query vertex sharing}
+  \label{alg:shared-expand}
+  \footnotesize
+  \begin{algorithmic}[1]
+    \Require CSR $G$; union $U$; masks $F,N,V$; values $X$; active $A$
+    \ForAll{$v\in U$ in parallel}
+      \State $M\gets F[v]\land A$
+      \ForAll{$(v,u)\in G$}
+        \State $S\gets 0$ \Comment{queries that improve $u$ on this edge}
+        \ForAll{set bits $q$ of $M$}
+          \State $c\gets P.\Call{Relax}{X[v,q],w(v,u)}$
+          \If{$P.\Call{MergeUpdate}{X[u,q],c}$ succeeds}
+            \State $S\gets S\lor 2^q$
+          \EndIf
+        \EndFor
+        \If{$S\neq0$}
+          \State \Call{MergeMask}{$N[u],S$}; \Call{MergeMask}{$V[u],S$}
+        \EndIf
+      \EndFor
+    \EndFor
+  \end{algorithmic}
+\end{algorithm}

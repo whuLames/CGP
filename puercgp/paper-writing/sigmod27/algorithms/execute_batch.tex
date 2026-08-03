@@ -1,0 +1,27 @@
+\begin{algorithm}[t]
+  \caption{Exact execution of one scheduled query batch}
+  \label{alg:execute-batch}
+  \footnotesize
+  \begin{algorithmic}[1]
+    \Require Graph $G$; queries $(q,s_q,o_q)$; policy $P$
+    \State initialize values $X$, masks $F,N,V$, union $U\gets\emptyset$
+    \State active query word $A\gets 0$; global step $t\gets 0$
+    \While{some query has not converged}
+      \ForAll{$q$ with start offset $o_q=t$}
+        \State initialize $X[s_q,q]$; $F[s_q]\gets F[s_q]\lor 2^q$
+        \State $A\gets A\lor 2^q$
+      \EndFor
+      \State $U\gets\Call{CompactNonzero}{F}$
+      \If{$U=\emptyset$} \State $t\gets t+1$; \textbf{continue} \EndIf
+      \State $z\gets\Call{MeasureExactFeatures}{G,U,F,A}$
+      \State $m\gets\Call{SelectStrategy}{z,P}$; clear $N$
+      \If{$m=\textsc{VertexShare}$}
+        \State \Call{VertexShare}{$G,U,F,N,V,X,A,P$}
+      \Else
+        \State \Call{AlignedGather}{$G,N,V,X,A,P$}
+      \EndIf
+      \State update $A$ from changed query bits; $F\gets N$; $t\gets t+1$
+    \EndWhile
+    \Ensure Per-query values $X[\cdot,q]$
+  \end{algorithmic}
+\end{algorithm}
