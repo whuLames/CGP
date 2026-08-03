@@ -10,11 +10,11 @@ single-query SSSP/PageRank result. A speedup above 1.0 is better.
 |---|---|---:|---:|---:|---:|---|
 | BFS | cit-Patents | 64 | 4.512 | 8.984 | 1.991x | complete |
 | BFS | soc-orkut | 32 | 13.497 | 15.822 | 1.172x | complete |
-| BFS | soc-twitter | - | - | 45.178 | - | OOM at Q=2 |
+| BFS | soc-twitter | 8 | 54.460 | 45.178 | 0.830x | complete (clean rerun) |
 | BFS | soc-sinaweibo | 8 | 60.785 | 64.223 | 1.057x | complete |
 | SSSP | cit-Patents | 64 | 17.258 | 14.932 | 0.865x | complete |
 | SSSP | soc-orkut | 2 | 51.780 | 38.333 | 0.740x | complete |
-| SSSP | soc-twitter | - | - | 83.004 | - | OOM at Q=2 |
+| SSSP | soc-twitter | 4 | 118.775 | 83.004 | 0.699x | complete (clean rerun) |
 | SSSP | soc-sinaweibo | 2 | 205.217 | 185.912 | 0.906x | complete |
 | PageRank | cit-Patents | 64 | 20.468 | 21.960 | 1.073x | complete |
 | PageRank | soc-orkut | 64 | 49.295 | 49.906 | 1.012x | complete |
@@ -23,16 +23,19 @@ single-query SSSP/PageRank result. A speedup above 1.0 is better.
 
 ## Main Findings
 
-1. BFS benefits from stream-level concurrency when memory permits. The observed
-   gains range from 1.057x to 1.991x.
-2. SSSP does not benefit. It is 10.4% to 35.1% slower on the three completed
-   cases, and `soc-twitter` cannot accommodate two concurrent queries.
+1. BFS benefits from stream-level concurrency on three datasets, with gains
+   from 1.057x to 1.991x. On `soc-twitter`, Q=8 is 20.5% slower than the
+   single-stream baseline.
+2. SSSP does not benefit. It is 10.4% to 43.1% slower across all four datasets.
 3. PageRank is nearly unchanged: 0.993x to 1.073x. A single dense PageRank query
    already consumes most available GPU execution and memory bandwidth, leaving
    little useful overlap for additional streams.
-4. Memory capacity, rather than the requested Q, determines usable concurrency.
-   The experiment tried Q in `64, 32, 16, 8, 4, 2` order and only fell back on
-   an explicit allocation failure.
+4. Memory capacity determines usable concurrency. On a clean V100,
+   `soc-twitter` supports BFS at Q=8 but not Q=16, and SSSP at Q=4 but not Q=8.
+5. The original `soc-twitter` BFS/SSSP `OOM at Q=2` entries were invalid. Two
+   workers were scheduled on GPU 1 concurrently, and later attempts also
+   observed reduced memory before graph/query initialization. A clean rerun on
+   isolated GPUs produced the completed results above.
 
 These results do not support treating naive Gunrock multi-stream execution as a
 uniformly stronger baseline. It helps BFS on graphs where multiple independent
@@ -52,6 +55,8 @@ states fit in memory, but is neutral for PageRank and harmful for SSSP.
   contexts, stream creation/destruction, and all `N=256` executions.
 - Each concurrent query has an independent non-blocking stream, Gunrock context,
   algorithm state, and output buffer; the immutable graph is shared.
+- The `soc-twitter` correction used the same source file and source order on
+  otherwise idle GPUs 6 and 7. SSSP Q=4 reached about 29,692 MiB device memory.
 
 The source files and SHA-256 values are:
 
@@ -80,3 +85,4 @@ The source files and SHA-256 values are:
 - `validation/`: correctness-check outputs.
 - `run_case.py`: runner with OOM-only Q fallback.
 - `summarize.py`: deterministic result and speedup generation.
+- `../20260728_gunrock_twitter_oom_recheck/`: clean rerun and OOM diagnosis.

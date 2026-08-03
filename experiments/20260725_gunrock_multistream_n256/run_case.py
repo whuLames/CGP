@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 
 import argparse
+import contextlib
 import csv
+import fcntl
 import hashlib
 import json
 import os
@@ -24,12 +26,65 @@ Q_CANDIDATES = (64, 32, 16)
 WARMUPS = 2
 REPEATS = 5
 TOTAL_QUERIES = 256
+GPU_BUSY_LIMIT_MIB = 64
 
 
 class RunFailure(RuntimeError):
     def __init__(self, message, oom=False):
         super().__init__(message)
         self.oom = oom
+
+
+class GpuBusyError(RuntimeError):
+    pass
+
+
+def gpu_memory_mib(gpu):
+    process = subprocess.run(
+        [
+            "nvidia-smi",
+            "--id",
+            str(gpu),
+            "--query-gpu=memory.used,memory.free",
+            "--format=csv,noheader,nounits",
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+    )
+    fields = [int(value.strip()) for value in process.stdout.strip().split(",")]
+    if len(fields) != 2:
+        raise RuntimeError(f"unexpected nvidia-smi output: {process.stdout!r}")
+    return fields[0], fields[1]
+
+
+def require_idle_gpu(gpu):
+    used_mib, free_mib = gpu_memory_mib(gpu)
+    print(
+        f"PREFLIGHT gpu={gpu} used_mib={used_mib} free_mib={free_mib}",
+        flush=True,
+    )
+    if used_mib > GPU_BUSY_LIMIT_MIB:
+        raise GpuBusyError(
+            f"gpu {gpu} is not idle: {used_mib} MiB already allocated"
+        )
+
+
+@contextlib.contextmanager
+def reserve_gpu(gpu):
+    lock_path = Path("/tmp") / f"puercgp-gunrock-gpu-{gpu}.lock"
+    with lock_path.open("a+") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise GpuBusyError(
+                f"gpu {gpu} is reserved by another benchmark worker"
+            ) from error
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
 
 
 def source_metadata(dataset):
@@ -81,6 +136,14 @@ def command_for(dataset, algorithm, q, output_dir, json_name):
 
 
 def run_once(dataset, algorithm, q, gpu, output_dir, kind, index):
+    with reserve_gpu(gpu):
+        return run_once_locked(
+            dataset, algorithm, q, gpu, output_dir, kind, index
+        )
+
+
+def run_once_locked(dataset, algorithm, q, gpu, output_dir, kind, index):
+    require_idle_gpu(gpu)
     json_name = f"{kind}-{index}.json"
     command = command_for(dataset, algorithm, q, output_dir, json_name)
     environment = os.environ.copy()
@@ -108,6 +171,13 @@ def run_once(dataset, algorithm, q, gpu, output_dir, kind, index):
             "memory allocation",
         )
     )
+    if oom:
+        used_mib, _ = gpu_memory_mib(gpu)
+        if used_mib > GPU_BUSY_LIMIT_MIB:
+            raise GpuBusyError(
+                f"gpu {gpu} remained externally occupied after failure: "
+                f"{used_mib} MiB allocated"
+            )
     json_path = output_dir / json_name
     if process.returncode != 0 or not json_path.exists():
         raise RunFailure(
@@ -133,8 +203,8 @@ def write_runs(path, rows):
         writer.writerows(rows)
 
 
-def run_algorithm(dataset, algorithm, gpu, q_candidates):
-    case_root = EXP_ROOT / "artifacts" / dataset / algorithm
+def run_algorithm(dataset, algorithm, gpu, q_candidates, artifact_root):
+    case_root = artifact_root / dataset / algorithm
     case_root.mkdir(parents=True, exist_ok=True)
     source_path, source_sha256 = source_metadata(dataset)
     summary_path = case_root / "summary.json"
@@ -177,7 +247,32 @@ def run_algorithm(dataset, algorithm, gpu, q_candidates):
         except subprocess.TimeoutExpired as error:
             attempts.append({"q": q, "status": "timeout", "error": str(error)})
             raise
+        except GpuBusyError as error:
+            attempts.append(
+                {"q": q, "status": "environment_busy", "error": str(error)}
+            )
+            (output_dir / "failure.json").write_text(
+                json.dumps(attempts[-1], indent=2) + "\n"
+            )
+            raise
         except RunFailure as error:
+            if error.oom and rows:
+                attempts.append(
+                    {
+                        "q": q,
+                        "status": "environment_unstable",
+                        "error": (
+                            f"{error}; the same Q already completed "
+                            f"{len(rows)} run(s)"
+                        ),
+                    }
+                )
+                (output_dir / "failure.json").write_text(
+                    json.dumps(attempts[-1], indent=2) + "\n"
+                )
+                raise GpuBusyError(
+                    f"{dataset} {algorithm} Q={q} became OOM after successful runs"
+                ) from error
             attempts.append(
                 {"q": q, "status": "oom" if error.oom else "failed", "error": str(error)}
             )
@@ -244,13 +339,31 @@ def main():
     parser.add_argument("--gpu", required=True, type=int)
     parser.add_argument("--algorithms", nargs="+", choices=ALGORITHMS, default=ALGORITHMS)
     parser.add_argument("--q-candidates", nargs="+", type=int, default=Q_CANDIDATES)
+    parser.add_argument(
+        "--artifact-root",
+        type=Path,
+        default=EXP_ROOT / "artifacts",
+    )
     args = parser.parse_args()
+    artifact_root = args.artifact_root.resolve()
     summaries = []
     for algorithm in args.algorithms:
         summaries.append(
-            run_algorithm(args.dataset, algorithm, args.gpu, args.q_candidates)
+            run_algorithm(
+                args.dataset,
+                algorithm,
+                args.gpu,
+                args.q_candidates,
+                artifact_root,
+            )
         )
-    (EXP_ROOT / f"worker-{args.dataset}.json").write_text(
+    worker_output = (
+        EXP_ROOT / f"worker-{args.dataset}.json"
+        if artifact_root == (EXP_ROOT / "artifacts").resolve()
+        else artifact_root / f"worker-{args.dataset}.json"
+    )
+    worker_output.parent.mkdir(parents=True, exist_ok=True)
+    worker_output.write_text(
         json.dumps(summaries, indent=2) + "\n"
     )
 
