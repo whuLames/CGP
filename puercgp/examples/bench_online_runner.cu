@@ -24,14 +24,50 @@
 
 namespace {
 
+constexpr std::int32_t kReorderMagic = 0x52454f52;
+
+// BFS preprocessing stores each shortcut's original hop count as its weight.
+// Raw BFS must keep using bfs_policy because its input weights are unrelated.
+struct weighted_bfs_policy {
+  using vertex_type = int;
+  using value_type = puercgp::algorithms::unified_value_t;
+  static constexpr puercgp::execution_model_t execution_model =
+      puercgp::execution_model_t::frontier;
+  static constexpr puercgp::algorithms::algo_kind_t algorithm_kind =
+      puercgp::algorithms::algo_kind_t::bfs;
+  static constexpr puercgp::algorithms::init_mode_t init_mode =
+      puercgp::algorithms::init_mode_t::single_source;
+  static constexpr puercgp::reduction_kind_t reduction =
+      puercgp::reduction_kind_t::minimum;
+  __host__ __device__ static constexpr value_type infinity() {
+    return puercgp::algorithms::unified_infinity();
+  }
+  __host__ __device__ static constexpr value_type source_value() {
+    return puercgp::algorithms::unified_source_value();
+  }
+  template <typename weight_t>
+  __host__ __device__ static value_type relax(value_type source_distance,
+                                               weight_t weight) {
+    return source_distance + static_cast<value_type>(weight);
+  }
+  __host__ __device__ static constexpr bool should_update(
+      value_type candidate, value_type current) {
+    return candidate < current;
+  }
+};
+
 struct benchmark_options {
   std::string graph_path;
   std::filesystem::path index_path;
   std::filesystem::path output_dir;
   std::filesystem::path sources_path;
+  std::filesystem::path mapping_path;
+  std::filesystem::path values_dir;
   std::string algorithm = "bfs";
   std::string mode = "hybrid";
+  std::string pull_strategy = "fused";
   std::string online_policy = "auto";
+  std::string pull_update = "in-place";
   std::string measure = "both";
   int total_queries = 256;
   int batch_size = 64;
@@ -40,11 +76,20 @@ struct benchmark_options {
   int landmarks = 32;
   int batch_swaps = 16;
   int max_offset = 16;
+  int save_values = 0;
+  double pull_edge_ratio = 0.20;
   unsigned int seed = 42;
   bool rebuild_index = false;
   bool validate = true;
   bool include_zero_offset = false;
   bool full_ablation = false;
+  bool bfs_edge_weights = false;
+  bool profile_iterations = false;
+};
+
+struct mapping_t {
+  std::vector<int> new_to_old;
+  std::vector<int> old_to_new;
 };
 
 struct query_fingerprint {
@@ -68,6 +113,9 @@ struct run_measurement {
   int iterations = 0;
   int push_iterations = 0;
   int pull_iterations = 0;
+  unsigned long long e_union = 0;
+  unsigned long long e_pair = 0;
+  unsigned long long active_pairs = 0;
   bool correct = true;
 
   double end_to_end_ms() const { return gpu_ms + evaluator_ms; }
@@ -86,8 +134,16 @@ __device__ __forceinline__ unsigned long long mix64(
 template <typename value_t>
 __device__ __forceinline__ unsigned int value_bits(value_t value) {
   if constexpr (std::is_same<value_t, float>::value) {
-    return __float_as_uint(value);
+    if (isinf(value)) {
+      return value > 0.0f ? std::numeric_limits<unsigned int>::max() : 0U;
+    }
+    return static_cast<unsigned int>(value + 0.5f);
   } else {
+    if constexpr (std::is_signed<value_t>::value) {
+      if (value == std::numeric_limits<value_t>::max()) {
+        return std::numeric_limits<unsigned int>::max();
+      }
+    }
     return static_cast<unsigned int>(value);
   }
 }
@@ -95,6 +151,7 @@ __device__ __forceinline__ unsigned int value_bits(value_t value) {
 template <typename value_t>
 __global__ void fingerprint_values_kernel(
     const value_t* values, std::size_t vertex_count, int query_count,
+    const int* new_to_old,
     unsigned long long* sums, unsigned long long* xor_values) {
   int query = threadIdx.x;
   if (query >= query_count) return;
@@ -103,8 +160,10 @@ __global__ void fingerprint_values_kernel(
   for (std::size_t vertex = blockIdx.x; vertex < vertex_count;
        vertex += gridDim.x) {
     const auto bits = value_bits(values[vertex * query_count + query]);
+    const auto original_vertex = static_cast<unsigned long long>(
+        new_to_old == nullptr ? vertex : new_to_old[vertex]);
     const auto mixed = mix64(
-        (static_cast<unsigned long long>(vertex) << 32) ^ bits ^
+        (original_vertex << 32) ^ bits ^
         0x9e3779b97f4a7c15ULL);
     local_sum += mixed;
     local_xor ^= mixed;
@@ -116,7 +175,8 @@ __global__ void fingerprint_values_kernel(
 template <typename value_t>
 std::vector<query_fingerprint> fingerprint_values(
   const thrust::device_vector<value_t>& values, std::size_t vertex_count,
-    int query_count, cudaStream_t stream) {
+    int query_count, const thrust::device_vector<int>* new_to_old,
+    cudaStream_t stream) {
   thrust::device_vector<unsigned long long> sums(query_count);
   thrust::device_vector<unsigned long long> xor_values(query_count);
   cudaMemsetAsync(thrust::raw_pointer_cast(sums.data()), 0,
@@ -127,6 +187,8 @@ std::vector<query_fingerprint> fingerprint_values(
       1, std::min(4096, static_cast<int>(vertex_count)));
   fingerprint_values_kernel<<<blocks, query_count, 0, stream>>>(
       thrust::raw_pointer_cast(values.data()), vertex_count, query_count,
+      new_to_old == nullptr ? nullptr
+                            : thrust::raw_pointer_cast(new_to_old->data()),
       thrust::raw_pointer_cast(sums.data()),
       thrust::raw_pointer_cast(xor_values.data()));
   auto status = cudaGetLastError();
@@ -150,6 +212,53 @@ std::vector<query_fingerprint> fingerprint_values(
   return result;
 }
 
+template <typename value_t>
+__global__ void export_query_values_kernel(
+    const value_t* values, std::size_t vertex_count, int query_count,
+    int query_slot, const int* new_to_old, unsigned int* canonical_values) {
+  for (std::size_t vertex = blockIdx.x * blockDim.x + threadIdx.x;
+       vertex < vertex_count; vertex += gridDim.x * blockDim.x) {
+    const std::size_t original_vertex = new_to_old == nullptr
+        ? vertex : static_cast<std::size_t>(new_to_old[vertex]);
+    canonical_values[original_vertex] =
+        value_bits(values[vertex * query_count + query_slot]);
+  }
+}
+
+template <typename value_t>
+void export_query_values(
+    const thrust::device_vector<value_t>& values, std::size_t vertex_count,
+    int query_count, int query_slot,
+    const thrust::device_vector<int>* new_to_old,
+    const std::filesystem::path& output_path, cudaStream_t stream) {
+  thrust::device_vector<unsigned int> canonical_values(vertex_count);
+  const int threads = 256;
+  const int blocks = std::max(
+      1, std::min(4096, static_cast<int>((vertex_count + threads - 1) /
+                                         threads)));
+  export_query_values_kernel<<<blocks, threads, 0, stream>>>(
+      thrust::raw_pointer_cast(values.data()), vertex_count, query_count,
+      query_slot,
+      new_to_old == nullptr ? nullptr
+                            : thrust::raw_pointer_cast(new_to_old->data()),
+      thrust::raw_pointer_cast(canonical_values.data()));
+  auto status = cudaGetLastError();
+  if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
+  std::vector<unsigned int> host_values(vertex_count);
+  cudaMemcpyAsync(host_values.data(),
+                  thrust::raw_pointer_cast(canonical_values.data()),
+                  vertex_count * sizeof(unsigned int), cudaMemcpyDeviceToHost,
+                  stream);
+  cudaStreamSynchronize(stream);
+  std::filesystem::create_directories(output_path.parent_path());
+  std::ofstream output(output_path, std::ios::binary);
+  if (!output) throw std::runtime_error("cannot create values output");
+  output.write(reinterpret_cast<const char*>(host_values.data()),
+               static_cast<std::streamsize>(host_values.size() *
+                                            sizeof(unsigned int)));
+  if (!output) throw std::runtime_error("failed to write values output");
+}
+
 puercgp::traversal_mode_t parse_mode(const std::string& value) {
   if (value == "push") return puercgp::traversal_mode_t::push;
   if (value == "pull") return puercgp::traversal_mode_t::pull;
@@ -157,16 +266,32 @@ puercgp::traversal_mode_t parse_mode(const std::string& value) {
   throw std::invalid_argument("mode must be push, pull, or hybrid");
 }
 
+puercgp::pull_strategy_t parse_pull_strategy(const std::string& value) {
+  if (value == "fused") return puercgp::pull_strategy_t::fused;
+  if (value == "degree-aware")
+    return puercgp::pull_strategy_t::degree_aware;
+  if (value == "degree-segmented")
+    return puercgp::pull_strategy_t::degree_segmented;
+  throw std::invalid_argument(
+      "pull strategy must be fused, degree-aware, or degree-segmented");
+}
+
 benchmark_options parse_options(int argc, char** argv) {
   if (argc < 4) {
     throw std::invalid_argument(
         "Usage: bench_online_runner <graph> <phase-index> <output-dir> "
         "[--algorithm=bfs|sssp|sswp] [--mode=push|pull|hybrid] "
+        "[--pull-strategy=fused|degree-aware|degree-segmented] "
+        "[--pull-update=in-place|synchronous] [--mapping=path] "
         "[--online-policy=auto|full|offset-only|batch-only] "
         "[--measure=both|baseline-only|online-only] "
         "[--total-queries=256] [--batch-size=64] [--repeats=5] "
         "[--warmups=2] [--sources=path] [--seed=42] [--landmarks=32] "
         "[--batch-swaps=16] [--max-offset=16] [--rebuild-index] "
+        "[--pull-edge-ratio=0.20] "
+        "[--values-dir=path] [--save-values=3] "
+        "[--bfs-edge-weights] "
+        "[--profile-iterations] "
         "[--no-validate] [--include-zero-offset] [--full-ablation]");
   }
   benchmark_options options;
@@ -182,6 +307,14 @@ benchmark_options parse_options(int argc, char** argv) {
       options.algorithm = argument.substr(12);
     else if (argument.rfind("--mode=", 0) == 0)
       options.mode = argument.substr(7);
+    else if (argument.rfind("--pull-strategy=", 0) == 0)
+      options.pull_strategy = argument.substr(16);
+    else if (argument.rfind("--pull-update=", 0) == 0)
+      options.pull_update = argument.substr(14);
+    else if (argument.rfind("--mapping=", 0) == 0)
+      options.mapping_path = argument.substr(10);
+    else if (argument.rfind("--values-dir=", 0) == 0)
+      options.values_dir = argument.substr(13);
     else if (argument.rfind("--online-policy=", 0) == 0)
       options.online_policy = argument.substr(16);
     else if (argument.rfind("--measure=", 0) == 0)
@@ -204,6 +337,10 @@ benchmark_options parse_options(int argc, char** argv) {
       options.batch_swaps = integer_value("--batch-swaps=");
     else if (argument.rfind("--max-offset=", 0) == 0)
       options.max_offset = integer_value("--max-offset=");
+    else if (argument.rfind("--save-values=", 0) == 0)
+      options.save_values = integer_value("--save-values=");
+    else if (argument.rfind("--pull-edge-ratio=", 0) == 0)
+      options.pull_edge_ratio = std::stod(argument.substr(18));
     else if (argument == "--rebuild-index")
       options.rebuild_index = true;
     else if (argument == "--no-validate")
@@ -212,16 +349,30 @@ benchmark_options parse_options(int argc, char** argv) {
       options.include_zero_offset = true;
     else if (argument == "--full-ablation")
       options.full_ablation = true;
+    else if (argument == "--bfs-edge-weights")
+      options.bfs_edge_weights = true;
+    else if (argument == "--profile-iterations")
+      options.profile_iterations = true;
     else
       throw std::invalid_argument("unknown option: " + argument);
   }
   if (options.total_queries <= 0 || options.batch_size <= 0 ||
       options.batch_size > 64 || options.repeats <= 0 ||
       options.warmups < 0 || options.landmarks <= 0 ||
-      options.batch_swaps < 0 || options.max_offset < 0) {
+      options.batch_swaps < 0 || options.max_offset < 0 ||
+      options.save_values < 0) {
     throw std::invalid_argument("invalid benchmark configuration");
   }
+  if (!(options.pull_edge_ratio >= 0.0 && options.pull_edge_ratio <= 1.0)) {
+    throw std::invalid_argument("pull edge ratio must be in [0,1]");
+  }
   parse_mode(options.mode);
+  parse_pull_strategy(options.pull_strategy);
+  if (options.pull_update != "in-place" &&
+      options.pull_update != "synchronous") {
+    throw std::invalid_argument(
+        "pull update must be in-place or synchronous");
+  }
   if (options.online_policy != "auto" && options.online_policy != "full" &&
       options.online_policy != "offset-only" &&
       options.online_policy != "batch-only") {
@@ -234,7 +385,44 @@ benchmark_options parse_options(int argc, char** argv) {
   if (options.full_ablation && options.measure != "both") {
     throw std::invalid_argument("full ablation requires --measure=both");
   }
+  if (options.bfs_edge_weights && options.algorithm != "bfs") {
+    throw std::invalid_argument("--bfs-edge-weights requires BFS");
+  }
   return options;
+}
+
+mapping_t load_mapping(const std::filesystem::path& path, int vertices) {
+  mapping_t mapping;
+  std::ifstream input(path, std::ios::binary);
+  if (!input) {
+    throw std::runtime_error("cannot open mapping file: " + path.string());
+  }
+  std::int32_t magic = 0;
+  std::int32_t count = 0;
+  std::int32_t strategy = 0;
+  input.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+  input.read(reinterpret_cast<char*>(&count), sizeof(count));
+  input.read(reinterpret_cast<char*>(&strategy), sizeof(strategy));
+  if (!input || magic != kReorderMagic || count != vertices) {
+    throw std::runtime_error("mapping header does not match graph");
+  }
+  mapping.new_to_old.resize(static_cast<std::size_t>(vertices));
+  input.read(reinterpret_cast<char*>(mapping.new_to_old.data()),
+             static_cast<std::streamsize>(mapping.new_to_old.size() *
+                                          sizeof(int)));
+  if (!input) {
+    throw std::runtime_error("truncated mapping file");
+  }
+  mapping.old_to_new.assign(static_cast<std::size_t>(vertices), -1);
+  for (int new_id = 0; new_id < vertices; ++new_id) {
+    const int old_id = mapping.new_to_old[static_cast<std::size_t>(new_id)];
+    if (old_id < 0 || old_id >= vertices ||
+        mapping.old_to_new[static_cast<std::size_t>(old_id)] != -1) {
+      throw std::runtime_error("mapping is not a permutation");
+    }
+    mapping.old_to_new[static_cast<std::size_t>(old_id)] = new_id;
+  }
+  return mapping;
 }
 
 std::vector<int> load_sources(const std::filesystem::path& path,
@@ -299,7 +487,10 @@ run_measurement execute_batches(
     const std::vector<puercgp::scheduling::online_execution_batch>& batches,
     const std::string& method, int repeat, bool scheduled,
     bool collect_fingerprints,
-    std::vector<query_fingerprint>* fingerprints) {
+    std::vector<query_fingerprint>* fingerprints,
+    const thrust::device_vector<int>* new_to_old,
+    const std::filesystem::path& values_dir = {}, int save_values = 0,
+    const std::filesystem::path& trace_dir = {}) {
   run_measurement measurement;
   measurement.method = method;
   measurement.repeat = repeat;
@@ -320,13 +511,75 @@ run_measurement execute_batches(
       else
         ++measurement.push_iterations;
     }
+    for (const auto& profile : result.iteration_profiles) {
+      measurement.e_union += profile.actual_edge_count;
+      measurement.e_pair += profile.virtual_edge_count;
+      measurement.active_pairs += profile.active_pair_count;
+    }
+    if (run_options.profile_iterations && !trace_dir.empty()) {
+      std::filesystem::create_directories(trace_dir);
+      const auto prefix = method + "-r" + std::to_string(repeat) + "-b" +
+          std::to_string(batch_id);
+      std::ofstream trace(trace_dir / (prefix + "-iterations.csv"));
+      trace << "iteration,mode,frontier_pairs,unique_frontier_vertices,"
+               "active_pairs,e_union,e_pair,asf,arr,iteration_wall_ms,"
+               "degree_scan_ms,push_kernel_ms,pull_kernel_ms,compact_ms,"
+               "count_sync_ms,active_query_mask\n";
+      for (const auto& profile : result.iteration_profiles) {
+        const double asf = profile.actual_edge_count == 0
+            ? 1.0
+            : static_cast<double>(profile.virtual_edge_count) /
+                  static_cast<double>(profile.actual_edge_count);
+        const double arr = profile.virtual_edge_count == 0
+            ? 0.0
+            : 1.0 - static_cast<double>(profile.actual_edge_count) /
+                  static_cast<double>(profile.virtual_edge_count);
+        trace << profile.iteration << ',' << profile.mode << ','
+              << profile.frontier_size << ','
+              << profile.unique_frontier_size << ','
+              << profile.active_pair_count << ','
+              << profile.actual_edge_count << ','
+              << profile.virtual_edge_count << ',' << asf << ',' << arr
+              << ',' << profile.iteration_wall_ms << ','
+              << profile.degree_scan_ms << ',' << profile.push_kernel_ms
+              << ',' << profile.pull_kernel_ms << ',' << profile.compact_ms
+              << ',' << profile.count_sync_ms << ','
+              << static_cast<unsigned long long>(
+                     profile.query_convergence_mask)
+              << '\n';
+      }
+      std::ofstream completion(trace_dir / (prefix + "-completion.csv"));
+      completion << "slot,query_id,source,start_offset,completion_level,"
+                    "logical_duration,completion_wall_ms\n";
+      for (int slot = 0; slot < static_cast<int>(batch.query_ids.size());
+           ++slot) {
+        const int start_offset = scheduled
+            ? batch.start_schedule.offsets()[static_cast<std::size_t>(slot)]
+            : 0;
+        const auto& query = result.queries[static_cast<std::size_t>(slot)];
+        completion << slot << ',' << batch.query_ids[slot] << ','
+                   << batch.sources[slot] << ',' << start_offset << ','
+                   << query.completion_level << ','
+                   << std::max(0, static_cast<int>(query.completion_level) -
+                                      start_offset + 1)
+                   << ',' << query.completion_wall_time_ms << '\n';
+      }
+    }
     if (collect_fingerprints) {
       auto batch_fingerprints = fingerprint_values(
           result.values, vertex_count, static_cast<int>(batch.sources.size()),
-          context.stream());
+          new_to_old, context.stream());
       for (int slot = 0; slot < static_cast<int>(batch.query_ids.size());
            ++slot) {
         (*fingerprints)[batch.query_ids[slot]] = batch_fingerprints[slot];
+        const int query_id = batch.query_ids[slot];
+        if (!values_dir.empty() && query_id < save_values) {
+          export_query_values(
+              result.values, vertex_count,
+              static_cast<int>(batch.sources.size()), slot, new_to_old,
+              values_dir / ("q" + std::to_string(query_id) + ".u32"),
+              context.stream());
+        }
       }
     }
     std::cout << "method=" << method << " repeat=" << repeat
@@ -344,13 +597,29 @@ template <typename Policy, typename graph_t>
 int run_benchmark(
     const benchmark_options& options,
     const puercgp_examples::host_csr_graph& graph_storage, graph_t& graph,
-    const std::vector<int>& sources,
+    const std::vector<int>& original_sources, const mapping_t* mapping,
     const puercgp::scheduling::landmark_phase_index& phase_index,
     double preprocessing_ms, bool built_index) {
+  std::vector<int> sources = original_sources;
+  thrust::device_vector<int> device_new_to_old;
+  if (mapping != nullptr) {
+    for (int& source : sources) {
+      source = mapping->old_to_new[static_cast<std::size_t>(source)];
+    }
+    device_new_to_old = mapping->new_to_old;
+  }
+  const auto* device_mapping =
+      mapping == nullptr ? nullptr : &device_new_to_old;
   puercgp::execution_context context;
   puercgp::run_options run_options;
   run_options.traversal_mode = parse_mode(options.mode);
+  run_options.pull_strategy = parse_pull_strategy(options.pull_strategy);
+  run_options.pull_update_mode = options.pull_update == "synchronous"
+      ? puercgp::pull_update_mode_t::synchronous
+      : puercgp::pull_update_mode_t::in_place;
+  run_options.pull_edge_ratio = options.pull_edge_ratio;
   run_options.max_queries = 64;
+  run_options.profile_iterations = options.profile_iterations;
 
   puercgp::scheduling::online_offset_evaluator evaluator(
       phase_index, options.max_offset);
@@ -410,14 +679,16 @@ int run_benchmark(
     if (options.measure != "online-only") {
       auto baseline = execute_batches<Policy>(
           graph, graph_storage.vertices, context, run_options, sequential,
-          "warmup_baseline", -1, false, false, nullptr);
+          "warmup_baseline", -1, false, false, nullptr, device_mapping,
+          {}, 0, options.output_dir / "traces");
       (void)baseline;
     }
     if (options.measure != "baseline-only") {
       auto plan = make_selected_plan();
       auto online = execute_batches<Policy>(
           graph, graph_storage.vertices, context, run_options, plan.batches,
-          "warmup_online", -1, selected_policy_is_scheduled, false, nullptr);
+          "warmup_online", -1, selected_policy_is_scheduled, false, nullptr,
+          device_mapping, {}, 0, options.output_dir / "traces");
       (void)online;
     }
   };
@@ -432,7 +703,9 @@ int run_benchmark(
   if (options.measure == "online-only" && options.validate) {
     auto reference = execute_batches<Policy>(
         graph, graph_storage.vertices, context, run_options, sequential,
-        "correctness_reference", -1, false, true, &baseline_fingerprints);
+        "correctness_reference", -1, options.profile_iterations, true,
+        &baseline_fingerprints, device_mapping, options.values_dir,
+        options.save_values, options.output_dir / "traces");
     (void)reference;
     baseline_fingerprints_ready = true;
   }
@@ -442,7 +715,9 @@ int run_benchmark(
       const bool collect = options.validate && !baseline_fingerprints_ready;
       auto measurement = execute_batches<Policy>(
           graph, graph_storage.vertices, context, run_options, sequential,
-          "baseline", repeat, false, collect, &baseline_fingerprints);
+          "baseline", repeat, options.profile_iterations, collect,
+          &baseline_fingerprints, device_mapping, options.values_dir,
+          options.save_values, options.output_dir / "traces");
       if (collect) baseline_fingerprints_ready = true;
       if (collect && !baseline_fingerprints.empty()) {
         std::cout << "baseline_fingerprint_q0="
@@ -459,7 +734,8 @@ int run_benchmark(
         auto zero = execute_batches<Policy>(
             graph, graph_storage.vertices, context, run_options, sequential,
             "scheduled_zero_offset", repeat, true, options.validate,
-            &zero_fingerprints);
+            &zero_fingerprints, device_mapping, {}, 0,
+            options.output_dir / "traces");
         if (options.validate) {
           std::cout << "scheduled_zero_fingerprint_q0="
                     << zero_fingerprints[0].sum << ':'
@@ -486,7 +762,8 @@ int run_benchmark(
       auto measurement = execute_batches<Policy>(
           graph, graph_storage.vertices, context, run_options, plan.batches,
           "online", repeat, selected_policy_is_scheduled, collect,
-          &online_fingerprints);
+          &online_fingerprints, device_mapping, {}, 0,
+          options.output_dir / "traces");
       measurement.grouping_ms = plan.grouping_ms;
       measurement.offset_ms = plan.offset_evaluator_ms;
       measurement.evaluator_ms = plan.evaluator_ms();
@@ -530,7 +807,8 @@ int run_benchmark(
           evaluator, sources, options.batch_size, options.batch_swaps);
       auto measurement = execute_batches<Policy>(
           graph, graph_storage.vertices, context, run_options, plan.batches,
-          "online_batching_only", repeat, false, false, nullptr);
+          "online_batching_only", repeat, options.profile_iterations, false,
+          nullptr, device_mapping, {}, 0, options.output_dir / "traces");
       measurement.grouping_ms = plan.grouping_ms;
       measurement.evaluator_ms = plan.grouping_ms;
       measurement.alignment_score = plan.grouping_alignment_score;
@@ -545,7 +823,8 @@ int run_benchmark(
           evaluator, sequential);
       auto measurement = execute_batches<Policy>(
           graph, graph_storage.vertices, context, run_options, plan.batches,
-          "online_offset_only", repeat, true, false, nullptr);
+          "online_offset_only", repeat, true, false, nullptr,
+          device_mapping, {}, 0, options.output_dir / "traces");
       measurement.offset_ms = plan.offset_evaluator_ms;
       measurement.evaluator_ms = plan.offset_evaluator_ms;
       measurements.push_back(measurement);
@@ -575,14 +854,26 @@ int run_benchmark(
   std::ofstream raw(options.output_dir / "runs.csv");
   raw << "method,repeat,gpu_ms,evaluator_ms,end_to_end_ms,runner_wall_ms,"
          "grouping_ms,offset_ms,alignment_score,iterations,push_iterations,"
-         "pull_iterations,correct\n";
+         "pull_iterations,e_union,e_pair,asf,arr,active_pairs,correct\n";
   for (const auto& value : measurements) {
     raw << value.method << ',' << value.repeat << ',' << value.gpu_ms << ','
         << value.evaluator_ms << ',' << value.end_to_end_ms() << ','
         << value.runner_wall_ms << ',' << value.grouping_ms << ','
         << value.offset_ms << ',' << value.alignment_score << ','
         << value.iterations << ',' << value.push_iterations << ','
-        << value.pull_iterations << ',' << (value.correct ? 1 : 0) << '\n';
+        << value.pull_iterations << ',' << value.e_union << ','
+        << value.e_pair << ','
+        << (value.e_union == 0
+                ? 1.0
+                : static_cast<double>(value.e_pair) /
+                      static_cast<double>(value.e_union))
+        << ','
+        << (value.e_pair == 0
+                ? 0.0
+                : 1.0 - static_cast<double>(value.e_union) /
+                      static_cast<double>(value.e_pair))
+        << ',' << value.active_pairs << ',' << (value.correct ? 1 : 0)
+        << '\n';
   }
 
   std::ofstream plans(options.output_dir / "online_plan.csv");
@@ -597,7 +888,7 @@ int run_benchmark(
           ? batch.predicted_lengths[slot]
           : -1;
       plans << batch_id << ',' << slot << ',' << batch.query_ids[slot] << ','
-            << batch.sources[slot] << ',' << predicted_length
+            << original_sources[batch.query_ids[slot]] << ',' << predicted_length
             << ',' << batch.start_schedule.offsets()[slot] << ','
             << batch.alignment_score << ',' << batch.offset_evaluator_ms
             << '\n';
@@ -605,12 +896,18 @@ int run_benchmark(
   }
 
   std::ofstream metadata(options.output_dir / "metadata.csv");
-  metadata << "graph,algorithm,mode,online_policy,measure,mean_predicted_length,vertices,edges,N,Q,repeats,warmups,seed,"
+  metadata << "graph,mapping,algorithm,bfs_edge_weights,mode,pull_strategy,pull_update,pull_edge_ratio,online_policy,measure,profile_iterations,algorithm_independent_schedule,mean_predicted_length,vertices,edges,N,Q,repeats,warmups,seed,"
               "index,index_built,index_landmarks,index_preprocessing_ms,"
               "index_bytes,max_offset,batch_swaps\n";
-  metadata << options.graph_path << ',' << options.algorithm << ','
-           << options.mode << ',' << selected_policy << ','
-           << options.measure << ',' << mean_predicted_length << ','
+  metadata << options.graph_path << ',' << options.mapping_path.string() << ','
+           << options.algorithm << ',' << (options.bfs_edge_weights ? 1 : 0)
+           << ',' << options.mode << ','
+           << options.pull_strategy << ','
+           << options.pull_update << ',' << options.pull_edge_ratio << ','
+           << selected_policy << ','
+           << options.measure << ',' << (options.profile_iterations ? 1 : 0)
+           << ',' << (options.algorithm == "bfs" ? 0 : 1)
+           << ',' << mean_predicted_length << ','
            << graph_storage.vertices << ','
            << graph_storage.edges << ',' << options.total_queries << ','
            << options.batch_size << ',' << options.repeats << ','
@@ -619,6 +916,17 @@ int run_benchmark(
            << ',' << phase_index.landmark_count() << ',' << preprocessing_ms
            << ',' << std::filesystem::file_size(options.index_path) << ','
            << options.max_offset << ',' << options.batch_swaps << '\n';
+  if (baseline_fingerprints_ready) {
+    std::ofstream fingerprints(options.output_dir / "fingerprints.csv");
+    fingerprints << "system,algorithm,query_id,source,fingerprint_sum,"
+                    "fingerprint_xor\n";
+    for (int query = 0; query < options.total_queries; ++query) {
+      fingerprints << "PuerCGP," << options.algorithm << ',' << query << ','
+                   << original_sources[query] << ','
+                   << baseline_fingerprints[query].sum << ','
+                   << baseline_fingerprints[query].xor_value << '\n';
+    }
+  }
   return 0;
 }
 
@@ -642,6 +950,12 @@ int main(int argc, char** argv) {
       }
     }
     save_sources(options.output_dir / "sources.csv", sources);
+    mapping_t mapping;
+    const mapping_t* mapping_ptr = nullptr;
+    if (!options.mapping_path.empty()) {
+      mapping = load_mapping(options.mapping_path, graph_storage.vertices);
+      mapping_ptr = &mapping;
+    }
 
     const auto preprocessing_start = std::chrono::steady_clock::now();
     const bool built_index = options.rebuild_index ||
@@ -669,18 +983,23 @@ int main(int argc, char** argv) {
               << " V=" << graph_storage.vertices << " E=" << graph_storage.edges
               << '\n';
     if (options.algorithm == "bfs") {
+      if (options.bfs_edge_weights) {
+        return run_benchmark<weighted_bfs_policy>(
+            options, graph_storage, graph, sources, mapping_ptr, phase_index,
+            preprocessing_ms, built_index);
+      }
       return run_benchmark<puercgp::algorithms::bfs_policy>(
-          options, graph_storage, graph, sources, phase_index,
+          options, graph_storage, graph, sources, mapping_ptr, phase_index,
           preprocessing_ms, built_index);
     }
     if (options.algorithm == "sssp") {
       return run_benchmark<puercgp::algorithms::sssp_policy>(
-          options, graph_storage, graph, sources, phase_index,
+          options, graph_storage, graph, sources, mapping_ptr, phase_index,
           preprocessing_ms, built_index);
     }
     if (options.algorithm == "sswp") {
       return run_benchmark<puercgp::algorithms::sswp_policy>(
-          options, graph_storage, graph, sources, phase_index,
+          options, graph_storage, graph, sources, mapping_ptr, phase_index,
           preprocessing_ms, built_index);
     }
     throw std::invalid_argument("algorithm must be bfs, sssp, or sswp");

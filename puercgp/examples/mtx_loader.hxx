@@ -269,10 +269,164 @@ inline host_csr_graph load_binary_csr_directory(
   return graph;
 }
 
+inline std::uint64_t decode_little_endian(const unsigned char* bytes,
+                                          unsigned width) {
+  std::uint64_t value = 0;
+  for (unsigned byte = 0; byte < width; ++byte) {
+    value |= static_cast<std::uint64_t>(bytes[byte]) << (8 * byte);
+  }
+  return value;
+}
+
+inline host_csr_graph load_galois_gr(
+    const std::string& path, bool build_pull_adjacency = false) {
+  std::ifstream input(path, std::ios::binary);
+  if (!input) {
+    throw std::runtime_error("could not open GR graph: " + path);
+  }
+  unsigned char header_bytes[32];
+  input.read(reinterpret_cast<char*>(header_bytes), sizeof(header_bytes));
+  if (!input) {
+    throw std::runtime_error("truncated GR header: " + path);
+  }
+  const std::uint64_t version = decode_little_endian(header_bytes, 8);
+  const std::uint64_t declared_width =
+      decode_little_endian(header_bytes + 8, 8);
+  const std::uint64_t vertices = decode_little_endian(header_bytes + 16, 8);
+  const std::uint64_t edges = decode_little_endian(header_bytes + 24, 8);
+  if (version != 1 ||
+      !(declared_width == 0 || declared_width == 1 || declared_width == 2 ||
+        declared_width == 4 || declared_width == 8)) {
+    throw std::runtime_error("unsupported GR version or edge width: " + path);
+  }
+  if (vertices > static_cast<std::uint64_t>(std::numeric_limits<int>::max()) ||
+      edges > static_cast<std::uint64_t>(std::numeric_limits<int>::max())) {
+    throw std::runtime_error("GR graph exceeds PuerCGP's 32-bit index limit");
+  }
+  const std::uint64_t destination_bytes = edges * sizeof(std::uint32_t);
+  const std::uint64_t padding = (8 - destination_bytes % 8) % 8;
+  const std::uint64_t weights_offset =
+      sizeof(header_bytes) + vertices * sizeof(std::uint64_t) +
+      destination_bytes + padding;
+  const std::uint64_t canonical_size = weights_offset + edges * declared_width;
+  const std::uint64_t file_size = std::filesystem::file_size(path);
+  std::uint64_t physical_width = declared_width;
+  if (file_size != canonical_size) {
+    const std::uint64_t legacy_size = weights_offset + edges * 4;
+    if ((declared_width != 1 && declared_width != 2) ||
+        file_size != legacy_size) {
+      throw std::runtime_error("GR file size does not match declared layout");
+    }
+    physical_width = 4;
+  }
+
+  host_csr_graph graph;
+  graph.vertices = static_cast<int>(vertices);
+  graph.edges = static_cast<int>(edges);
+  graph.row_offsets.resize(static_cast<std::size_t>(vertices) + 1);
+  graph.column_indices.resize(static_cast<std::size_t>(edges));
+  graph.edge_weights.resize(static_cast<std::size_t>(edges));
+  graph.row_offsets[0] = 0;
+
+  constexpr std::size_t chunk_elements = 1U << 20;
+  std::vector<std::uint64_t> offset_buffer(chunk_elements);
+  std::uint64_t previous = 0;
+  for (std::uint64_t first = 0; first < vertices;) {
+    const auto count = static_cast<std::size_t>(
+        std::min<std::uint64_t>(chunk_elements, vertices - first));
+    input.read(reinterpret_cast<char*>(offset_buffer.data()),
+               static_cast<std::streamsize>(count * sizeof(std::uint64_t)));
+    if (!input) throw std::runtime_error("truncated GR offsets");
+    for (std::size_t index = 0; index < count; ++index) {
+      const std::uint64_t value = offset_buffer[index];
+      if (value < previous || value > edges) {
+        throw std::runtime_error("non-monotonic GR offset");
+      }
+      graph.row_offsets[static_cast<std::size_t>(first) + index + 1] =
+          static_cast<int>(value);
+      previous = value;
+    }
+    first += count;
+  }
+  if (previous != edges) {
+    throw std::runtime_error("last GR offset does not equal E");
+  }
+
+  std::vector<std::uint32_t> destination_buffer(chunk_elements);
+  for (std::uint64_t first = 0; first < edges;) {
+    const auto count = static_cast<std::size_t>(
+        std::min<std::uint64_t>(chunk_elements, edges - first));
+    input.read(reinterpret_cast<char*>(destination_buffer.data()),
+               static_cast<std::streamsize>(count * sizeof(std::uint32_t)));
+    if (!input) throw std::runtime_error("truncated GR destinations");
+    for (std::size_t index = 0; index < count; ++index) {
+      if (destination_buffer[index] >= vertices) {
+        throw std::runtime_error("GR destination outside [0,V)");
+      }
+      graph.column_indices[static_cast<std::size_t>(first) + index] =
+          static_cast<int>(destination_buffer[index]);
+    }
+    first += count;
+  }
+  if (padding != 0) {
+    unsigned char padding_bytes[8] = {};
+    input.read(reinterpret_cast<char*>(padding_bytes), padding);
+    if (!input) throw std::runtime_error("truncated GR padding");
+    for (std::uint64_t byte = 0; byte < padding; ++byte) {
+      if (padding_bytes[byte] != 0) {
+        throw std::runtime_error("non-zero GR destination padding");
+      }
+    }
+  }
+
+  if (declared_width == 0) {
+    std::fill(graph.edge_weights.begin(), graph.edge_weights.end(), 1.0f);
+  } else {
+    std::vector<unsigned char> weight_buffer(
+        chunk_elements * static_cast<std::size_t>(physical_width));
+    for (std::uint64_t first = 0; first < edges;) {
+      const auto count = static_cast<std::size_t>(
+          std::min<std::uint64_t>(chunk_elements, edges - first));
+      const auto bytes = count * static_cast<std::size_t>(physical_width);
+      input.read(reinterpret_cast<char*>(weight_buffer.data()),
+                 static_cast<std::streamsize>(bytes));
+      if (!input) throw std::runtime_error("truncated GR weights");
+      for (std::size_t index = 0; index < count; ++index) {
+        const auto value = decode_little_endian(
+            weight_buffer.data() + index * physical_width,
+            static_cast<unsigned>(physical_width));
+        if (value > std::numeric_limits<std::uint32_t>::max() ||
+            (physical_width == 4 && declared_width < 4 &&
+             value >= (std::uint64_t{1} << (8 * declared_width)))) {
+          throw std::runtime_error("GR weight exceeds its supported range");
+        }
+        graph.edge_weights[static_cast<std::size_t>(first) + index] =
+            static_cast<float>(value);
+      }
+      first += count;
+    }
+  }
+
+  thrust::host_vector<int> row_offsets(graph.row_offsets.begin(),
+                                       graph.row_offsets.end());
+  thrust::host_vector<int> column_indices(graph.column_indices.begin(),
+                                          graph.column_indices.end());
+  thrust::host_vector<float> edge_weights(graph.edge_weights.begin(),
+                                          graph.edge_weights.end());
+  graph.device_graph = puercgp::csr_graph_storage<int, int, float>(
+      graph.vertices, row_offsets, column_indices, edge_weights,
+      build_pull_adjacency);
+  return graph;
+}
+
 inline host_csr_graph load_graph_auto(const std::string& path,
                                       bool build_pull_adjacency = false) {
   if (std::filesystem::is_directory(path)) {
     return load_binary_csr_directory(path, build_pull_adjacency);
+  }
+  const auto extension = lower_copy(std::filesystem::path(path).extension());
+  if (extension == ".gr" || extension == ".ggr") {
+    return load_galois_gr(path, build_pull_adjacency);
   }
   return load_matrix_market(path, build_pull_adjacency);
 }
