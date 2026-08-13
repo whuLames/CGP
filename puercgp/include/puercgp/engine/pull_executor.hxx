@@ -21,10 +21,12 @@ void launch_fused_pull_compute(graph_t graph,
                                unsigned long long* unique_flags,
                                unsigned long long* pair_counts,
                                query_mask_t active_slots,
-                               cudaStream_t stream) {
+                               cudaStream_t stream,
+                               const typename Policy::value_type* input_values =
+                                   nullptr) {
   launch_fused_pull<Policy, graph_t, vertex_t>(
       graph, query_count, values, visited_mask, next_frontier_mask,
-      unique_flags, pair_counts, active_slots, stream);
+      unique_flags, pair_counts, active_slots, stream, input_values);
 }
 
 template <typename Policy, typename graph_t, typename vertex_t>
@@ -33,10 +35,12 @@ void launch_fused_pull_compute_scheduled(
     query_mask_t* visited_mask, query_mask_t* next_frontier_mask,
     unsigned long long* unique_flags, unsigned long long* pair_counts,
     query_mask_t active_slots, query_mask_t* active_union,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    const typename Policy::value_type* input_values = nullptr) {
   launch_fused_pull_scheduled<Policy, graph_t, vertex_t>(
       graph, query_count, values, visited_mask, next_frontier_mask,
-      unique_flags, pair_counts, active_slots, active_union, stream);
+      unique_flags, pair_counts, active_slots, active_union, stream,
+      input_values);
 }
 
 template <typename Policy, typename graph_t, typename vertex_t>

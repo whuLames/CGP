@@ -1,8 +1,10 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstddef>
+#include <limits>
 #include <stdexcept>
 #include <type_traits>
 
@@ -10,6 +12,7 @@
 #include <thrust/device_vector.h>
 #include <thrust/execution_policy.h>
 #include <thrust/scan.h>
+#include <thrust/sort.h>
 
 #include <puercgp/algorithms/bfs.hxx>
 #include <puercgp/algorithms/sssp.hxx>
@@ -180,6 +183,34 @@ class frontier_engine {
                   "puercgp frontier policies currently require int vertices");
 
     queries.validate(options.max_queries);
+    if (options.pull_bidirectional_period == 0) {
+      throw std::invalid_argument("pull_bidirectional_period must be positive");
+    }
+    const bool degree_partitioned_pull =
+        options.pull_strategy == pull_strategy_t::degree_aware ||
+        options.pull_strategy == pull_strategy_t::degree_segmented;
+    if (degree_partitioned_pull &&
+        (!(options.pull_degree_threshold_2 > 0 &&
+           options.pull_degree_threshold_2 < options.pull_degree_threshold_4 &&
+           options.pull_degree_threshold_4 < options.pull_degree_threshold_8) ||
+         (options.pull_sweep != pull_sweep_t::forward &&
+          options.pull_sweep != pull_sweep_t::bidirectional) ||
+         options.pull_degree_bucket_order.size() != 4 ||
+         options.pull_high_degree_segment_edges <= 0 ||
+         (options.pull_high_degree_segment_threads != 128 &&
+          options.pull_high_degree_segment_threads != 256 &&
+          options.pull_high_degree_segment_threads != 512 &&
+          options.pull_high_degree_segment_threads != 1024))) {
+      throw std::invalid_argument("invalid degree-aware pull configuration");
+    }
+    if (degree_partitioned_pull) {
+      auto order = options.pull_degree_bucket_order;
+      std::sort(order.begin(), order.end());
+      if (order != std::vector<int>({0, 1, 2, 3})) {
+        throw std::invalid_argument(
+            "degree-aware bucket order must be a permutation of 0..3");
+      }
+    }
     const int query_count = static_cast<int>(queries.size());
     if (query_count > 64) {
       throw std::invalid_argument("shared frontier supports at most 64 queries");
@@ -196,6 +227,16 @@ class frontier_engine {
 
     const auto vertex_count =
         static_cast<std::size_t>(graph.get_number_of_vertices());
+    if (options.pull_sweep == pull_sweep_t::bidirectional) {
+      const auto reverse_end = options.pull_reverse_vertex_end == 0
+          ? vertex_count
+          : options.pull_reverse_vertex_end;
+      if (options.pull_reverse_vertex_begin >= reverse_end ||
+          reverse_end > vertex_count) {
+        throw std::invalid_argument(
+            "pull reverse vertex range must be within [0, V)");
+      }
+    }
     const std::size_t value_count =
         vertex_count * static_cast<std::size_t>(query_count);
 
@@ -208,6 +249,10 @@ class frontier_engine {
     engine_workspace<vertex_type, value_type> workspace;
     workspace.resize(vertex_count, static_cast<std::size_t>(query_count));
     auto& values = workspace.values_vector();
+    thrust::device_vector<value_type> pull_input_values(
+        options.pull_update_mode == pull_update_mode_t::synchronous
+            ? value_count
+            : 0);
     auto& visited_mask = workspace.visited_mask_vector();
     auto& frontier_mask = workspace.frontier_mask_vector();
     auto& next_frontier_mask = workspace.next_frontier_mask_vector();
@@ -218,6 +263,14 @@ class frontier_engine {
     auto& next_pair_count_dev = workspace.next_pair_count_vector();
     thrust::device_vector<unsigned long long> frontier_metric_counters(3);
     thrust::device_vector<query_mask_t> active_union_dev(scheduled ? 1 : 0);
+    thrust::device_vector<unsigned long long> pull_update_iteration_sum(
+        options.trace_pull_updates ? vertex_count : 0);
+    thrust::device_vector<unsigned int> pull_update_count(
+        options.trace_pull_updates ? vertex_count : 0);
+    thrust::device_vector<unsigned int> pull_update_first(
+        options.trace_pull_updates ? vertex_count : 0);
+    thrust::device_vector<unsigned int> pull_update_last(
+        options.trace_pull_updates ? vertex_count : 0);
     thrust::device_vector<int> device_start_levels;
     if (scheduled) {
       device_start_levels = start_schedule->offsets();
@@ -228,6 +281,130 @@ class frontier_engine {
     auto& unique_flags = pull_state.unique_flags_vector();
     auto& pair_counts = pull_state.pair_counts_vector();
     auto& unique_offsets = pull_state.unique_offsets_vector();
+
+    std::array<std::size_t, 5> pull_degree_offsets{};
+    thrust::device_vector<vertex_type> pull_degree_vertices;
+    using edge_type = typename graph_t::edge_type;
+    thrust::device_vector<vertex_type> pull_segment_vertices;
+    thrust::device_vector<edge_type> pull_segment_begins;
+    thrust::device_vector<edge_type> pull_segment_ends;
+    std::size_t pull_segment_count = 0;
+    if (degree_partitioned_pull &&
+        options.traversal_mode != traversal_mode_t::push) {
+      thrust::device_vector<unsigned long long> bucket_counts(4);
+      detail::throw_if_cuda_error(
+          cudaMemsetAsync(thrust::raw_pointer_cast(bucket_counts.data()), 0,
+                          4 * sizeof(unsigned long long), stream),
+          "cudaMemsetAsync(pull_degree_bucket_counts)");
+      detail::count_pull_degree_buckets_kernel<graph_t, vertex_type>
+          <<<detail::grid_for(vertex_count, threads), threads, 0, stream>>>(
+              graph, options.pull_degree_threshold_2,
+              options.pull_degree_threshold_4,
+              options.pull_degree_threshold_8,
+              thrust::raw_pointer_cast(bucket_counts.data()));
+      detail::throw_if_cuda_error(cudaGetLastError(),
+                                  "count_pull_degree_buckets_kernel");
+      std::array<unsigned long long, 4> host_counts{};
+      detail::throw_if_cuda_error(
+          cudaMemcpyAsync(host_counts.data(),
+                          thrust::raw_pointer_cast(bucket_counts.data()),
+                          host_counts.size() * sizeof(unsigned long long),
+                          cudaMemcpyDeviceToHost, stream),
+          "cudaMemcpyAsync(pull_degree_bucket_counts)");
+      context.synchronize();
+      for (std::size_t bucket = 0; bucket < host_counts.size(); ++bucket) {
+        pull_degree_offsets[bucket + 1] =
+            pull_degree_offsets[bucket] +
+            static_cast<std::size_t>(host_counts[bucket]);
+      }
+      pull_degree_vertices.resize(vertex_count);
+      thrust::device_vector<unsigned long long> bucket_offsets(4);
+      thrust::device_vector<unsigned long long> bucket_positions(4);
+      std::array<unsigned long long, 4> host_offsets{};
+      for (std::size_t bucket = 0; bucket < host_offsets.size(); ++bucket) {
+        host_offsets[bucket] = pull_degree_offsets[bucket];
+      }
+      detail::throw_if_cuda_error(
+          cudaMemcpyAsync(thrust::raw_pointer_cast(bucket_offsets.data()),
+                          host_offsets.data(),
+                          host_offsets.size() * sizeof(unsigned long long),
+                          cudaMemcpyHostToDevice, stream),
+          "cudaMemcpyAsync(pull_degree_bucket_offsets)");
+      detail::throw_if_cuda_error(
+          cudaMemsetAsync(thrust::raw_pointer_cast(bucket_positions.data()), 0,
+                          4 * sizeof(unsigned long long), stream),
+          "cudaMemsetAsync(pull_degree_bucket_positions)");
+      detail::fill_pull_degree_buckets_kernel<graph_t, vertex_type>
+          <<<detail::grid_for(vertex_count, threads), threads, 0, stream>>>(
+              graph, options.pull_degree_threshold_2,
+              options.pull_degree_threshold_4,
+              options.pull_degree_threshold_8,
+              thrust::raw_pointer_cast(bucket_offsets.data()),
+              thrust::raw_pointer_cast(bucket_positions.data()),
+              thrust::raw_pointer_cast(pull_degree_vertices.data()));
+      detail::throw_if_cuda_error(cudaGetLastError(),
+                                  "fill_pull_degree_buckets_kernel");
+      for (std::size_t bucket = 0; bucket < 4; ++bucket) {
+        thrust::sort(thrust_policy,
+                     pull_degree_vertices.begin() +
+                         static_cast<std::ptrdiff_t>(
+                             pull_degree_offsets[bucket]),
+                     pull_degree_vertices.begin() +
+                         static_cast<std::ptrdiff_t>(
+                             pull_degree_offsets[bucket + 1]));
+      }
+      if (options.pull_strategy == pull_strategy_t::degree_segmented) {
+        const std::size_t high_degree_count =
+            pull_degree_offsets[4] - pull_degree_offsets[3];
+        thrust::device_vector<unsigned int> segment_counts(high_degree_count);
+        thrust::device_vector<unsigned int> segment_offsets(
+            high_degree_count + 1);
+        detail::throw_if_cuda_error(
+            cudaMemsetAsync(thrust::raw_pointer_cast(segment_offsets.data()), 0,
+                            sizeof(unsigned int), stream),
+            "cudaMemsetAsync(pull_segment_offsets)");
+        detail::count_pull_high_degree_segments_kernel<graph_t, vertex_type>
+            <<<detail::grid_for(high_degree_count, threads), threads, 0,
+               stream>>>(
+                graph,
+                thrust::raw_pointer_cast(pull_degree_vertices.data()) +
+                    pull_degree_offsets[3],
+                high_degree_count, options.pull_high_degree_segment_edges,
+                thrust::raw_pointer_cast(segment_counts.data()));
+        detail::throw_if_cuda_error(
+            cudaGetLastError(), "count_pull_high_degree_segments_kernel");
+        thrust::inclusive_scan(
+            thrust_policy, segment_counts.begin(), segment_counts.end(),
+            segment_offsets.begin() + 1);
+        unsigned int host_segment_count = 0;
+        detail::throw_if_cuda_error(
+            cudaMemcpyAsync(
+                &host_segment_count,
+                thrust::raw_pointer_cast(segment_offsets.data()) +
+                    high_degree_count,
+                sizeof(host_segment_count), cudaMemcpyDeviceToHost, stream),
+            "cudaMemcpyAsync(pull_segment_count)");
+        context.synchronize();
+        pull_segment_count = host_segment_count;
+        pull_segment_vertices.resize(pull_segment_count);
+        pull_segment_begins.resize(pull_segment_count);
+        pull_segment_ends.resize(pull_segment_count);
+        detail::fill_pull_high_degree_segments_kernel<graph_t, vertex_type>
+            <<<detail::grid_for(high_degree_count, threads), threads, 0,
+               stream>>>(
+                graph,
+                thrust::raw_pointer_cast(pull_degree_vertices.data()) +
+                    pull_degree_offsets[3],
+                high_degree_count, options.pull_high_degree_segment_edges,
+                thrust::raw_pointer_cast(segment_offsets.data()),
+                thrust::raw_pointer_cast(pull_segment_vertices.data()),
+                thrust::raw_pointer_cast(pull_segment_begins.data()),
+                thrust::raw_pointer_cast(pull_segment_ends.data()));
+        detail::throw_if_cuda_error(
+            cudaGetLastError(), "fill_pull_high_degree_segments_kernel");
+        context.synchronize();
+      }
+    }
 
     auto wall_start = std::chrono::high_resolution_clock::now();
     detail::cuda_event_timer total_timer;
@@ -250,6 +427,25 @@ class frontier_engine {
         cudaMemsetAsync(thrust::raw_pointer_cast(next_frontier_mask.data()), 0,
                         mask_bytes, stream),
         "cudaMemsetAsync(next_frontier_mask)");
+    if (options.trace_pull_updates && vertex_count != 0) {
+      detail::throw_if_cuda_error(
+          cudaMemsetAsync(
+              thrust::raw_pointer_cast(pull_update_iteration_sum.data()), 0,
+              vertex_count * sizeof(unsigned long long), stream),
+          "cudaMemsetAsync(pull_update_iteration_sum)");
+      detail::throw_if_cuda_error(
+          cudaMemsetAsync(thrust::raw_pointer_cast(pull_update_count.data()), 0,
+                          vertex_count * sizeof(unsigned int), stream),
+          "cudaMemsetAsync(pull_update_count)");
+      detail::throw_if_cuda_error(
+          cudaMemsetAsync(thrust::raw_pointer_cast(pull_update_first.data()), 0,
+                          vertex_count * sizeof(unsigned int), stream),
+          "cudaMemsetAsync(pull_update_first)");
+      detail::throw_if_cuda_error(
+          cudaMemsetAsync(thrust::raw_pointer_cast(pull_update_last.data()), 0,
+                          vertex_count * sizeof(unsigned int), stream),
+          "cudaMemsetAsync(pull_update_last)");
+    }
     detail::reset_counter_kernel<<<1, 1, 0, stream>>>(
         thrust::raw_pointer_cast(unique_count_dev.data()));
     detail::throw_if_cuda_error(cudaGetLastError(), "reset_counter_kernel");
@@ -318,8 +514,13 @@ class frontier_engine {
         query_partition_t::all_slots(query_count, options.traversal_mode);
 
     vertex_type level = 0;
+    std::size_t pull_iteration_count = 0;
     query_mask_t live_slots = scheduled ? query_mask_t{0}
                                         : default_partition.active_slots;
+    std::vector<int> query_completion_levels(
+        static_cast<std::size_t>(query_count), -1);
+    std::vector<float> query_completion_wall_ms(
+        static_cast<std::size_t>(query_count), 0.0f);
     const int last_start_step = scheduled ? start_schedule->max_offset() : -1;
     bool bfs_pull_phase = false;
     while ((current_unique_count > 0 ||
@@ -408,8 +609,12 @@ class frontier_engine {
       unsigned long long actual_edges = 0;
       unsigned long long virtual_edges = 0;
       unsigned long long active_pairs = 0;
+      bool frontier_metrics_ready = false;
 
       auto compute_frontier_metrics = [&]() {
+        if (frontier_metrics_ready) {
+          return;
+        }
         detail::throw_if_cuda_error(
             cudaMemsetAsync(
                 thrust::raw_pointer_cast(frontier_metric_counters.data()), 0,
@@ -449,7 +654,16 @@ class frontier_engine {
         profile.edge_count = virtual_edges;
         profile.actual_edge_count = actual_edges;
         profile.virtual_edge_count = virtual_edges;
+        profile.active_pair_count = active_pairs;
+        frontier_metrics_ready = true;
       };
+
+      // Trace runs collect logical adjacency reuse for every execution mode
+      // and every iteration.  Formal timing keeps this disabled so the extra
+      // reduction and host synchronization cannot perturb reported runtime.
+      if (options.profile_iterations) {
+        compute_frontier_metrics();
+      }
 
       bool use_pull = false;
       if (options.traversal_mode == traversal_mode_t::pull) {
@@ -481,6 +695,20 @@ class frontier_engine {
         profile.mode = "pull";
         profile.pull_kernel_ms = detail::timed_gpu(
             stream, options.profile_iterations, [&]() {
+              const value_type* pull_input =
+                  thrust::raw_pointer_cast(values.data());
+              if (options.pull_update_mode ==
+                  pull_update_mode_t::synchronous) {
+                detail::throw_if_cuda_error(
+                    cudaMemcpyAsync(
+                        thrust::raw_pointer_cast(pull_input_values.data()),
+                        thrust::raw_pointer_cast(values.data()),
+                        value_count * sizeof(value_type),
+                        cudaMemcpyDeviceToDevice, stream),
+                    "cudaMemcpyAsync(synchronous_pull_snapshot)");
+                pull_input =
+                    thrust::raw_pointer_cast(pull_input_values.data());
+              }
               if (scheduled) {
                 detail::launch_fused_pull_compute_scheduled<
                     Policy, graph_t, vertex_type>(
@@ -491,16 +719,121 @@ class frontier_engine {
                     thrust::raw_pointer_cast(unique_flags.data()),
                     thrust::raw_pointer_cast(pair_counts.data()),
                     iteration_active_slots,
-                    thrust::raw_pointer_cast(active_union_dev.data()), stream);
+                    thrust::raw_pointer_cast(active_union_dev.data()), stream,
+                    pull_input);
               } else {
-                detail::launch_fused_pull_compute<Policy, graph_t, vertex_type>(
-                    graph, query_count,
-                    thrust::raw_pointer_cast(values.data()),
-                    thrust::raw_pointer_cast(visited_mask.data()),
+                if (degree_partitioned_pull) {
+                  const int* degree_order =
+                      options.pull_degree_bucket_order.data();
+                  if (options.pull_strategy ==
+                      pull_strategy_t::degree_segmented) {
+                    detail::launch_fused_pull_degree_segmented<
+                        Policy, graph_t, vertex_type>(
+                        graph, query_count,
+                        thrust::raw_pointer_cast(pull_degree_vertices.data()),
+                        pull_degree_offsets.data(), degree_order,
+                        thrust::raw_pointer_cast(pull_segment_vertices.data()),
+                        thrust::raw_pointer_cast(pull_segment_begins.data()),
+                        thrust::raw_pointer_cast(pull_segment_ends.data()),
+                        pull_segment_count,
+                        thrust::raw_pointer_cast(values.data()),
+                        thrust::raw_pointer_cast(visited_mask.data()),
+                        thrust::raw_pointer_cast(next_frontier_mask.data()),
+                        thrust::raw_pointer_cast(unique_flags.data()),
+                        thrust::raw_pointer_cast(pair_counts.data()),
+                        iteration_active_slots,
+                        options.pull_high_degree_segment_threads, stream,
+                        pull_input);
+                  } else {
+                    detail::launch_fused_pull_degree_aware<Policy, graph_t,
+                                                           vertex_type>(
+                        graph, query_count,
+                        thrust::raw_pointer_cast(pull_degree_vertices.data()),
+                        pull_degree_offsets.data(), degree_order,
+                        thrust::raw_pointer_cast(values.data()),
+                        thrust::raw_pointer_cast(visited_mask.data()),
+                        thrust::raw_pointer_cast(next_frontier_mask.data()),
+                        thrust::raw_pointer_cast(unique_flags.data()),
+                        thrust::raw_pointer_cast(pair_counts.data()),
+                        iteration_active_slots, stream, pull_input);
+                  }
+                  const bool add_reverse =
+                      options.pull_sweep == pull_sweep_t::bidirectional &&
+                      (options.pull_bidirectional_rounds == 0 ||
+                       pull_iteration_count <
+                           options.pull_bidirectional_rounds) &&
+                      pull_iteration_count %
+                              options.pull_bidirectional_period ==
+                          0;
+                  if (add_reverse) {
+                    const std::size_t reverse_begin =
+                        options.pull_reverse_vertex_begin;
+                    const std::size_t reverse_end =
+                        options.pull_reverse_vertex_end == 0
+                            ? vertex_count
+                            : options.pull_reverse_vertex_end;
+                    detail::launch_fused_pull_range<Policy, graph_t,
+                                                    vertex_type>(
+                        graph, query_count,
+                        thrust::raw_pointer_cast(values.data()),
+                        thrust::raw_pointer_cast(visited_mask.data()),
+                        thrust::raw_pointer_cast(next_frontier_mask.data()),
+                        thrust::raw_pointer_cast(unique_flags.data()),
+                        thrust::raw_pointer_cast(pair_counts.data()),
+                        iteration_active_slots, reverse_begin, reverse_end,
+                        true, stream, 0, nullptr, nullptr, nullptr, nullptr,
+                        true, pull_input);
+                  }
+                } else {
+                  detail::launch_fused_pull_range<Policy, graph_t,
+                                                  vertex_type>(
+                      graph, query_count,
+                      thrust::raw_pointer_cast(values.data()),
+                      thrust::raw_pointer_cast(visited_mask.data()),
+                      thrust::raw_pointer_cast(next_frontier_mask.data()),
+                      thrust::raw_pointer_cast(unique_flags.data()),
+                      thrust::raw_pointer_cast(pair_counts.data()),
+                      iteration_active_slots, 0, vertex_count, false, stream,
+                      0, nullptr, nullptr, nullptr, nullptr, false,
+                      pull_input);
+                  const bool add_reverse =
+                      options.pull_sweep == pull_sweep_t::bidirectional &&
+                      (options.pull_bidirectional_rounds == 0 ||
+                       pull_iteration_count <
+                           options.pull_bidirectional_rounds) &&
+                      pull_iteration_count %
+                              options.pull_bidirectional_period ==
+                          0;
+                  if (add_reverse) {
+                    const std::size_t reverse_begin =
+                        options.pull_reverse_vertex_begin;
+                    const std::size_t reverse_end =
+                        options.pull_reverse_vertex_end == 0
+                            ? vertex_count
+                            : options.pull_reverse_vertex_end;
+                    detail::launch_fused_pull_range<Policy, graph_t,
+                                                    vertex_type>(
+                        graph, query_count,
+                        thrust::raw_pointer_cast(values.data()),
+                        thrust::raw_pointer_cast(visited_mask.data()),
+                        thrust::raw_pointer_cast(next_frontier_mask.data()),
+                        thrust::raw_pointer_cast(unique_flags.data()),
+                        thrust::raw_pointer_cast(pair_counts.data()),
+                        iteration_active_slots, reverse_begin, reverse_end,
+                        true, stream, 0, nullptr, nullptr, nullptr, nullptr,
+                        true, pull_input);
+                  }
+                }
+              }
+              if (options.trace_pull_updates) {
+                detail::launch_trace_pull_frontier(
                     thrust::raw_pointer_cast(next_frontier_mask.data()),
-                    thrust::raw_pointer_cast(unique_flags.data()),
-                    thrust::raw_pointer_cast(pair_counts.data()),
-                    iteration_active_slots, stream);
+                    vertex_count, static_cast<unsigned int>(level),
+                    thrust::raw_pointer_cast(
+                        pull_update_iteration_sum.data()),
+                    thrust::raw_pointer_cast(pull_update_count.data()),
+                    thrust::raw_pointer_cast(pull_update_first.data()),
+                    thrust::raw_pointer_cast(pull_update_last.data()), stream);
               }
             });
         detail::throw_if_cuda_error(cudaGetLastError(), "launch_fused_pull");
@@ -548,6 +881,7 @@ class frontier_engine {
         }
         context.synchronize();
         profile.count_sync_ms += detail::elapsed_ms(sync_start);
+        ++pull_iteration_count;
       } else {
         profile.mode = "push";
         profile.shared_push_kernel_ms = detail::timed_gpu(
@@ -677,6 +1011,18 @@ class frontier_engine {
       }
 
       if (scheduled) {
+        const query_mask_t completed_slots =
+            iteration_active_slots & ~next_live_slots;
+        const float completion_wall = detail::elapsed_ms(wall_start);
+        for (int query = 0; query < query_count; ++query) {
+          if ((completed_slots & (query_mask_t{1} << query)) != 0 &&
+              query_completion_levels[static_cast<std::size_t>(query)] < 0) {
+            query_completion_levels[static_cast<std::size_t>(query)] =
+                static_cast<int>(level);
+            query_completion_wall_ms[static_cast<std::size_t>(query)] =
+                completion_wall;
+          }
+        }
         profile.query_convergence_mask = next_live_slots;
         live_slots = next_live_slots;
       }
@@ -703,12 +1049,22 @@ class frontier_engine {
     result.wall_time_ms = detail::elapsed_ms(wall_start);
     result.queries.reserve(queries.size());
     for (std::size_t q = 0; q < queries.size(); ++q) {
+      const int completion_level = query_completion_levels[q] >= 0
+          ? query_completion_levels[q]
+          : std::max(0, static_cast<int>(level) - 1);
+      const float completion_wall = query_completion_levels[q] >= 0
+          ? query_completion_wall_ms[q]
+          : result.wall_time_ms;
       result.queries.push_back(
           {static_cast<vertex_type>(q), queries[q],
-           static_cast<vertex_type>(std::max(0, static_cast<int>(level) - 1)),
-           result.wall_time_ms});
+           static_cast<vertex_type>(completion_level), completion_wall});
     }
     result.values = std::move(values);
+    result.pull_update_iteration_sum =
+        std::move(pull_update_iteration_sum);
+    result.pull_update_count = std::move(pull_update_count);
+    result.pull_update_first = std::move(pull_update_first);
+    result.pull_update_last = std::move(pull_update_last);
     return result;
   }
 };

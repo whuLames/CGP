@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 namespace puercgp {
 
@@ -17,7 +18,11 @@ enum class push_strategy_t {
   shared_node_warp
 };
 
-enum class pull_strategy_t { fused };
+enum class pull_strategy_t { fused, degree_aware, degree_segmented };
+
+enum class pull_sweep_t { forward, bidirectional };
+
+enum class pull_update_mode_t { in_place, synchronous };
 
 enum class frontier_repr_t { shared };
 
@@ -27,6 +32,13 @@ struct run_options {
   traversal_mode_t traversal_mode = traversal_mode_t::hybrid;
   push_strategy_t push_strategy = push_strategy_t::shared_node_warp;
   pull_strategy_t pull_strategy = pull_strategy_t::fused;
+  pull_update_mode_t pull_update_mode = pull_update_mode_t::in_place;
+  int pull_degree_threshold_2 = 32;
+  int pull_degree_threshold_4 = 64;
+  int pull_degree_threshold_8 = 128;
+  int pull_high_degree_segment_edges = 1024;
+  int pull_high_degree_segment_threads = 256;
+  std::vector<int> pull_degree_bucket_order{0, 1, 2, 3};
   double pull_frontier_ratio = 0.15;
   double pull_edge_ratio = 0.20;
   bool profile_iterations = false;
@@ -35,6 +47,18 @@ struct run_options {
   // Keep dense algorithms active until max_iterations even if the convergence
   // test succeeds early. Frontier algorithms continue to use convergence.
   bool fixed_iterations = false;
+  pull_sweep_t pull_sweep = pull_sweep_t::forward;
+  // In bidirectional mode, add a reverse sweep every N outer iterations.
+  // pull_bidirectional_rounds=0 leaves the periodic rule active to convergence.
+  std::size_t pull_bidirectional_period = 1;
+  std::size_t pull_bidirectional_rounds = 0;
+  // Limit the extra reverse pass to [begin, end). end=0 selects all vertices.
+  std::size_t pull_reverse_vertex_begin = 0;
+  std::size_t pull_reverse_vertex_end = 0;
+  // Optional experiment trace: aggregate the pull iterations in which each
+  // vertex-query value improved. Disabled by default and never allocated on
+  // production paths.
+  bool trace_pull_updates = false;
   std::size_t max_queries = 0;
   // replenishment（运行期 slot 动态补给）开关：
   //   false（默认）→ 走现有 hybrid_frontier_engine::run，所有 replenish kernel 不调用
@@ -79,6 +103,20 @@ inline const char* pull_strategy_name(pull_strategy_t strategy) {
   switch (strategy) {
     case pull_strategy_t::fused:
       return "fused";
+    case pull_strategy_t::degree_aware:
+      return "degree_aware";
+    case pull_strategy_t::degree_segmented:
+      return "degree_segmented";
+  }
+  return "unknown";
+}
+
+inline const char* pull_update_mode_name(pull_update_mode_t mode) {
+  switch (mode) {
+    case pull_update_mode_t::in_place:
+      return "in_place";
+    case pull_update_mode_t::synchronous:
+      return "synchronous";
   }
   return "unknown";
 }

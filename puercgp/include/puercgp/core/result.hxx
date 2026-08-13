@@ -23,6 +23,7 @@ struct iteration_profile_t {
   std::string mode;
   std::size_t frontier_size = 0;
   std::size_t unique_frontier_size = 0;
+  unsigned long long active_pair_count = 0;
   unsigned long long edge_count = 0;
   unsigned long long actual_edge_count = 0;
   unsigned long long virtual_edge_count = 0;
@@ -43,6 +44,10 @@ struct iteration_profile_t {
 template <typename vertex_t, typename value_t>
 struct run_result_t {
   thrust::device_vector<value_t> values;
+  thrust::device_vector<unsigned long long> pull_update_iteration_sum;
+  thrust::device_vector<unsigned int> pull_update_count;
+  thrust::device_vector<unsigned int> pull_update_first;
+  thrust::device_vector<unsigned int> pull_update_last;
   std::vector<query_result_t<vertex_t>> queries;
   std::vector<std::size_t> frontier_sizes;
   std::vector<std::size_t> unique_frontier_sizes;
