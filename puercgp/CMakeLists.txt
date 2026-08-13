@@ -34,6 +34,7 @@ project(puercgp
 option(PUERCGP_BUILD_EXAMPLES "Build puercgp smoke and validation examples." ON)
 
 find_package(CUDAToolkit REQUIRED)
+find_package(OpenMP)
 
 if(NOT CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES 75 CACHE STRING "CUDA architectures" FORCE)
@@ -59,7 +60,7 @@ target_include_directories(puercgp
 target_link_libraries(puercgp INTERFACE CUDA::cudart)
 
 if(PUERCGP_BUILD_EXAMPLES)
-  foreach(_puercgp_example smoke_frontier validate_bfs validate_sssp validate_sswp validate_pagerank validate_ppr bench_pagerank_push_pull bench_rank_baseline smoke_reduce_ops smoke_hybrid_init smoke_hybrid_push validate_hybrid validate_wcc validate_hybrid_real bench_hybrid smoke_replenish validate_replenish bench_replenish bench_phase_schedule bench_phase_schedule_n128 bench_online_offset_n128 bench_online_runner validate_online_runner smoke_green_context bench_push_sm_scaling bench_pull_sm_scaling validate_query_partition_kernels trace_hybrid_q64 trace_query_work_q64 bench_query_partition_replay_q64 validate_roadnet_replenish bench_concurrent_push_groups bench_group_replenish)
+  foreach(_puercgp_example smoke_frontier validate_bfs validate_sssp validate_sswp validate_pagerank validate_ppr bench_pagerank_push_pull bench_rank_baseline smoke_reduce_ops smoke_hybrid_init smoke_hybrid_push validate_hybrid validate_wcc validate_hybrid_real bench_hybrid smoke_replenish validate_replenish bench_replenish bench_phase_schedule bench_phase_schedule_n128 bench_online_offset_n128 bench_online_runner validate_online_runner smoke_green_context bench_push_sm_scaling bench_pull_sm_scaling validate_query_partition_kernels trace_hybrid_q64 trace_query_work_q64 bench_query_partition_replay_q64 validate_roadnet_replenish bench_concurrent_push_groups bench_group_replenish bench_reordering bench_pull_update_ablation)
     add_executable(${_puercgp_example} examples/${_puercgp_example}.cu)
     target_link_libraries(${_puercgp_example} PRIVATE puercgp::puercgp)
     set_target_properties(${_puercgp_example}
@@ -84,4 +85,57 @@ if(PUERCGP_BUILD_EXAMPLES)
       CXX_STANDARD 17
       CXX_STANDARD_REQUIRED ON
   )
+
+  add_executable(select_static_landmarks tools/select_static_landmarks.cpp)
+  set_target_properties(select_static_landmarks
+    PROPERTIES
+      CXX_STANDARD 17
+      CXX_STANDARD_REQUIRED ON
+  )
+
+  add_executable(reorder_csr tools/reorder_csr.cpp)
+  set_target_properties(reorder_csr
+    PROPERTIES
+      CXX_STANDARD 17
+      CXX_STANDARD_REQUIRED ON
+  )
+  if(OpenMP_CXX_FOUND)
+    target_link_libraries(reorder_csr PRIVATE OpenMP::OpenMP_CXX)
+  endif()
+
+  add_executable(add_forest_shortcuts tools/add_forest_shortcuts.cpp)
+  set_target_properties(add_forest_shortcuts
+    PROPERTIES
+      CXX_STANDARD 17
+      CXX_STANDARD_REQUIRED ON
+  )
+
+  add_executable(add_low_degree_shortcuts
+    tools/add_low_degree_shortcuts.cpp)
+  set_target_properties(add_low_degree_shortcuts
+    PROPERTIES
+      CXX_STANDARD 17
+      CXX_STANDARD_REQUIRED ON
+  )
+  if(OpenMP_CXX_FOUND)
+    target_link_libraries(add_low_degree_shortcuts PRIVATE OpenMP::OpenMP_CXX)
+  endif()
+
+  add_executable(prune_dominated_edges tools/prune_dominated_edges.cpp)
+  set_target_properties(prune_dominated_edges
+    PROPERTIES
+      CXX_STANDARD 17
+      CXX_STANDARD_REQUIRED ON
+  )
+  if(OpenMP_CXX_FOUND)
+    target_link_libraries(prune_dominated_edges PRIVATE OpenMP::OpenMP_CXX)
+  endif()
+
+  add_executable(ggr2csr tools/ggr2csr.cpp)
+  set_target_properties(ggr2csr
+    PROPERTIES
+      CXX_STANDARD 17
+      CXX_STANDARD_REQUIRED ON
+  )
+
 endif()
