@@ -30,7 +30,7 @@ For a $w$-byte value, the value matrix requires $w|V|Q$ bytes.  Three 64-bit mas
 \paragraph{GPU mapping.}
 This paragraph contains the hardware-specific mapping deliberately omitted from the conceptual design.  \sharedexpand assigns one active union vertex to a cooperative execution group; the current default uses a warp for a vertex and distributes high- and low-degree rows across blocks for load balance.  \coalescedgather maps the query identifier to the contiguous dimension of a CUDA block while holding a destination row fixed.  As Figure~\ref{fig:layout} shows, this mapping follows the vertex-major state layout and turns one vertex's query values into consecutive accesses.
 
-\input{figures/operator_mapping}
+\input{figures/05_implementation/operator_mapping}
 
 \paragraph{Frontier construction.}
 Atomic updates merge successful query bits at a destination.  A first-writer test records whether the destination needs a compact-list entry; a prefix scan then produces the next union frontier and counts unique vertices and query--edge pairs.  Both traversal strategies emit the same compact format.  These operations are included in end-to-end time because omitting them would overstate the benefit of sharing.

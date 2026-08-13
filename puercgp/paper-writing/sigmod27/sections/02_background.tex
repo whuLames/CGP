@@ -94,7 +94,7 @@ Under the same query count, batch size, and source seed, the union-edge reductio
 \paragraph{O3: overlap depends on traversal phase.}
 Starting another query as soon as a slot becomes free increases occupancy but mixes unrelated traversal phases.  The extra work can exceed the benefit of filling the slot.  Conversely, a bounded start delay can bring high-cost phases together and increase exact vertex sharing.  Figure~\ref{fig:phase-alignment} illustrates that an offset changes only the global start time; it does not pause a query or alter its internal level order.
 
-\input{figures/phase_alignment}
+\input{figures/02_background/phase_alignment}
 
 \subsection{Design Principles}
 

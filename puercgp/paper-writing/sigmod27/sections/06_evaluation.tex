@@ -1,205 +1,361 @@
-\section{Evaluation}
+\section{Experiments}
+\label{sec:experiment}
 \label{sec:evaluation}
 
-The evaluation tests whether the memory-access view yields an effective CGQ system.  It separates three mechanisms from end-to-end performance: neighborhood sharing, regular state access, and scheduling-induced reuse.  Blue text denotes reproducible but preliminary measurements from the current repository; red text marks experiments still required before submission.
+In this section, we extensively evaluate the efficiency of \system, including the overall performance and effectiveness of the components proposed by \system.
 
-We organize the section around six questions:
-\begin{description}
-  \item[RQ1: Overall performance.] Does one fixed \system configuration improve query-window throughput and latency over strong graph-system and CGQ baselines?
-  \item[RQ2: Memory behavior.] Do fewer neighborhood accesses and lower state-access stalls explain performance?
-  \item[RQ3: Component effectiveness.] What does vertex sharing, aligned aggregation, adaptive selection, and scheduling contribute individually?
-  \item[RQ4: Scheduling quality.] Do grouping and offsets increase realized vertex sharing after online cost and query delay?
-  \item[RQ5: Generality and scaling.] Do the benefits persist across graph structure, query count, batch size, algorithms, and devices?
-  \item[RQ6: Overhead and correctness.] What preprocessing, online, memory, and semantic costs does \system introduce?
-\end{description}
+% \begin{description}
+%   \item[RQ1: Overall performance.] Does one fixed \system configuration improve query-window throughput and latency over strong graph-system and CGQ baselines?
+%   \item[RQ2: Memory behavior.] Do fewer neighborhood accesses and more efficient memory transfers explain performance?
+%   \item[RQ3: Component effectiveness.] What does vertex sharing, aligned aggregation, adaptive selection, and scheduling contribute individually?
+%   \item[RQ4: Scheduling quality.] Do grouping and offsets increase realized vertex sharing after online cost and query delay?
+%   \item[RQ5: Generality and scaling.] Do the benefits persist across graph structure, query count, batch size, algorithms, and devices?
+%   \item[RQ6: Overhead and correctness.] What preprocessing, online, memory, and semantic costs does \system introduce?
+% \end{description}
 
 \subsection{Experimental Setup}
 
-\paragraph{Platform.}
-Existing measurements use one NVIDIA Tesla V100-SXM2 with 32~GiB HBM2, CUDA 12.8, and release compilation.  Unless stated otherwise, query sources are distinct, reusable index construction is excluded, online scheduling is included, and correctness is checked against per-query fingerprints.  The online runner uses two warmups, five measured repetitions, alternating method order, and reports the median.  Final experiments will add a recent GPU generation and at least seven measured repetitions with confidence intervals.
+% 这里我们将sys和四个图系统进行对比，分别是Glign，ForkGraph，Gunrock和iBFS。其中，Glign是目前基于shared memory的SOTA的并发图处理系统。ForkGraph 被设计用于在CPU上高效处理涉及多节点travesal的图算法，也可以认为是对并发图处理任务的优化系统。Gunrock和Groute是目前GPU上SOTA的single-query 图处理系统，我们扩充Gunrock&Groute到串行版(Gunrock-S,Groute-S)和并行版(Gunrock-S,Gunrock-C)两个版本。前者按照顺序串行处理多个graph query，后者通过multi-stream实现在同一张图上并行处理多个graph query. iBFS 在GPU上 对多BFS查询进行针对性优化的系统.
+\subsubsection{Baselines.} We compare \system against five graph processing systems: Glign, ForkGraph, Gunrock, Groute, and iBFS. Glign is a state-of-the-art concurrent graph processing system for shared-memory architectures. ForkGraph is designed to efficiently execute graph algorithms involving multi-vertex traversals on CPUs. This design can also be viewed as an optimization for concurrent graph processing workloads. Gunrock and Groute are state-of-the-art GPU-based systems for single-query graph processing. We extend both systems with sequential variants (Gunrock-S and Groute-S) and concurrent variants (Gunrock-C and Groute-C). The sequential variants process multiple graph queries one at a time, whereas the concurrent variants use multiple GPU streams to process queries concurrently on a single shared graph copy. Finally, iBFS is a GPU-based system specifically optimized for concurrent BFS queries.
 
-\paragraph{Datasets.}
-Table~\ref{tab:datasets} spans citation, web, and social graphs with different degree distributions.  The final suite should add a long-diameter road graph and a synthetic family with controlled degree skew and source overlap.  Directed inputs retain their directions; \coalescedgather materializes incoming adjacency.
+% 我们选取Personilized Pagerank, SSSP, SSWP, BFS 作为我们的测试图算法，这些算法在很多图系统中都被采用作为对比算法。对于每个算法，我们都在测试数据集上随机生成256个query来得到完整的测试用例，这些用例用于构造后续试验的中采用的workload。对于PPR，我们....，对于SSSP，SSWP和BFS这样的单源搜索算法，我们随机选取256个源节点来构造256个query。关于workload，目前我们主要关注离线场景的试验评估，即我们假定所有测试的query都同时到达，我们重点关注各个对比系统处理完一批测试query的整体耗时，这是因为目前所有的对比系统都没有设计在线场景的query调度，尽管如此，在section6.6中我们会对我们系统在在线场景下的性能进行简单的分析。
+\subsubsection{Graph Algorithms and Workload.}
+% Our evaluation considers four graph algorithms: Personalized PageRank (PPR), SSSP, SSWP, and BFS. These algorithms are widely used in the evaluation of graph processing systems. For each algorithm and graph data set, we randomly generate 256 queries to construct the workloads used in subsequent experiments. For PPR, we .... . For the single-source algorithms, including SSSP, SSWP, and BFS, we construct the queries by randomly selecting 256 source vertices.
+We select Personalized PageRank (PPR), Single Source Shortest Path(SSSP), Single Source Widthest Path(SSWP), and Breadth First Search(BFS) for evaluation, all of which are widely used to evaluate graph processing systems. For each algorithm and data set, we randomly generate 256 queries to construct the workloads used in subsequent experiments. For PPR, we .... For the single-source algorithms, including SSSP, SSWP, and BFS, we construct the queries by randomly selecting 256 source vertices.
+
+We primarily evaluate offline workloads, assuming that all queries arrive simultaneously, and measure the time required to complete an entire query batch. This is because none of the compared systems is designed for query scheduling in online settings. Nevertheless, Section 6.6 briefly analyzes the performance of our system in an online setting and describes the workload used for this evaluation.
+
+
+\subsubsection{Implementation and Hardware Settings}
+\system is implemented as a header-only C++17/CUDA framework with approximately 8.5K lines of code. We compile it using GCC 12.2 and CUDA 12.8 on Debian 12, with -O3 optimization enabled. All experiments are conducted on the same CPU–GPU server. The host is equipped with two 2.40 GHz Intel Xeon Platinum 8260 CPUs, providing 48 physical cores and 96 hardware threads, along with 251 GiB of main memory. GPU workloads are executed on an NVIDIA Tesla V100-SXM2 GPU with 5,120 CUDA cores and 32 GiB of HBM2 memory.
+
+Table~\ref{tab:datasets} summarizes the six input graphs. We use the graph
+abbreviations throughout the remaining figures and tables.
 
 \begin{table}[t]
   \centering
-  \caption{Graphs in existing experiments.  B and M denote billions and millions.}
+  \caption{Graph datasets used in the evaluation.}
   \label{tab:datasets}
   \small
-  \begin{tabular}{lrr}
+  \begin{tabular}{llrr}
     \toprule
-    Graph & $|V|$ & $|E|$ \\
+    Graph & Abbr. & $|V|$ & $|E|$ \\
     \midrule
-    cit-Patents & 3.77M & 33.04M \\
-    soc-Orkut & 3.00M & 212.70M \\
-    soc-LiveJournal1 & 4.85M & 137.99M \\
-    indochina-2004 & 7.41M & 304.47M \\
-    soc-Twitter & 21.30M & 530.05M \\
-    soc-SinaWeibo & 58.66M & 522.64M \\
+    cit-Patents & CP & 3,774,768 & 33,037,895 \\
+    soc-LiveJournal1 & LJ & 4,846,609 & 85,702,474 \\
+    indochina-2004 & IN & 7,414,866 & 301,969,638 \\
+    uk-2002 & UK & 18,520,486 & 523,574,516 \\
+    soc-Twitter & TW & 21,297,772 & 530,051,618 \\
+    soc-Orkut & OK & 2,997,166 & 212,698,418 \\
     \bottomrule
   \end{tabular}
 \end{table}
 
-\paragraph{Queries.}
-We evaluate BFS, SSSP with nonnegative weights, and single-source widest path (SSWP).  Main experiments use $N=256,Q=64$ and sweep $N\in\{64,128,256,512,1024\}$ and $Q\in\{1,2,4,8,16,32,64\}$.  Query latency begins at window admission, so scheduling delay remains visible.  Uniform distinct sources are the reproducible default; high-degree-biased, community-local, and adversarial low-overlap sources exercise different sharing regimes.  Every family uses at least ten stored source vectors.
+\subsection{Overall Performance}
 
-\paragraph{Baselines.}
-The main comparison includes: independent execution in the same engine; independent concurrent execution; Gunrock~\cite{wang_gunrock_2016} and TGraph~\cite{zhang_tgraph_2025} where their artifacts support the same graph and algorithm; \textsc{iBFS} for BFS~\cite{liu_ibfs_2016}; and a \textsc{Glign}-compatible grouping and delay policy on \system's execution engine~\cite{yin_glign_2022}.  The same-engine baselines isolate CGQ mechanisms from language and implementation differences.  CGgraph and CompressGraph address out-of-memory and compressed single-query execution, respectively, so they provide design context rather than a universal speedup denominator.
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=\textwidth]{figures/06_evaluation/runtime_scaling_all.pdf}
+  \caption{ Runtime across all test cases for varying query counts (in seconds, log scale)
+  }
+  \Description{Eighteen line charts arranged in three rows and six columns.
+  Each row represents BFS, SSSP, or SSWP, and each column represents one graph
+  dataset. Every panel compares runtime at 32, 64, 128, and 256 queries.}
+  \label{fig:runtime-scaling-all}
+\end{figure*}
 
-\paragraph{Metrics and fairness.}
-Window throughput is $N/T_{\mathrm{wall}}$ and includes query-dependent scheduling.  We report absolute time, queries/s, P50/P95 query latency, peak memory, and out-of-memory outcomes.  Access metrics include $E_{\mathrm{ind}}$, $E_{\mathrm{union}}$, $E_{\mathrm{pair}}$, device memory bytes, requests per useful value, and exposed data-access stalls.  Every main result uses one frozen policy rather than the best configuration selected separately for each graph.  Systems receive the same orientation, weights, sources, semantics, memory limit, warmups, and repetitions.  \drafttodo{Rerun all systems from one clean commit on an exclusive machine and publish source vectors, raw repetitions, checksums, clocks, and commands.}
+Figure~\ref{fig:runtime-scaling-all} reports end-to-end runtime as the
+number of total execution queries increases from 32 to 256. The common logarithmic
+axis preserves both the absolute gaps between systems and the scaling trend of
+each curve. Table~\ref{tab:n256-runtime} complements the figure with the exact
+$N=256$ runtimes in minutes.
 
-\subsection{RQ1: Overall CGQ Performance}
-
-\paragraph{Hypothesis.}
-If access savings exceed mask maintenance, frontier construction, and scheduling cost, one fixed \system configuration should improve query-window throughput without hiding delay in its constituent queries.  The primary result will report queries/s and absolute time over all graph--algorithm pairs, normalized to the strongest applicable baseline, with a separate common-capacity comparison for systems that cannot hold $Q=64$.
-
-\drafttodo{Produce the fixed-policy $N=256,Q=64$ main table after implementing and freezing the selector.  Include independent execution, Gunrock/TGraph where applicable, iBFS, the Glign-compatible schedule, GraphWeft, scheduling time, total time, queries/s, P50/P95 latency, and peak device memory.}
-
-The current external result is not yet a positive end-to-end claim.  Table~\ref{tab:ibfs-gap} compares the fixed online-hybrid BFS path with \textsc{iBFS} at $N=256,Q=64$.  \preliminary{Its geometric-mean speedup is only $0.49\times$.}  This result shows that the current combination of sharing and scheduling does not compensate for the maturity and BFS specialization of \textsc{iBFS} at this batch size.
+% 所有的测试用例均先执行一遍warm up，然后重复执行5次并取这五次执行结果的均值作为汇报的执行时间
 
 \begin{table}[t]
   \centering
-  \caption{Preliminary fixed-$Q=64$ BFS comparison.  Speedup is iBFS time divided by \system time; higher favors \system.}
-  \label{tab:ibfs-gap}
-  \small
-  \begin{tabular}{lrrr}
-    \toprule
-    Graph & \system (ms) & iBFS (ms) & Speedup \\
-    \midrule
-    cit-Patents & 967.87 & 298.36 & 0.31$\times$ \\
-    soc-Orkut & 1679.54 & 1030.02 & 0.61$\times$ \\
-    soc-Twitter & 10268.30 & 3463.27 & 0.34$\times$ \\
-    soc-SinaWeibo & 5704.68 & 5180.71 & 0.91$\times$ \\
-    \midrule
-    Geometric mean & --- & --- & 0.49$\times$ \\
-    \bottomrule
+  \caption{Overall comparison of query-window runtime at $N=256$ (min)}
+  \label{tab:n256-runtime}
+  \scriptsize
+  \setlength{\tabcolsep}{1.0pt}
+  \renewcommand{\arraystretch}{0.98}
+  \resizebox{\columnwidth}{!}{%
+  \begin{tabular}{|c|c|rrrrrrr|r|}
+    \hline
+    Alg. & G & Ours & Glign & Krill & Gr-S & Gr-C & Gu-S & Gu-C & GM$\times$ \\
+    \hline
+    \multirow{6}{*}{BFS}
+    & CP & \textbf{0.03} & 0.32 & 0.67 & 0.11 & 0.10 & 0.13 & \underline{0.08} & 5.45 \\
+    & LJ & \textbf{0.05} & 0.31 & 1.06 & 0.25 & 0.15 & 0.14 & \underline{0.09} & 4.35 \\
+    & IN & \textbf{0.05} & 0.71 & 6.79 & 1.10 & \underline{0.19} & 0.29 & 0.22 & 11.59 \\
+    & UK & \textbf{0.12} & 0.59 & 2.81 & 1.16 & 0.34 & 0.26 & \underline{0.22} & 4.69 \\
+    & TW & \textbf{0.40} & 4.37 & 18.05 & 3.55 & 0.89 & 0.69 & \underline{0.66} & 5.57 \\
+    & OK & \textbf{0.11} & 0.67 & 2.32 & 0.46 & 0.34 & 0.23 & \underline{0.21} & 4.25 \\
+    \hline
+    \multirow{6}{*}{SSSP}
+    & CP & \textbf{0.02} & 0.88 & 3.60 & 0.93 & 0.80 & \underline{0.33} & 0.33 & 41.27 \\
+    & LJ & \textbf{0.05} & 0.94 & 9.11 & 1.16 & 0.89 & \underline{0.33} & 0.34 & 19.67 \\
+    & IN & \textbf{0.04} & 2.57 & 42.95 & 3.82 & 1.16 & 0.38 & \underline{0.35} & 49.64 \\
+    & UK & \textbf{0.10} & 1.67 & 19.04 & 4.99 & 2.71 & 0.66 & \underline{0.64} & 22.71 \\
+    & TW & \textbf{0.25} & 10.26 & 121.57 & 7.26 & 2.23 & 1.22 & \underline{1.18} & 22.26 \\
+    & OK & \textbf{0.11} & 1.87 & 13.03 & 2.74 & 2.39 & \underline{0.59} & 0.60 & 17.72 \\
+    \hline
+    \multirow{6}{*}{SSWP}
+    & CP & \textbf{0.04} & 0.86 & 2.88 & 0.58 & 0.55 & \underline{0.21} & 0.22 & 15.83 \\
+    & LJ & \textbf{0.03} & 0.70 & 6.43 & 0.71 & 0.54 & \underline{0.17} & 0.18 & 20.68 \\
+    & IN & \textbf{0.03} & 1.63 & 48.73 & 2.52 & 0.61 & 0.27 & \underline{0.24} & 44.58 \\
+    & UK & \textbf{0.08} & 1.69 & 23.10 & 3.26 & 1.56 & 0.36 & \underline{0.35} & 21.80 \\
+    & TW & \textbf{0.17} & 9.86 & 124.42 & 5.20 & 1.57 & 0.87 & \underline{0.83} & 26.49 \\
+    & OK & \textbf{0.08} & 1.75 & 12.02 & 2.18 & 1.89 & \underline{0.40} & 0.41 & 20.28 \\
+    \hline
   \end{tabular}
+  }
 \end{table}
 
-Two follow-ups gate the final claim.  First, the batch-size sweep must reproduce on the current code the earlier observation that \system is more competitive at $Q=16$ and $Q=32$.  Second, the same engine must compare an iBFS-like bitwise BFS, a \textsc{Glign}-compatible schedule, their combination, and the full \system.  This decomposition distinguishes a general memory-access design from a composition of prior BFS and scheduling techniques.
+\paragraph{Absolute performance.}
+In Table~\ref{tab:n256-runtime}, bold values highlight the best result and
+underlined values denote the second-best result in each row.
+Ours is the fastest system for all 18 combinations of algorithm and dataset at
+$N=256$.
+Relative to the fastest baseline in each pair, it achieves a geometric-mean
+speedup of $4.39\times$, with per-pair improvements ranging from
+$1.66\times$ to $16.85\times$. Broken down by algorithm, the geometric-mean
+speedups are $2.09\times$ for BFS, $7.27\times$ for SSSP, and $5.54\times$
+for SSWP. The larger advantage on the two weighted traversals is consistent
+with Ours sharing topology accesses while retaining typed per-query updates,
+rather than launching or scheduling each traversal independently.
 
-\paragraph{Current conclusion.}
-The current $Q=64$ evidence rejects end-to-end superiority for BFS.  It narrows the immediate task to locating the batch-size crossover, removing hybrid regressions, and testing whether typed multi-algorithm execution adds value after controlling for an iBFS-like specialization.
+\paragraph{Scaling with the query window.}
+The nearly parallel curves in Figure~\ref{fig:runtime-scaling-all} show that
+the GPU systems generally preserve throughput as $N$ grows: from $N=32$ to
+$N=256$, Ours changes geometric-mean throughput by $1.02\times$. Multi-stream
+execution substantially improves Groute at $N=256$---by $2.40\times$ for BFS,
+$1.80\times$ for SSSP, and $1.89\times$ for SSWP on geometric mean---but its
+weighted traversals still remain behind Ours. Gunrock-C improves over
+Gunrock-S by $1.28\times$ for BFS, while their weighted performance is nearly
+identical ($1.01\times$). This contrast indicates that kernel concurrency alone
+does not reliably capture cross-query reuse. Krill's geometric-mean throughput
+falls to $0.57\times$ of its $N=32$ level, whereas Ours remains close to
+constant throughput across the eightfold increase in query count.
 
-\subsection{RQ2: Memory-Access Behavior}
+Overall, Figure~\ref{fig:runtime-scaling-all} and
+Table~\ref{tab:n256-runtime} show that Ours combines the lowest absolute
+runtime with stable query-window scaling across all three traversal semantics.
 
-\paragraph{Hypothesis.}
-\sharedexpand should improve time only when it reduces realized neighborhood access, while \coalescedgather should improve time only when regular state access reduces memory requests or exposed stalls enough to offset additional edge inspection.  We test two causal chains:
-\[
- \text{sharing}\rightarrow E_{\mathrm{union}}/E_{\mathrm{ind}}
- \rightarrow\text{topology bytes}\rightarrow\text{time},
-\]
-\[
- \text{aggregation}\rightarrow\text{requests/value}
- \rightarrow\text{access stalls}\rightarrow\text{time}.
-\]
-The controlled comparison holds the logical query--edge pairs and output values fixed while changing data organization and traversal order.
+%
+% 列出一个table，展示在所有数据集，256 query的场景下，我们系统的性能表现
+% 画个图展示 32 & 64 & 128 & 256 query下，不同算法的表现
 
-Existing profiles support the bottleneck diagnosis but not yet the full causal chain.  In one representative $Q=32$ aggregation iteration per graph, achieved bandwidth is 31--62\% of peak while long-latency dependency stalls account for 43--60\% (Table~\ref{tab:ncu}).  Sampling one iteration cannot characterize a complete query window.
 
-\begin{table}[t]
+% \subsubsection{Computation Runtime Comparison}
+
+% % 将Azure上的租赁价格作为我们的对比根源
+% % 可以拓展CPU 和 GPU的种类来丰富这个实验
+% \subsubsection{Cost-Effective Analysis}
+
+%
+
+\subsection{Sharing-aware Scheduler}
+\label{sec:scheduler-ablation}
+
+We fix the workload at $N=256$ and the resident batch size at $Q=32$.
+Figure~\ref{fig:scheduler-ablation} reports matched ratios; values above one
+indicate that the added component is beneficial.  Runtime includes online
+grouping and offset planning.  We obtain the sharing factor (ASF) from a
+separate instrumented run as $E_{\mathrm{pair}}/E_{\mathrm{union}}$, where
+$E_{\mathrm{pair}}$ is the query-separated adjacency work and
+$E_{\mathrm{union}}$ counts each active adjacency list once.
+
+\begin{figure*}[t]
   \centering
-  \caption{Preliminary profile of one $Q=32$ aggregation iteration per graph.}
-  \label{tab:ncu}
-  \small
-  \begin{tabular}{lrrr}
-    \toprule
-    Graph & GB/s & Peak BW & Access stall \\
-    \midrule
-    cit-Patents & 531.8 & 59.2\% & 59.8\% \\
-    soc-Orkut & 557.3 & 62.0\% & 46.5\% \\
-    soc-Twitter & 278.4 & 31.0\% & 51.7\% \\
-    soc-SinaWeibo & 472.9 & 52.6\% & 43.1\% \\
-    \bottomrule
-  \end{tabular}
-\end{table}
+  \includegraphics[width=\textwidth]{figures/06_evaluation/scheduler_ablation.pdf}
+  \caption{Effect of sharing-aware batching and bounded start offsets at
+  $N=256,Q=32$.  Each marker is one graph--algorithm pair; the dashed line
+  denotes no change.}
+  \Description{Four scatter plots compare end-to-end runtime speedup and
+  adjacency sharing-factor gain for query batching and start offsets across
+  six graphs and three algorithms.}
+  \label{fig:scheduler-ablation}
+\end{figure*}
 
-\drafttodo{Collect stratified or full-run profiles; compare vertex-major and query-major state, plus direct and alternative aggregation, for 4-, 8-, and 16-byte values.}
+\subsubsection{Query Batching.}
+Sharing-aware batching improves runtime on 16 of 18 graph--algorithm pairs,
+with a geometric-mean speedup of $1.04\times$
+(Figure~\ref{fig:scheduler-ablation}(a)).  More importantly, the measured ASF
+increases by $1.05\times$ on geometric mean and on 17 of 18 pairs
+(Figure~\ref{fig:scheduler-ablation}(b)).  Thus, the scheduler's inexpensive
+unweighted-landmark proxy generally places queries with overlapping realized
+frontiers in the same batch, and the resulting reuse offsets its online cost.
 
-\paragraph{Current conclusion.}
-The samples establish that exposed data-access latency is significant in the target workload, but they do not yet prove that \coalescedgather reduces it relative to a controlled alternative.  That proof requires identical logical work, values, and frontier inputs.
+\subsubsection{Start-offset Alignment.}
+We next add bounded offsets while retaining the same 256 queries and $Q=32$.
+Offsets improve FIFO by $1.16\times$ on geometric mean (17/18 wins), and add a
+$1.21\times$ benefit after sharing-aware batching (18/18 wins).  The
+corresponding ASF gains are $1.24\times$ and $1.31\times$, respectively
+(Figure~\ref{fig:scheduler-ablation}(c--d)).  This stronger sharing signal
+explains why offsets remain useful after batching rather than duplicating its
+effect.  The logical completion-step stretch remains bounded: the geometric
+means of the per-run p50/p95 ratios are 1.05/1.11 for FIFO and 1.04/1.12 for
+sharing-aware batching.
 
-\subsection{RQ3: Component Effectiveness}
+\subsection{Hybrid Computation Strategy}
+\label{sec:hybrid-ablation}
 
-\paragraph{Hypothesis.}
-Each component should move the memory quantity it targets: query-aware masks should eliminate false query--edge work, \sharedexpand should reduce neighborhood accesses, \coalescedgather should reduce effective state-access cost in broad phases, and the selector should approach the faster strategy without per-graph tuning.
+We evaluate the complete C9 configuration at $N=256,Q=32$.  In GraphWeft,
+Push-only is a frontier-driven scatter, whereas Pull-only performs a
+topology-driven gather over the graph; Hybrid uses the production threshold
+selected on disjoint calibration sources.  Figure~\ref{fig:hybrid-pull}
+reports fixed-mode runtime over Hybrid runtime, so a value above one favors
+Hybrid.
 
-The ablation compares independent execution; a query-oblivious union; exact masks with fixed \sharedexpand; exact masks with fixed \coalescedgather; the existing threshold; the calibrated selector; and a measured per-iteration oracle.  Controlled frontier replays vary union size, mask population, degree, active query count, and value width independently.  Whole-query runs then test whether the learned crossover transfers to natural frontier sequences.  Selector quality is reported as regret relative to the oracle, switching frequency, and measurement/model overhead.
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=\textwidth]{figures/06_evaluation/hybrid_pull_ablation.pdf}
+  \caption{Push/Pull and pull-kernel ablations.  Panels (a--b) use the full C9
+  execution at $N=256,Q=32$; panel (c) isolates matched pull kernels while
+  varying the number of query columns.}
+  \Description{Three plots show fixed-mode relative runtime, integrated
+  segment-reduce versus fused-pull runtime, and pull microkernel speedup for
+  query-column counts 8, 16, 32, and 64.}
+  \label{fig:hybrid-pull}
+\end{figure*}
 
-\drafttodo{Implement the model in Section~\ref{sec:selector}, create graph-disjoint calibration and test splits, and explain the current Twitter hybrid regression.}
+\subsubsection{Push vs. Pull Execution.}
+Hybrid is $1.04\times$ faster than Push-only and $1.01\times$ faster than
+Pull-only on geometric mean, but the averages conceal substantial variation:
+Hybrid wins only 3/18 and 10/18 pairs, respectively.  In particular, Hybrid
+is $1.14\times$ faster than Push-only for SSSP on geometric mean, largely due
+to a $2.44\times$ CP outlier, while Push-only is consistently slightly faster
+for SSWP.  Fixed Pull likewise ranges from $2.30\times$ slower to
+$2.32\times$ faster than Hybrid.  These results show that the frozen selector
+is competitive in aggregate but is not an oracle, and we do not tune it on
+the formal workload.
 
-\subsection{RQ4: Sharing-Aware Scheduling}
+\drafttodo{Add a matched-state diagnostic that fairly explains when Push or
+Pull is preferable. End-to-end fixed-mode runs follow different intermediate
+states and therefore cannot identify the per-iteration crossover.}
 
-\paragraph{Hypothesis.}
-If the phase estimator captures useful overlap, higher schedule scores should produce lower $E_{\mathrm{union}}/E_{\mathrm{ind}}$ after online cost, without unacceptable query delay.  Table~\ref{tab:planner-prelim} reports the strongest current mechanism result: all-push BFS, $N=128,Q=32$, seed 42, comparing online grouping plus offsets with input-order batches at zero offset.  \preliminary{Speedups range from $1.15\times$ to $2.31\times$, and the largest gains coincide with the largest reductions in union-edge access.}
+\subsubsection{Comparison of Different Pull Kernels.}
+We compare our query-lane-coalesced, GE-SpMM-like pull with the extracted
+segment-reduce control.  When integrated into the complete traversal, the two
+are effectively tied: segment-reduce/fused runtime is $0.995\times$ on
+geometric mean and fused wins 5/18 pairs
+(Figure~\ref{fig:hybrid-pull}(b)).  Isolating the matched kernels exposes the
+benefit that other traversal stages hide: fused pull is $1.83\times$ faster at
+$Q=32$ and $2.77\times$ faster at $Q=64$ across the six graphs
+(Figure~\ref{fig:hybrid-pull}(c)).
 
-Figure~\ref{fig:planner-result} places the execution benefit beside the remaining neighborhood work.  The trend is consistent with the access-count hypothesis, but the single seed, BFS-only workload, and per-graph landmark configurations do not establish general scheduling quality.
+Figure~\ref{fig:pull-kernel-profile} explains the kernel-level gap.  At
+$Q=32$, fused pull improves load efficiency by $7.35$--$7.86\times$ and reads
+$1.33$--$2.55\times$ fewer DRAM bytes.  Here, load efficiency is the fraction
+of each fetched 32-byte global-memory sector actually requested by the warp.
+The improvement is consistent across all six graphs, indicating that
+coalescing both makes transferred sectors more useful and reduces off-chip
+traffic.
 
-\input{figures/planner_speedup}
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\columnwidth]{figures/06_evaluation/pull_kernel_profile.pdf}
+  \caption{Matched pull-kernel profiling at $Q=32$.  All bars are improvement
+  factors over segment-reduce: kernel speedup is $T_{\mathrm{segment}}/
+  T_{\mathrm{GraphWeft}}$, sector utilization is useful bytes per fetched
+  32-byte sector, and DRAM-read reduction compares bytes read.  Values above
+  one favor GraphWeft.}
+  \Description{A grouped bar chart compares CP, LJ, IN, UK, TW, and OK on
+  kernel speedup, sector-utilization gain, and DRAM-read reduction relative to
+  segment-reduce.}
+  \label{fig:pull-kernel-profile}
+\end{figure}
+
+\subsection{Multi-hop Propagation}
+\label{sec:propagation-ablation}
+
+Figure~\ref{fig:propagation-ablation} separates in-place propagation from the
+two offline graph transformations.  Every new graph variant produces exactly
+the same 256-query fingerprints as Original.
+
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=\textwidth]{figures/06_evaluation/propagation_ablation.pdf}
+  \caption{Matched propagation ablations at $N=256,Q=32$.  Runtime and
+  iteration ratios are before/after, so values above one indicate improvement.}
+  \Description{Four scatter plots show runtime and iteration changes from
+  in-place pull and from reorder-only, shortcut-only, and full preprocessing
+  across six graphs and three algorithms.}
+  \label{fig:propagation-ablation}
+\end{figure*}
+
+\subsubsection{Effect of In-place Pull.}
+On Original, in-place pull improves runtime by $1.03\times$ on geometric mean
+and wins 12/18 pairs.  On the preprocessed graph it also gives $1.03\times$,
+but wins all 18 pairs.  The aggregate iteration reductions are only
+$1.01\times$ and $1.00\times$, respectively
+(Figure~\ref{fig:propagation-ablation}(a,c)).  Hence, the measured benefit does
+not primarily come from fewer globally reported rounds; it comes from making
+new values visible within a round and reducing the cost of reaching the same
+fixed point.  This distinction prevents us from treating an in-place round as
+equivalent to a synchronous superstep.
+
+\subsubsection{Ablation Study on Preprocessing Method.}
+Reordering alone is not sufficient: it yields $0.89\times$ geometric-mean
+speedup and wins only 4/18 pairs.  Shortcut-only reduces iterations by
+$1.61\times$ on every pair and improves runtime by $1.22\times$ on geometric
+mean.  Full preprocessing further raises runtime speedup to $1.30\times$ while
+retaining a $1.62\times$ iteration reduction
+(Figure~\ref{fig:propagation-ablation}(b,d)).  The effect is algorithm
+dependent.  Full preprocessing accelerates every SSSP and SSWP case, by
+$2.11\times$ and $1.84\times$ on geometric mean, but slows all six BFS cases
+to $0.57\times$ despite reducing their round counts.  Thus, contracting the
+dependency path is useful only when the saved rounds outweigh the changed
+per-round graph work.
+
+Table~\ref{tab:preprocessing-cost} reports storage and amortization.  The
+recorded graph-build cost amortizes after 6--22 windows for the SSSP cases with
+available timing records, and after 9--41 windows for SSWP.  BFS does not
+amortize because its online runtime increases.  Three reused SSSP assets lack
+historical build times and are shown as ``--'' rather than reconstructed from
+unverifiable estimates.
 
 \begin{table*}[t]
   \centering
-  \caption{Preliminary online scheduling result: all-push BFS, $N=128,Q=32$.  Baseline is input-order batching with zero offsets; scheduling time is included.}
-  \label{tab:planner-prelim}
-  \small
-  \begin{tabular}{lrrrrrr}
+  \caption{Online benefit and recorded offline cost of graph preprocessing at
+  $N=256,Q=32$.  Runtime and iteration columns are ratios over Original;
+  above one is favorable. Prep./raw is the recorded graph-build cost in
+  equivalent Original windows and excludes the retained reordering job.}
+  \label{tab:preprocessing-cost}
+  \scriptsize
+  \setlength{\tabcolsep}{3.4pt}
+  \begin{tabular}{llrrrrrrrr}
     \toprule
-    Graph & Baseline (ms) & Scheduled (ms) & Speedup & Sched. (ms) & Baseline union edges & Scheduled union edges \\
+    Graph & Alg. & Reorder & Shortcut & Full & Iter. red. & Edge exp. & Storage exp. & Prep./raw & Break-even \\
     \midrule
-    indochina-2004 & 1116.43 & 483.42 & 2.31$\times$ & 10.69 & 9.278B & 3.302B \\
-    soc-Twitter & 5160.31 & 2602.48 & 1.98$\times$ & 11.87 & 9.462B & 4.054B \\
-    soc-LiveJournal1 & 1032.91 & 693.50 & 1.49$\times$ & 13.14 & 2.367B & 1.422B \\
-    soc-Orkut & 1459.51 & 1087.66 & 1.34$\times$ & 14.49 & 2.887B & 2.016B \\
-    cit-Patents & 1039.62 & 806.09 & 1.29$\times$ & 14.20 & 0.745B & 0.527B \\
-    soc-SinaWeibo & 5571.70 & 4834.70 & 1.15$\times$ & 11.24 & 4.973B & 4.202B \\
+    CP & BFS & 1.45$\times$ & 0.94$\times$ & 0.99$\times$ & 1.42$\times$ & 1.48$\times$ & 1.43$\times$ & 7.3$\times$ & $\infty$ \\
+    CP & SSSP & 1.21$\times$ & 1.56$\times$ & 1.88$\times$ & 1.61$\times$ & 1.12$\times$ & 1.11$\times$ & 5.9$\times$ & 13 \\
+    CP & SSWP & 1.04$\times$ & 1.41$\times$ & 1.46$\times$ & 1.89$\times$ & 0.96$\times$ & 0.96$\times$ & 6.5$\times$ & 21 \\
+    \midrule
+    LJ & BFS & 1.04$\times$ & 0.58$\times$ & 0.60$\times$ & 1.40$\times$ & 1.22$\times$ & 1.21$\times$ & 15.3$\times$ & $\infty$ \\
+    LJ & SSSP & 0.94$\times$ & 1.58$\times$ & 1.55$\times$ & 1.55$\times$ & 0.81$\times$ & 0.82$\times$ & -- & -- \\
+    LJ & SSWP & 0.95$\times$ & 1.52$\times$ & 1.50$\times$ & 1.84$\times$ & 0.68$\times$ & 0.70$\times$ & 13.0$\times$ & 40 \\
+    \midrule
+    IN & BFS & 0.64$\times$ & 0.55$\times$ & 0.65$\times$ & 1.75$\times$ & 1.07$\times$ & 1.06$\times$ & 21.7$\times$ & $\infty$ \\
+    IN & SSSP & 0.83$\times$ & 3.32$\times$ & 3.72$\times$ & 1.86$\times$ & 0.48$\times$ & 0.49$\times$ & -- & -- \\
+    IN & SSWP & 0.83$\times$ & 2.49$\times$ & 2.83$\times$ & 1.49$\times$ & 0.44$\times$ & 0.45$\times$ & 12.9$\times$ & 20 \\
+    \midrule
+    UK & BFS & 0.78$\times$ & 0.47$\times$ & 0.53$\times$ & 1.74$\times$ & 1.11$\times$ & 1.11$\times$ & 20.4$\times$ & $\infty$ \\
+    UK & SSSP & 0.82$\times$ & 2.94$\times$ & 3.14$\times$ & 1.84$\times$ & 0.39$\times$ & 0.41$\times$ & -- & -- \\
+    UK & SSWP & 0.80$\times$ & 2.29$\times$ & 2.42$\times$ & 1.74$\times$ & 0.33$\times$ & 0.35$\times$ & 10.9$\times$ & 19 \\
+    \midrule
+    TW & BFS & 0.71$\times$ & 0.37$\times$ & 0.40$\times$ & 1.65$\times$ & 1.13$\times$ & 1.12$\times$ & 11.0$\times$ & $\infty$ \\
+    TW & SSSP & 0.92$\times$ & 1.26$\times$ & 1.33$\times$ & 1.57$\times$ & 0.98$\times$ & 0.98$\times$ & 5.3$\times$ & 22 \\
+    TW & SSWP & 0.93$\times$ & 1.24$\times$ & 1.30$\times$ & 1.74$\times$ & 0.93$\times$ & 0.93$\times$ & 9.5$\times$ & 41 \\
+    \midrule
+    OK & BFS & 0.60$\times$ & 0.40$\times$ & 0.42$\times$ & 1.15$\times$ & 1.06$\times$ & 1.05$\times$ & 12.4$\times$ & $\infty$ \\
+    OK & SSSP & 0.98$\times$ & 1.90$\times$ & 1.96$\times$ & 1.27$\times$ & 0.74$\times$ & 0.75$\times$ & 2.9$\times$ & 6 \\
+    OK & SSWP & 0.98$\times$ & 1.91$\times$ & 1.97$\times$ & 1.85$\times$ & 0.66$\times$ & 0.67$\times$ & 4.4$\times$ & 9 \\
     \bottomrule
   \end{tabular}
 \end{table*}
 
-The six-graph ordering is monotonic: indochina retains 35.6\% of baseline union-edge work and has the largest speedup, while SinaWeibo retains 84.5\% and has the smallest.  Online scheduling takes 10.7--14.5~ms and is included in the scheduled time.  This small sample supports the proposed mechanism but is not a general correlation result.
 
-The newer $N=256,Q=64$ runner adds a conservative automatic gate (Table~\ref{tab:planner-gating}).  It enables full scheduling for cit-Patents and Twitter and uses the fallback for the other two cases.  The gate avoids regressions in the tested neutral cases, but the four-graph geometric-mean benefit is only $1.064\times$.
-
-\begin{table}[t]
-  \centering
-  \caption{Preliminary automatic scheduling for BFS at $N=256,Q=64$.  Online evaluation is included; disabled rows use the fallback.}
-  \label{tab:planner-gating}
-  \small
-  \begin{tabular}{lrrr}
-    \toprule
-    Graph & Schedule & Speedup & Eval. ms \\
-    \midrule
-    cit-Patents & full & 1.148$\times$ & 26.62 \\
-    soc-Orkut & disabled & 1.000$\times$ & 0.02 \\
-    soc-Twitter & full & 1.119$\times$ & 15.10 \\
-    soc-SinaWeibo & disabled & 1.000$\times$ & 0.11 \\
-    \midrule
-    Geometric mean & auto & 1.064$\times$ & --- \\
-    \bottomrule
-  \end{tabular}
-\end{table}
-
-The final ablation compares input order, random order, degree grouping, a scalar-landmark \textsc{Glign}-compatible policy, pairwise histograms, pair swaps, zero offsets, completion-aligned offsets, and bounded coordinate search.  It reports predicted score, realized $S_{\mathrm{share}}$, execution and scheduling time, and P50/P95 latency over at least ten source sets, including low-overlap adversarial queries.
-
-\paragraph{Current conclusion.}
-For this all-push BFS sample, lower realized neighborhood access accompanies higher speedup, and a simple gate avoids the tested neutral Q64 cases.  Existing data does not yet establish multi-seed robustness, incremental value over \textsc{Glign}, or scheduling benefit for weighted traversals.
-
-\subsection{RQ5: Generality and Scaling}
-
-\paragraph{Hypothesis.}
-Sharing should initially improve with $Q$ as more overlap becomes available, then flatten or reverse when resident state and query--edge work dominate.  The $N$ sweep separates resident batch size from total window throughput.  Source sets are stratified by predicted and realized overlap; synthetic graphs vary average degree, skew, diameter, and community structure.
-
-Cross-device experiments use the V100 and one recent GPU with a different memory/compute balance.  Selector coefficients may be calibrated once per device, not per graph.  Weighted algorithms use several weight distributions and verify that a BFS phase index is not credited for behavior it cannot predict.  \drafttodo{Design SSSP- and SSWP-appropriate phase summaries, or narrow the scheduling claim to BFS while retaining the general execution model.}
-
-\subsection{RQ6: Overhead and Correctness}
-
-Reusable index and resident state should amortize across repeated query windows before erasing execution savings.  We report memory for CSR, transpose, weights, value matrix, masks, compaction workspace, and phase index.  Online cost is decomposed into index load, histogram construction, grouping, swaps, offset search, exact counters, and union construction.  Break-even analysis finds the minimum sharing level and number of windows required to recover each cost.
-
-The current serial CPU index builder takes about 30.3~s/0.88~GiB for indochina, 45.8~s/0.58~GiB for LiveJournal, and 116.7~s/1.27~GiB for Twitter.  These costs must be reported rather than treated as free preprocessing.
-
-Correctness compares every query result with independent execution.  Existing validation covers 60 real-graph runs and 27 small-graph combinations across BFS/SSSP/SSWP, $Q\in\{1,32,64\}$, and both fixed and hybrid strategies.  The final artifact adds randomized graphs, disconnected components, duplicate sources, unreachable vertices, large distances, weighted ties, saturated landmark distances, $N$ not divisible by $Q$, and maximum offset.  Integral outputs use exact equality; floating-point policies declare tolerance and determinism limits.
-
-\subsection{Evidence Summary}
-
-Current evidence establishes three narrower facts: scheduled exact execution is correct on the tested cases; phase alignment can substantially reduce neighborhood accesses for selected BFS windows; and exposed data-access latency is significant in the sampled aggregation phases.  It does \emph{not} yet establish that a frozen \system configuration beats \textsc{iBFS}, that aligned aggregation causes lower access cost, that the selector transfers across graphs, or that scheduling benefits weighted algorithms.  These are the gating experiments for a defensible SIGMOD/VLDB claim.
+% A broader hardware-profiling subsection is deferred; the pull-kernel NCU
+% evidence required by the current component study appears in Section 6.4.

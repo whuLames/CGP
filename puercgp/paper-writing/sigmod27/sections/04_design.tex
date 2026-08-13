@@ -52,7 +52,7 @@ Three per-vertex masks have different meanings and lifetimes.  The \emph{frontie
 
 Figure~\ref{fig:state-lifecycle} shows why the masks cannot be collapsed.  Frontier membership is a per-level work predicate, visited membership is historical algorithm state, and the next mask is the result of typed updates.  Combining frontier and visited state would reprocess inactive vertices; discarding query membership would force unrelated queries to inspect every union vertex.
 
-\input{figures/state_lifecycle}
+\input{figures/04_design/state_lifecycle}
 
 The masks expose sharing without changing the value domain of an individual query.  For an active vertex $v$, the engine enumerates exactly the queries in $\querymask_t(v)$ and invokes their typed relaxation rule.  BFS uses first discovery, SSSP uses weighted minimum, and widest path uses bottleneck maximum.  The mask determines \emph{which queries share the vertex}; the policy determines \emph{what each query computes}.
 
@@ -108,7 +108,7 @@ A start offset inserts inactive global iterations before a query's logical level
 \subsection{Sharing-Aware Query Scheduling}
 \label{sec:planner}
 
-\input{figures/planner}
+\input{figures/04_design/planner}
 
 The scheduler increases the input opportunity for \sharedexpand by placing compatible high-cost traversal phases in the same global iterations.  It has a reusable graph-analysis stage and a query-window stage.
 
@@ -144,7 +144,7 @@ where $A_t$ counts active destination--query pairs, $E_{\mathrm{in}}$ is incomin
 
 Figure~\ref{fig:selector-space} shows the qualitative boundary.  High exact overlap favors \sharedexpand; broad frontiers and high query activity amortize the fixed inspection cost of \coalescedgather.  The boundary is deliberately conceptual because its measured position depends on graph structure, value width, and platform.
 
-\input{figures/selector_space}
+\input{figures/04_design/selector_space}
 
 \paragraph{Current implementation.}
 The checked-in selector does not yet implement this calibrated model.  It chooses \coalescedgather when

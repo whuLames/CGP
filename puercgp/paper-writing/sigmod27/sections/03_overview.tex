@@ -1,7 +1,7 @@
 \section{System Overview}
 \label{sec:overview}
 
-\input{figures/system_overview}
+\input{figures/03_overview/system_overview}
 
 \system accepts a GPU-resident graph, a set of source-based graph queries, and a resident batch limit $Q$.  Figure~\ref{fig:overview} follows the same three principles derived in Section~\ref{sec:background}.  The scheduler exposes more simultaneous overlap (P3); exact query-aware state identifies which neighborhood accesses can be shared (P1); and the execution engine chooses between vertex sharing and access-efficient aggregation for the remaining work (P2).
 

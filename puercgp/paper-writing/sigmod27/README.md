@@ -17,11 +17,24 @@ latexmk -pdf -interaction=nonstopmode -halt-on-error main.tex
 latexmk -c
 ```
 
+## 导出矢量图
+
+将 `figures/` 中的 TikZ/PGFPlots 图批量编译为不含 caption 的独立矢量 PDF：
+
+```bash
+./figures/export_all.sh
+```
+
+生成的 PDF 与源文件同名，并按正文 section 保存在
+`figures/01_introduction/`--`figures/06_evaluation/` 对应子目录中。修改图形的
+`.tex` 文件后，重新执行该命令即可更新全部 TikZ/PGFPlots PDF。
+
 ## 目录内容
 
 - `main.tex`：SIGMOD/ACM 双栏入口、匿名审稿设置和摘要。
 - `sections/`：完整正文，包括 Introduction、Background、Overview、Design、Implementation、Evaluation、Related Work、Discussion、Conclusion。
-- `figures/`：八张可直接编译的 TikZ/PGFPlots 图，包括核心思想、阶段对齐、状态生命周期、选择空间和已有实验趋势。
+- `figures/`：按 section 编号组织的论文图片；TikZ/PGFPlots 源文件与导出的
+  PDF 成对放置，全体系统运行时间对比图位于 `figures/06_evaluation/`。
 - `algorithms/`：四个算法浮动体，覆盖批处理主循环、两种访问策略和在线调度器。
 - `references.bib`：正文使用的参考文献。
 - `CLAIM_EVIDENCE.md`：核心 claim 与代码、实验、缺失证据的映射。

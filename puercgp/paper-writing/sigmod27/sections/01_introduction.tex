@@ -10,7 +10,7 @@ Our key observation is that concurrency creates both the problem and the opportu
 
 Figure~\ref{fig:core-idea} summarizes this principle: \emph{share repeated accesses and regularize the remainder}.  This is a workload-level view rather than a GPU execution detail.  It first asks which graph data and query states are logically reusable, then maps the resulting computation to the hardware in Section~\ref{sec:implementation}.
 
-\input{figures/core_idea}
+\input{figures/01_introduction/core_idea}
 
 Realizing this opportunity raises three challenges.
 
