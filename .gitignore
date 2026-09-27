@@ -1,0 +1,9 @@
+/build/
+/experiments/
+/.vscode/
+/.clangd
+/core
+__pycache__/
+*.py[cod]
+*.o
+*.a
