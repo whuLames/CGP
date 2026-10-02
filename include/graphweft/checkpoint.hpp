@@ -14,6 +14,7 @@ struct Checkpoint {
   std::vector<uint64_t> frontier_mask;
   std::vector<uint32_t> frontier;
   std::vector<uint8_t> live_slots;
+  std::vector<Algorithm> slot_algorithms;
 };
 void save_checkpoint(const Checkpoint&, const std::string& path);
 Checkpoint load_checkpoint(const std::string& path);

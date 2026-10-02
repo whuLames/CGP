@@ -25,6 +25,7 @@ int main() {
           std::vector<RoundSnapshot> reference;
           run(graph,queries,options,{},[&](const RoundSnapshot& s){reference.push_back(s);});
           options.selector=Options::Selector::Replay;
+          options.frontier_build=FrontierBuildMode::Fused;
           for(int check=0;check<2;++check)for(int k=0;k<pull_partition_count;++k) {
             options.replay={pull_partition_id(k,check!=0)};size_t index=0;
             auto stats=run(graph,queries,options,{},[&](const RoundSnapshot& s){
@@ -47,6 +48,7 @@ int main() {
     std::vector<RoundSnapshot> negative_reference;
     run(negative,negative_queries,negative_options,{},[&](const RoundSnapshot& s){negative_reference.push_back(s);});
     negative_options.selector=Options::Selector::Replay;
+    negative_options.frontier_build=FrontierBuildMode::Fused;
     for(int check=0;check<2;++check)for(int k=0;k<pull_partition_count;++k){
       negative_options.replay={pull_partition_id(k,check!=0)};size_t index=0;
       run(negative,negative_queries,negative_options,{},[&](const RoundSnapshot& s){
@@ -83,6 +85,7 @@ int main() {
       if(q!=32)matrix.push_back({Layout::Grouped,32,partition_id(32)});
       for(auto [layout,width,kernel]:matrix){
         Options candidate=baseline;candidate.layout=layout;candidate.group_width=width;candidate.replay={kernel};
+        candidate.frontier_build=FrontierBuildMode::Fused;
         size_t round_index=0,result_index=0;
         auto stats=run(graph,queries,candidate,[&](const QueryResult& r){
           if(result_index>=reference_results.size() || r.id!=reference_results[result_index].id ||

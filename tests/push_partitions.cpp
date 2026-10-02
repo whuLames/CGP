@@ -31,6 +31,7 @@ int main(int argc,char**){
   std::vector<RoundSnapshot> baseline;
   run(g,prod_queries,production,{},[&](const RoundSnapshot& state){baseline.push_back(state);});
   production.selector=Options::Selector::Replay;
+  production.frontier_build=FrontierBuildMode::Fused;
   for(int k=0;k<push_partition_count;++k){
     production.replay={push_partition_id(k)};size_t round=0;
     auto stats=run(g,prod_queries,production,{},[&](const RoundSnapshot& state){

@@ -34,17 +34,17 @@ int main(int argc,char** argv){
   Buffer<uint64_t> row(graph.row.size()),in_row(graph.directed?graph.incoming_row.size():0),mask(cp.frontier_mask.size());
   Buffer<uint32_t> col(graph.col.size()),in_col(graph.directed?graph.incoming_col.size():0),list(cp.frontier_count),count(1);
   Buffer<float> weight(graph.weight.size()),in_weight(graph.directed?graph.incoming_weight.size():0),old(cp.old_values.size()),next(cp.old_values.size());
-  Buffer<uint8_t> live(cp.live_slots.size());Buffer<int> error(1);
+  Buffer<uint8_t> live(cp.live_slots.size());Buffer<Algorithm> algorithms(cp.slot_algorithms.size());Buffer<int> error(1);
   Buffer<unsigned char> eviction(cold?64ULL*1024*1024:0);
   row.upload(graph.row);col.upload(graph.col);weight.upload(graph.weight);
   if(graph.directed){in_row.upload(graph.incoming_row);in_col.upload(graph.incoming_col);in_weight.upload(graph.incoming_weight);}
-  mask.upload(cp.frontier_mask);list.upload(cp.frontier);live.upload(cp.live_slots);
+  mask.upload(cp.frontier_mask);list.upload(cp.frontier);live.upload(cp.live_slots);algorithms.upload(cp.slot_algorithms);
   check(cudaMemcpy(count.p,&cp.frontier_count,4,cudaMemcpyHostToDevice));
   GraphView gv{graph.vertices,graph.edges(),row.p,col.p,weight.p,
     graph.directed?in_row.p:row.p,graph.directed?in_col.p:col.p,graph.directed?in_weight.p:weight.p};
   auto value_view=[&](float* data){return ValueView{data,cp.vertices,cp.physical_slots,cp.group_width,cp.layout};};
   auto context=[&](){return Context{gv,value_view(old.p),value_view(next.p),mask.p,list.p,count.p,live.p,
-                                cp.slots,cp.words,cp.algorithm,nullptr,error.p};};
+                                cp.slots,cp.words,cp.algorithm,nullptr,error.p,UINT32_MAX,algorithms.p};};
   auto restore=[&](){
     old.upload(cp.old_values);check(cudaMemcpy(next.p,old.p,cp.old_values.size()*4,cudaMemcpyDeviceToDevice));
     check(cudaMemset(error.p,0,4));

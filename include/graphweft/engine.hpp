@@ -5,15 +5,32 @@
 #include <string>
 #include <vector>
 namespace graphweft {
-struct Query { uint64_t id; uint32_t source; double score = 0; uint32_t offset = 0; uint64_t feature_key = 0; };
+struct Query {
+  uint64_t id; uint32_t source; double score = 0; uint32_t offset = 0; uint64_t feature_key = 0;
+  // -1 inherits Options::algorithm.  Keeping this field last preserves the
+  // source compatibility of existing aggregate initializers and frozen plans.
+  int algorithm = -1;
+  // Optional reference-only length used by the oracle diagnostic planner.
+  uint32_t reference_rounds = 0;
+};
 struct Options {
   Algorithm algorithm = Algorithm::BFS;
   Layout layout = Layout::VertexMajor;
   FrontierMode frontier = FrontierMode::Unordered;
+  FrontierBuildMode frontier_build = FrontierBuildMode::Scan;
+  bool frontier_mask64 = true;
   uint32_t capacity = 32;
   uint32_t group_width = 8;
+  // Reclaim a physical group as soon as all its members finish.  Queries are
+  // grouped by algorithm and groups from algorithm queues are interleaved.
+  bool group_refill = false;
+  bool same_algorithm_groups = false;
+  bool oracle_order = false;
   double memory_fraction = .8;
   double pull_threshold = .2;
+  enum class PushMapping { Shared, Static, Degree, Density, Adaptive, Iteration } push_mapping = PushMapping::Shared;
+  uint32_t push_query_lanes = 8;
+  uint32_t push_grain = 0; // 0/1/2: 1/2/4 warps; 3/4: 2/4 blocks.
   bool sort_by_score = false;
   enum class Predictor { Imported, ImportedKey, CoreDistance, WeightedBoundary } predictor = Predictor::Imported;
   bool use_offsets = false;
@@ -31,6 +48,8 @@ struct Options {
   std::string checkpoint_path;
   uint32_t checkpoint_round = 0;
   std::string plan_output_path;
+  std::string completion_output_path;
+  std::string schedule_events_path;
 };
 struct AllocationPlan {
   std::map<std::string, uint64_t> bytes;
@@ -38,10 +57,38 @@ struct AllocationPlan {
 };
 AllocationPlan allocation_plan(const HostGraph&, const Options&, uint32_t capacity);
 uint32_t max_capacity(const HostGraph&, const Options&, uint64_t allowed_bytes, uint32_t limit);
-struct RoundFeatures { uint64_t edge_pairs = 0, active_queries = 0; double density = 0; bool density_valid = false; };
+struct RoundFeatures {
+  uint64_t edge_pairs = 0, active_queries = 0;
+  double density = 0;
+  bool density_valid = false;
+  uint64_t vertex_pairs = 0;
+  uint32_t frontier_vertices = 0, graph_vertices = 0;
+  uint64_t graph_edges = 0;
+};
 struct QueryResult { uint64_t id; uint32_t source; uint32_t completion_local_round; std::vector<float> values; };
-struct RunStats { uint64_t batches = 0, rounds = 0, push_rounds = 0, pull_rounds = 0; double planning_ms = 0, prediction_ms = 0, initialization_ms = 0, copy_ms = 0, kernel_ms = 0, kernel_gpu_ms = 0, frontier_ms = 0, compare_ms = 0, feature_ms = 0, selector_ms = 0, transfer_ms = 0, round_ms = 0, execution_ms = 0, task_wall_ms = 0, total_ms = 0; };
+struct QueryFingerprint {
+  uint64_t id = 0; uint32_t source = 0, completion_local_round = 0, vertices = 0;
+  uint64_t sum = 0, xor_value = 0;
+};
+struct CompletionRecord {
+  uint64_t id = 0; uint32_t source = 0; Algorithm algorithm = Algorithm::BFS;
+  uint32_t slot = 0, group = 0, activation_round = 0, completion_round = 0, service_rounds = 0;
+  // Host wall-clock timestamps relative to workload submission.  They are
+  // sampled at synchronization points that already exist in the executor, so
+  // enabling completion metadata does not add a GPU synchronization.
+  double activation_ms = 0, completion_ms = 0, waiting_ms = 0,
+         service_ms = 0, submit_to_completion_ms = 0;
+};
+struct RunStats {
+  uint64_t batches = 0, rounds = 0, push_rounds = 0, pull_rounds = 0;
+  uint64_t group_refills = 0, completed_slot_rounds = 0, active_slot_rounds = 0, capacity_slot_rounds = 0;
+  uint64_t final_drain_rounds = 0;
+  double planning_ms = 0, prediction_ms = 0, initialization_ms = 0, recycle_ms = 0, copy_ms = 0, kernel_ms = 0, kernel_gpu_ms = 0, frontier_ms = 0, compare_ms = 0, feature_ms = 0, adaptive_preparation_ms = 0, selector_ms = 0, transfer_ms = 0, round_ms = 0, execution_ms = 0, task_wall_ms = 0, total_ms = 0;
+  double workload_ms = 0;
+  std::vector<CompletionRecord> completions;
+};
 using ResultCallback = std::function<void(const QueryResult&)>;
+using FingerprintCallback = std::function<void(const QueryFingerprint&)>;
 struct RoundSnapshot {
   uint64_t batch_index;
   uint32_t global_round, used_slots, physical_slots, words;
@@ -55,6 +102,6 @@ using RoundCallback = std::function<void(const RoundSnapshot&)>;
 // Diagnostic hook before the production round. Only new_values/error_flag are scratch.
 // The executor restores scratch after the probe; input state must remain unchanged.
 using DeviceRoundProbe = std::function<void(const Context&, uint64_t batch, uint32_t round)>;
-RunStats run(const HostGraph&, std::vector<Query>, const Options&, const ResultCallback& = {}, const RoundCallback& = {}, const DeviceRoundProbe& = {});
+RunStats run(const HostGraph&, std::vector<Query>, const Options&, const ResultCallback& = {}, const RoundCallback& = {}, const DeviceRoundProbe& = {}, const FingerprintCallback& = {});
 std::vector<Query> load_queries(const std::string& path, uint32_t vertices, const std::string& graph_identity = {}, bool require_identity = false, uint32_t expected_capacity = 0);
 }

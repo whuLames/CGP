@@ -1,4 +1,5 @@
 #include "graphweft/scheduler.hpp"
+#include "graphweft/iteration_model.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -77,7 +78,9 @@ void CoreDistanceProvider::predict(const HostGraph& g,std::vector<Query>& querie
 void WeightedBoundaryProvider::predict(const HostGraph& g,std::vector<Query>& queries)const{
   if(!g.vertices)return;
   std::vector<uint32_t> landmarks(g.vertices);std::iota(landmarks.begin(),landmarks.end(),0);
-  uint32_t count=std::min<uint32_t>(256,g.vertices);
+  // weighted-boundary-v4 freezes the K=32 tier.  Keep the online builder
+  // identical so regenerated graph-bound plans compare directly.
+  uint32_t count=std::min<uint32_t>(32,g.vertices);
   std::partial_sort(landmarks.begin(),landmarks.begin()+count,landmarks.end(),[&](uint32_t a,uint32_t b){
     uint64_t da=g.row[a+1]-g.row[a],db=g.row[b+1]-g.row[b];
     if(da!=db)return da<db;
@@ -110,14 +113,67 @@ std::vector<Query> BatchPlanner::plan(std::vector<Query> queries,const Options& 
   }
   return queries;
 }
+std::vector<Query> BatchPlanner::plan_groups(std::vector<Query> queries,const Options& options){
+  if(!options.group_refill && !options.same_algorithm_groups)return plan(std::move(queries),options);
+  const auto algorithm_of=[&](const Query& q){
+    return q.algorithm<0?options.algorithm:static_cast<Algorithm>(q.algorithm);
+  };
+  std::vector<Query> queues[3];
+  for(auto& q:queries){
+    auto a=algorithm_of(q);
+    if(a<Algorithm::BFS || a>Algorithm::SSWP)throw std::invalid_argument("invalid per-query algorithm");
+    q.algorithm=int(a);queues[int(a)].push_back(std::move(q));
+  }
+  for(auto& queue:queues){
+    if(options.oracle_order)
+      std::stable_sort(queue.begin(),queue.end(),[](const Query& a,const Query& b){
+        return a.reference_rounds!=b.reference_rounds?a.reference_rounds<b.reference_rounds:a.id<b.id;
+      });
+    else if(options.sort_by_score){
+      if(options.predictor==Options::Predictor::Imported)
+        std::stable_sort(queue.begin(),queue.end(),[](const Query& a,const Query& b){return a.score>b.score;});
+      else
+        std::stable_sort(queue.begin(),queue.end(),[](const Query& a,const Query& b){return a.feature_key<b.feature_key;});
+    }
+  }
+  std::vector<Query> result;result.reserve(queries.size());size_t cursor[3]={0,0,0};
+  bool progress=true;
+  while(progress){
+    progress=false;
+    for(int a=0;a<3;++a)if(cursor[a]<queues[a].size()){
+      progress=true;size_t end=std::min(queues[a].size(),cursor[a]+options.group_width);
+      for(;cursor[a]<end;++cursor[a])result.push_back(std::move(queues[a][cursor[a]]));
+    }
+  }
+  return result;
+}
 KernelId ConfiguredSelector::choose(const RoundFeatures& features,uint64_t round)const{
+  used_iteration_model_=false;
+  auto mapped_push=[&](){
+    if(options_.push_mapping==Options::PushMapping::Shared)return KernelId::SharedPush;
+    if(options_.push_mapping==Options::PushMapping::Adaptive)return KernelId::AdaptivePush;
+    if(options_.push_mapping==Options::PushMapping::Iteration){
+      iteration_prediction_=predict_iteration_push(features);used_iteration_model_=true;
+      return push_partition_id(iteration_prediction_.candidate);
+    }
+    uint32_t lanes=options_.push_query_lanes;
+    if(options_.push_mapping==Options::PushMapping::Degree){
+      double degree=features.vertex_pairs?double(features.edge_pairs)/features.vertex_pairs:0;
+      lanes=degree>=256?1:degree>=64?2:degree>=16?4:degree>=4?8:16;
+    }else if(options_.push_mapping==Options::PushMapping::Density){
+      double d=features.density;
+      lanes=d<.015625?1:d<.03125?2:d<.0625?4:d<.125?8:d<.25?16:32;
+    }
+    uint32_t group=0;while((1u<<group)<lanes)++group;
+    return push_partition_id(int(group*5+options_.push_grain));
+  };
   switch(options_.selector){
-    case Options::Selector::Push:return KernelId::SharedPush;
+    case Options::Selector::Push:return mapped_push();
     case Options::Selector::Pull:return KernelId::DensePull;
     case Options::Selector::Replay:return options_.replay[round%options_.replay.size()];
     case Options::Selector::Threshold:
-      if(!features.active_queries || !features.density_valid)return KernelId::SharedPush;
-      return features.density>=options_.pull_threshold?KernelId::DensePull:KernelId::SharedPush;
+      if(!features.active_queries || !features.density_valid)return mapped_push();
+      return features.density>=options_.pull_threshold?KernelId::DensePull:mapped_push();
   }
   return KernelId::SharedPush;
 }

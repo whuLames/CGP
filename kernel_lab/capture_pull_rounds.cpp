@@ -28,9 +28,11 @@ int main(int argc,char** argv) {
       cp.old_values.resize(size_t(graph.vertices)*cp.physical_slots);
       cp.frontier_mask.resize(size_t(graph.vertices)*cp.words);
       cp.frontier.resize(cp.frontier_count);cp.live_slots.resize(c.slots);
+      cp.slot_algorithms.resize(c.slots,c.algorithm);
       if(cudaMemcpy(cp.old_values.data(),c.old_values.data,cp.old_values.size()*4,cudaMemcpyDeviceToHost)!=cudaSuccess ||
          cudaMemcpy(cp.frontier_mask.data(),c.frontier_mask,cp.frontier_mask.size()*8,cudaMemcpyDeviceToHost)!=cudaSuccess ||
          cudaMemcpy(cp.live_slots.data(),c.live_slots,cp.live_slots.size(),cudaMemcpyDeviceToHost)!=cudaSuccess ||
+         (c.slot_algorithms&&cudaMemcpy(cp.slot_algorithms.data(),c.slot_algorithms,cp.slot_algorithms.size()*sizeof(Algorithm),cudaMemcpyDeviceToHost)!=cudaSuccess) ||
          (cp.frontier_count && cudaMemcpy(cp.frontier.data(),c.frontier,cp.frontier.size()*4,cudaMemcpyDeviceToHost)!=cudaSuccess))
         throw std::runtime_error("checkpoint input copy failed");
       auto path=std::filesystem::path(argv[3])/("round-"+std::to_string(round)+".bin");

@@ -34,16 +34,16 @@ int main(int argc,char** argv) {
     Buffer<uint64_t> row(graph.row.size()),in_row(graph.incoming_row.size()),mask(cp.frontier_mask.size());
     Buffer<uint32_t> col(graph.col.size()),in_col(graph.incoming_col.size()),list(cp.frontier_count),count(1);
     Buffer<float> weight(graph.weight.size()),in_weight(graph.incoming_weight.size()),old(cp.old_values.size()),next(cp.old_values.size());
-    Buffer<uint8_t> live(cp.live_slots.size());Buffer<int> error(1);
+    Buffer<uint8_t> live(cp.live_slots.size());Buffer<Algorithm> algorithms(cp.slot_algorithms.size());Buffer<int> error(1);
     row.upload(graph.row);col.upload(graph.col);weight.upload(graph.weight);
     in_row.upload(graph.incoming_row);in_col.upload(graph.incoming_col);in_weight.upload(graph.incoming_weight);
-    mask.upload(cp.frontier_mask);list.upload(cp.frontier);live.upload(cp.live_slots);old.upload(cp.old_values);
+    mask.upload(cp.frontier_mask);list.upload(cp.frontier);live.upload(cp.live_slots);algorithms.upload(cp.slot_algorithms);old.upload(cp.old_values);
     check(cudaMemcpy(count.p,&cp.frontier_count,4,cudaMemcpyHostToDevice));
     check(cudaMemcpy(next.p,old.p,cp.old_values.size()*4,cudaMemcpyDeviceToDevice));check(cudaMemset(error.p,0,4));
     GraphView gv{graph.vertices,graph.edges(),row.p,col.p,weight.p,in_row.p,in_col.p,in_weight.p};
     Context context{gv,{old.p,cp.vertices,cp.physical_slots,cp.group_width,cp.layout},
       {next.p,cp.vertices,cp.physical_slots,cp.group_width,cp.layout},mask.p,list.p,count.p,live.p,
-      cp.slots,cp.words,cp.algorithm,nullptr,error.p,cp.frontier_count};
+      cp.slots,cp.words,cp.algorithm,nullptr,error.p,cp.frontier_count,algorithms.p};
     launch(candidate(argv[3]),context);check(cudaDeviceSynchronize());
     int flag=0;check(cudaMemcpy(&flag,error.p,4,cudaMemcpyDeviceToHost));
     if(flag)throw std::runtime_error("precision flag set");
