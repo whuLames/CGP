@@ -38,12 +38,13 @@ DEFINE_int32(landmarks,16,"Phase index landmark count");
 DEFINE_int32(max_offset,16,"Phase evaluator maximum start offset");
 DEFINE_string(selector,"threshold","threshold, push, pull, replay");
 DEFINE_string(replay,"","Comma separated push,pull choices");
+DEFINE_string(pull_kernel,"auto","auto or a pull-dense-* kernel token");
 DEFINE_double(pull_threshold,.2,"Dense pull threshold");
 DEFINE_string(push_mapping,"shared","shared, static, degree, density, adaptive or iteration Push mapping");
 DEFINE_int32(push_query_lanes,8,"Static Push query lanes per edge: 1/2/4/8/16/32");
 DEFINE_int32(push_grain,0,"Push grain: 0/1/2=1/2/4 warps, 3/4=2/4 blocks");
 DEFINE_string(frontier,"unordered","unordered or stable");
-DEFINE_string(frontier_build,"scan","scan, fused or direct frontier construction");
+DEFINE_string(frontier_build,"fused","scan, fused or direct frontier construction");
 DEFINE_bool(frontier_mask64,true,"Aggregate update-driven frontier publication in 64-query words");
 DEFINE_bool(copy_results_to_cpu,false,"Return per query results");
 DEFINE_bool(profile_compare,false,"Measure compare_kernel GPU time with CUDA events");
@@ -104,6 +105,7 @@ int main(int argc,char** argv){
     if(FLAGS_landmarks<=0 || FLAGS_max_offset<0)throw std::invalid_argument("invalid phase index options");
     o.landmarks=FLAGS_landmarks;o.max_offset=FLAGS_max_offset;
     o.pull_threshold=FLAGS_pull_threshold;o.memory_fraction=FLAGS_memory_fraction;
+    if(FLAGS_pull_kernel!="auto")o.pull_kernel=gw::parse_dense_pull_token(FLAGS_pull_kernel);
     if(FLAGS_push_mapping=="static")o.push_mapping=gw::Options::PushMapping::Static;
     else if(FLAGS_push_mapping=="degree")o.push_mapping=gw::Options::PushMapping::Degree;
     else if(FLAGS_push_mapping=="density")o.push_mapping=gw::Options::PushMapping::Density;
@@ -140,12 +142,8 @@ int main(int argc,char** argv){
       while(std::getline(in,token,',')){
         if(token=="push")o.replay.push_back(gw::KernelId::SharedPush);
         else if(token=="pull")o.replay.push_back(gw::KernelId::DensePull);
-        else if(token=="pull-vm-serial-q32")o.replay.push_back(gw::KernelId::VmFusedSerialSmemQ32);
-        else if(token=="pull-vm-serial-q16")o.replay.push_back(gw::KernelId::VmFusedSerialSmemQ16);
-        else if(token=="pull-vm-serial-q8")o.replay.push_back(gw::KernelId::VmFusedSerialSmemQ8);
-        else if(token=="pull-vm-parallel-q32")o.replay.push_back(gw::KernelId::VmParallelSmemShuffleQ32);
-        else if(token=="pull-vm-parallel-q16")o.replay.push_back(gw::KernelId::VmParallelSmemShuffleQ16);
-        else if(token=="pull-vm-parallel-q8")o.replay.push_back(gw::KernelId::VmParallelSmemShuffleQ8);
+        else if(token.rfind("pull-dense-",0)==0 || token.rfind("pull-vm-",0)==0)
+          o.replay.push_back(gw::parse_dense_pull_token(token));
         else if(token=="pull-grouped-g8-edge4-warp4")
           o.replay.push_back(gw::KernelId::GroupedG8Edge4Warp4Pull);
         else {

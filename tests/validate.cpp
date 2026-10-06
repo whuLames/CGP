@@ -55,6 +55,16 @@ void verify(const HostGraph& g,Algorithm a,Layout layout,FrontierMode mode,uint3
 }
 int main(){
   {
+    if(dense_pull_candidate_count!=21)throw std::runtime_error("dense Pull candidate count");
+    for(KernelId id:dense_pull_candidates){
+      const char* token=dense_pull_token(id);
+      if(!token || parse_dense_pull_token(token)!=id || !is_dense_pull_kernel(id) || !is_pull_kernel(id))
+        throw std::runtime_error("dense Pull token round trip");
+    }
+    bool invalid_dense_token=false;
+    try{(void)parse_dense_pull_token("pull-dense-not-a-kernel");}
+    catch(const std::invalid_argument&){invalid_dense_token=true;}
+    if(!invalid_dense_token)throw std::runtime_error("invalid dense Pull token accepted");
     Options o;o.sort_by_score=true;
     std::vector<Query> input{{10,0,2},{11,0,3},{12,0,3},{13,0,1}};
     auto ordered=BatchPlanner::plan(input,o);

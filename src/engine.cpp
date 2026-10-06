@@ -29,18 +29,39 @@ struct KernelDescription {
   bool check=false;
   const char* pull_mapping="";
   uint32_t pull_query_width=0;
+  const char* token="",*pull_storage="",*pull_reduction="";
+  bool pull_fused=false;
 };
 KernelDescription describe(KernelId id) {
   if(id==KernelId::SharedPush)return {"shared_push"};
   if(id==KernelId::DensePull)return {"dense_pull"};
   if(id==KernelId::AdaptivePush)return {"adaptive_push"};
   if(id==KernelId::GroupedG8Edge4Warp4Pull)return {"grouped_g8_edge4_warp4_pull",8,4,1,false};
-  if(id==KernelId::VmFusedSerialSmemQ32)return {"vm_fused_serial_smem",0,4,1,false,"serial",32};
-  if(id==KernelId::VmFusedSerialSmemQ16)return {"vm_fused_serial_smem",0,4,1,false,"serial",16};
-  if(id==KernelId::VmFusedSerialSmemQ8)return {"vm_fused_serial_smem",0,4,1,false,"serial",8};
-  if(id==KernelId::VmParallelSmemShuffleQ32)return {"vm_parallel_smem_shuffle",0,0,1,false,"parallel",32};
-  if(id==KernelId::VmParallelSmemShuffleQ16)return {"vm_parallel_smem_shuffle",0,0,1,false,"parallel",16};
-  if(id==KernelId::VmParallelSmemShuffleQ8)return {"vm_parallel_smem_shuffle",0,0,1,false,"parallel",8};
+  if(is_dense_pull_kernel(id)){
+    const char* token=dense_pull_token(id);const int raw=int(id);
+    const bool parallel=id==KernelId::VmParallelSmemShuffleQ32 || id==KernelId::VmParallelSmemShuffleQ16 ||
+      id==KernelId::VmParallelSmemShuffleQ8 ||
+      (raw>=int(KernelId::DenseParallelGlobalQ32) && raw<=int(KernelId::DenseParallelShuffleQ8));
+    const bool fused=id==KernelId::VmFusedSerialSmemQ32 || id==KernelId::VmFusedSerialSmemQ16 ||
+      id==KernelId::VmFusedSerialSmemQ8 ||
+      (raw>=int(KernelId::DenseFusedSerialGlobalQ32) && raw<=int(KernelId::DenseFusedSerialGlobalQ8));
+    const bool smem=id==KernelId::VmFusedSerialSmemQ32 || id==KernelId::VmFusedSerialSmemQ16 ||
+      id==KernelId::VmFusedSerialSmemQ8 || id==KernelId::VmParallelSmemShuffleQ32 ||
+      id==KernelId::VmParallelSmemShuffleQ16 || id==KernelId::VmParallelSmemShuffleQ8 ||
+      id==KernelId::DenseSerialSmemQ32 || id==KernelId::DenseSerialSmemShuffleQ16 ||
+      id==KernelId::DenseSerialSmemShuffleQ8;
+    const bool shared=id==KernelId::DenseSerialSharedQ16 || id==KernelId::DenseSerialSharedQ8 ||
+      id==KernelId::DenseParallelSharedQ16 || id==KernelId::DenseParallelSharedQ8;
+    const uint32_t q=(id==KernelId::DenseFusedSerialGlobalQ32 || id==KernelId::VmFusedSerialSmemQ32 ||
+      id==KernelId::DenseSerialSmemQ32 || id==KernelId::DenseParallelGlobalQ32 ||
+      id==KernelId::VmParallelSmemShuffleQ32)?32:
+      (id==KernelId::DenseFusedSerialGlobalQ16 || id==KernelId::VmFusedSerialSmemQ16 ||
+       id==KernelId::DenseSerialSharedQ16 || id==KernelId::DenseSerialShuffleQ16 ||
+       id==KernelId::DenseSerialSmemShuffleQ16 || id==KernelId::DenseParallelSharedQ16 ||
+       id==KernelId::DenseParallelShuffleQ16 || id==KernelId::VmParallelSmemShuffleQ16)?16:8;
+    return {"dense_pull",0,parallel?0u:4u,1,false,parallel?"parallel":"serial",q,
+      token,smem?"smem":"global",q==32?"direct":shared?"shared":"shuffle",fused};
+  }
   int raw=int(id),base=int(KernelId::PullCheckFreeBase);
   bool check=false;
   if(raw>=int(KernelId::PullCheckBase) && raw<int(KernelId::PullCheckBase)+pull_partition_count){
@@ -129,6 +150,8 @@ void validate(const HostGraph& g,const Options& o,const std::vector<Query>& quer
   for(const auto& q:queries)has_sssp|=q.algorithm==int(Algorithm::SSSP);
   if(has_sssp)for(float w:g.weight)if(w<0 || !std::isfinite(w))throw std::invalid_argument("SSSP requires nonnegative finite weights");
   if(o.selector==Options::Selector::Replay && o.replay.empty())throw std::invalid_argument("empty replay selector");
+  if(o.pull_kernel!=KernelId::DensePull && !is_dense_pull_kernel(o.pull_kernel))
+    throw std::invalid_argument("pull_kernel is not a dense Pull candidate");
 }
 }
 uint64_t AllocationPlan::total() const { uint64_t sum=0;for(auto [_,v]:bytes)sum=add(sum,v);return sum; }
@@ -280,7 +303,7 @@ RunStats run(const HostGraph& g,std::vector<Query> queries,const Options& o,cons
     if(!parent.empty())std::filesystem::create_directories(parent);
     round_metrics.open(o.round_metrics_path,std::ios::trunc);
     if(!round_metrics)throw std::runtime_error("cannot write round metrics: "+o.round_metrics_path);
-    round_metrics<<"batch,round,live_queries,kernel_id,kernel_family,pull_mapping,pull_query_width,group_size,warps_per_block,blocks_per_vertex,check,kernel_gpu_ms,adaptive_preparation_ms,adaptive_w1_vertices,adaptive_w2_vertices,adaptive_w4_vertices,adaptive_b2_vertices,adaptive_b4_vertices,frontier_vertices,vertex_pairs,edge_pairs,density,mean_active_queries,mean_degree,mean_edge_pairs,selector_ms,predicted_log_cost,predicted_relative_cost,iteration_model_version,group_mapping_launches,group_mapping_divergent,group_mappings\n";
+    round_metrics<<"batch,round,live_queries,kernel_id,kernel_token,kernel_family,pull_mapping,pull_storage,pull_query_width,pull_reduction,pull_fused,group_size,warps_per_block,blocks_per_vertex,check,kernel_gpu_ms,adaptive_preparation_ms,adaptive_w1_vertices,adaptive_w2_vertices,adaptive_w4_vertices,adaptive_b2_vertices,adaptive_b4_vertices,frontier_vertices,vertex_pairs,edge_pairs,density,mean_active_queries,mean_degree,mean_edge_pairs,selector_ms,predicted_log_cost,predicted_relative_cost,iteration_model_version,group_mapping_launches,group_mapping_divergent,group_mappings\n";
   }
   bool checkpoint_saved=false;
   auto execution_start=Clock::now();
@@ -406,9 +429,11 @@ RunStats run(const HostGraph& g,std::vector<Query> queries,const Options& o,cons
         iteration_features?frontier_vertices:0,g.vertices,g.edges()},stats.rounds);
       // Preserve the Push/Pull decision exactly; only refine a default Pull
       // into the VM family. Explicit Replay remains byte-for-byte ordered.
-      if(chosen==KernelId::DensePull && o.selector!=Options::Selector::Replay &&
-         p%32==0 && p<=256)
-        chosen=default_pull_kernel(p,g.vertices,g.edges());
+      if(chosen==KernelId::DensePull && o.selector!=Options::Selector::Replay && p%32==0 && p<=256)
+        chosen=o.pull_kernel==KernelId::DensePull?default_pull_kernel(p,g.vertices,g.edges()):o.pull_kernel;
+      // Explicit dense replay/override tokens retain priority, but unsupported
+      // capacities use the historical general DensePull implementation.
+      if(is_dense_pull_kernel(chosen) && (p<32 || p>256 || p%32))chosen=KernelId::DensePull;
       if(is_pull_kernel(chosen))
         ++stats.pull_rounds;
       else ++stats.push_rounds;
@@ -449,9 +474,15 @@ RunStats run(const HostGraph& g,std::vector<Query> queries,const Options& o,cons
           frontier_vertices=launch_frontier_size;
         }
       }
+      Algorithm round_algorithm=o.algorithm;bool homogeneous_algorithm=true,have_round_algorithm=false;
+      for(uint32_t s=0;s<q;++s)if(host_live[s]){
+        if(!have_round_algorithm){round_algorithm=host_algorithms[s];have_round_algorithm=true;}
+        else if(host_algorithms[s]!=round_algorithm){homogeneous_algorithm=false;break;}
+      }
       Context context{dg.view,{old,g.vertices,p,o.group_width,storage_layout},{next,g.vertices,p,o.group_width,storage_layout},
                       current_mask,current_list,current_count,live.get(),q,words,o.algorithm,stream,error.get(),launch_frontier_size,
-                      slot_algorithms.get()};
+                      homogeneous_algorithm?nullptr:slot_algorithms.get()};
+      context.algorithm=round_algorithm;
       if(probe)probe(context,stats.batches-1,global_round);
       t=Clock::now();check(cudaMemcpyAsync(next,old,cells*sizeof(float),cudaMemcpyDeviceToDevice,stream),"value copy");
       check(cudaMemsetAsync(error.get(),0,4,stream),"error reset");
@@ -503,8 +534,9 @@ RunStats run(const HostGraph& g,std::vector<Query> queries,const Options& o,cons
       }
       if(round_metrics.is_open()){
         auto d=describe(chosen);
-        round_metrics<<(stats.batches-1)<<','<<global_round<<','<<active<<','<<int(chosen)<<','<<d.family<<','
-          <<d.pull_mapping<<','<<d.pull_query_width<<','<<d.group_size<<','<<d.warps_per_block<<','<<d.blocks_per_vertex<<','<<int(d.check)<<','<<kernel_gpu_ms<<','
+        round_metrics<<(stats.batches-1)<<','<<global_round<<','<<active<<','<<int(chosen)<<','<<d.token<<','<<d.family<<','
+          <<d.pull_mapping<<','<<d.pull_storage<<','<<d.pull_query_width<<','<<d.pull_reduction<<','<<int(d.pull_fused)<<','
+          <<d.group_size<<','<<d.warps_per_block<<','<<d.blocks_per_vertex<<','<<int(d.check)<<','<<kernel_gpu_ms<<','
           <<round_adaptive_preparation_ms<<','<<host_adaptive_counts[0]<<','<<host_adaptive_counts[1]<<','
           <<host_adaptive_counts[2]<<','<<host_adaptive_counts[3]<<','<<host_adaptive_counts[4]<<','
           <<(frontier_vertices==UINT32_MAX?0:frontier_vertices)<<','<<vertex_pairs<<','<<pairs<<','<<rho<<','
@@ -726,12 +758,7 @@ RunStats run(const HostGraph& g,std::vector<Query> queries,const Options& o,cons
           stats.recycle_ms+=elapsed(recycle_start);
         }
       }
-      const bool partition_pull=(int(chosen)>=int(KernelId::PullCheckFreeBase) &&
-          int(chosen)<int(KernelId::PullCheckFreeBase)+pull_partition_count) ||
-          (int(chosen)>=int(KernelId::PullCheckBase) &&
-          int(chosen)<int(KernelId::PullCheckBase)+pull_partition_count) ||
-          chosen==KernelId::GroupedG8Edge4Warp4Pull ||
-          (int(chosen)>=int(KernelId::VmFusedSerialSmemQ32) && int(chosen)<=int(KernelId::VmParallelSmemShuffleQ8));
+      const bool partition_pull=is_pull_kernel(chosen) && chosen!=KernelId::DensePull;
       spdlog::debug("scheduler round={} active={} edge_pairs={} density={} kernel={} kernel_id={}",global_round,active,pairs,rho,
                     chosen==KernelId::DensePull?"dense_pull":chosen==KernelId::SharedPush?"shared_push":partition_pull?"partition_pull":"partition_push",int(chosen));
       stats.round_ms+=elapsed(round_start);

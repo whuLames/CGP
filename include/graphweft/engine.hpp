@@ -17,7 +17,7 @@ struct Options {
   Algorithm algorithm = Algorithm::BFS;
   Layout layout = Layout::VertexMajor;
   FrontierMode frontier = FrontierMode::Unordered;
-  FrontierBuildMode frontier_build = FrontierBuildMode::Scan;
+  FrontierBuildMode frontier_build = FrontierBuildMode::Fused;
   bool frontier_mask64 = true;
   uint32_t capacity = 32;
   uint32_t group_width = 8;
@@ -60,6 +60,9 @@ struct Options {
   std::string round_metrics_path;
   enum class Selector { Threshold, Push, Pull, Replay } selector = Selector::Threshold;
   std::vector<KernelId> replay;
+  // Used only after a non-Replay selector has chosen Pull. DensePull means
+  // auto, preserving the historical slot-aware selection policy.
+  KernelId pull_kernel = KernelId::DensePull;
   std::string checkpoint_path;
   uint32_t checkpoint_round = 0;
   std::string plan_output_path;

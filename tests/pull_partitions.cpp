@@ -2,6 +2,7 @@
 #include "graphweft/kernels.hpp"
 #include <spdlog/spdlog.h>
 #include <iostream>
+#include <algorithm>
 #include <stdexcept>
 #include <tuple>
 using namespace graphweft;
@@ -61,20 +62,16 @@ int main() {
     }
     // Every new VM Pull specialization must preserve the complete synchronous
     // trajectory, including frontier publication and completion rounds.
-    const KernelId vm_kernels[]={
-      KernelId::VmFusedSerialSmemQ32,KernelId::VmFusedSerialSmemQ16,
-      KernelId::VmFusedSerialSmemQ8,KernelId::VmParallelSmemShuffleQ32,
-      KernelId::VmParallelSmemShuffleQ16,KernelId::VmParallelSmemShuffleQ8};
     uint64_t vm_trajectories=0;
     for(auto algorithm:{Algorithm::BFS,Algorithm::SSSP,Algorithm::SSWP})
-      for(uint32_t q:{32u,64u,128u,256u}){
+      for(uint32_t q:{32u,64u,96u,128u,160u,192u,224u,256u}){
         Options baseline;baseline.algorithm=algorithm;baseline.layout=Layout::Grouped;
         baseline.group_width=32;baseline.capacity=q;baseline.selector=Options::Selector::Push;
         baseline.frontier=FrontierMode::Stable;baseline.frontier_build=FrontierBuildMode::Fused;
         std::vector<Query> queries;for(uint32_t s=0;s<q;++s)queries.push_back({s,s%10,0,s%3});
         std::vector<RoundSnapshot> expected;auto baseline_stats=run(
           graph,queries,baseline,{},[&](const RoundSnapshot& s){expected.push_back(s);});
-        for(KernelId kernel:vm_kernels){
+        for(KernelId kernel:dense_pull_candidates){
           Options candidate=baseline;candidate.selector=Options::Selector::Replay;candidate.replay={kernel};
           size_t index=0;auto stats=run(graph,queries,candidate,{},[&](const RoundSnapshot& s){
             if(index>=expected.size() || s.values!=expected[index].values ||
@@ -88,6 +85,81 @@ int main() {
           ++vm_trajectories;
         }
       }
+    // Mixed algorithms use the per-slot fallback and must retain the same
+    // round-by-round values and frontier as Push for every dense candidate.
+    {
+      constexpr uint32_t q=64;
+      Options baseline;baseline.capacity=q;baseline.selector=Options::Selector::Push;
+      baseline.frontier=FrontierMode::Stable;baseline.frontier_build=FrontierBuildMode::Fused;
+      std::vector<Query> queries;
+      for(uint32_t s=0;s<q;++s){Query query{s,s%10,0,s%3};query.algorithm=int(s%3);queries.push_back(query);}
+      std::vector<RoundSnapshot> expected;
+      auto baseline_stats=run(graph,queries,baseline,{},[&](const RoundSnapshot& snapshot){expected.push_back(snapshot);});
+      for(KernelId kernel:dense_pull_candidates){
+        Options candidate=baseline;candidate.selector=Options::Selector::Replay;candidate.replay={kernel};
+        size_t index=0;auto stats=run(graph,queries,candidate,{},[&](const RoundSnapshot& snapshot){
+          if(index>=expected.size() || snapshot.values!=expected[index].values ||
+             snapshot.mask!=expected[index].mask || snapshot.frontier!=expected[index].frontier)
+            throw std::runtime_error("mixed dense Pull trajectory mismatch");
+          ++index;
+        });
+        if(index!=expected.size() || stats.rounds!=baseline_stats.rounds)
+          throw std::runtime_error("mixed dense Pull round count mismatch");
+        ++vm_trajectories;
+      }
+    }
+    // Exercise every legal frontier epilogue configuration for every dense
+    // candidate. Unordered Direct compares sets and explicitly rejects
+    // duplicate vertices; Stable configurations retain exact list order.
+    {
+      constexpr uint32_t q=64;
+      std::vector<Query> queries;for(uint32_t s=0;s<q;++s)queries.push_back({s,s%10});
+      struct Configuration { FrontierBuildMode build;FrontierMode mode;bool mask64; };
+      const Configuration configurations[]={
+        {FrontierBuildMode::Scan,FrontierMode::Stable,true},
+        {FrontierBuildMode::Fused,FrontierMode::Stable,false},
+        {FrontierBuildMode::Fused,FrontierMode::Stable,true},
+        {FrontierBuildMode::Direct,FrontierMode::Unordered,false},
+        {FrontierBuildMode::Direct,FrontierMode::Unordered,true}};
+      Options reference_options;reference_options.capacity=q;reference_options.selector=Options::Selector::Push;
+      reference_options.frontier=FrontierMode::Stable;reference_options.frontier_build=FrontierBuildMode::Scan;
+      std::vector<RoundSnapshot> reference;
+      run(graph,queries,reference_options,{},[&](const RoundSnapshot& snapshot){reference.push_back(snapshot);});
+      for(const auto& configuration:configurations)for(KernelId kernel:dense_pull_candidates){
+        Options candidate=reference_options;candidate.selector=Options::Selector::Replay;candidate.replay={kernel};
+        candidate.frontier_build=configuration.build;candidate.frontier=configuration.mode;
+        candidate.frontier_mask64=configuration.mask64;size_t index=0;
+        run(graph,queries,candidate,{},[&](const RoundSnapshot& snapshot){
+          if(index>=reference.size() || snapshot.values!=reference[index].values || snapshot.mask!=reference[index].mask)
+            throw std::runtime_error("dense frontier epilogue trajectory mismatch");
+          auto actual=snapshot.frontier,expected=reference[index].frontier;
+          if(configuration.mode==FrontierMode::Unordered){
+            std::sort(actual.begin(),actual.end());std::sort(expected.begin(),expected.end());
+            if(std::adjacent_find(actual.begin(),actual.end())!=actual.end())
+              throw std::runtime_error("dense Direct frontier contains a duplicate vertex");
+          }
+          if(actual!=expected)throw std::runtime_error("dense frontier set/order mismatch");
+          ++index;
+        });
+        if(index!=reference.size())throw std::runtime_error("dense frontier epilogue round count mismatch");
+        ++vm_trajectories;
+      }
+    }
+    // Unsupported physical capacities must preserve explicit Replay priority
+    // semantically while falling back to the general DensePull kernel.
+    {
+      constexpr uint32_t q=33;std::vector<Query> queries;
+      for(uint32_t s=0;s<q;++s)queries.push_back({s,s%10});
+      Options baseline;baseline.capacity=q;baseline.selector=Options::Selector::Push;baseline.frontier=FrontierMode::Stable;
+      std::vector<RoundSnapshot> expected;run(graph,queries,baseline,{},[&](const RoundSnapshot& s){expected.push_back(s);});
+      baseline.selector=Options::Selector::Replay;baseline.replay={dense_pull_candidates[0]};size_t index=0;
+      run(graph,queries,baseline,{},[&](const RoundSnapshot& s){
+        if(index>=expected.size() || s.values!=expected[index].values || s.mask!=expected[index].mask || s.frontier!=expected[index].frontier)
+          throw std::runtime_error("unsupported dense capacity fallback mismatch");
+        ++index;
+      });
+      if(index!=expected.size())throw std::runtime_error("unsupported dense capacity round count mismatch");
+    }
     // Exact experiment matrix on the adversarial SSSP graph above: Q=32/64/96,
     // grouped widths 8/16/32, both requested mappings, and early completion.
     auto partition_id=[](uint32_t group){

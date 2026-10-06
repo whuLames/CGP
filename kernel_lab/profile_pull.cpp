@@ -14,6 +14,8 @@ template<class T>struct Buffer {
 };
 KernelId candidate(const std::string& name) {
   if(name=="dense_pull")return KernelId::DensePull;
+  if(name.rfind("pull-dense-",0)==0 || name.rfind("pull-vm-",0)==0)
+    return parse_dense_pull_token(name);
   for(int k=0;k<pull_partition_count;++k) {
     auto p=pull_partition(k);
     std::string shape="q"+std::to_string(p.group_size)+

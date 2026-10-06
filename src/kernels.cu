@@ -544,6 +544,281 @@ template<int Q,bool Parallel>void launch_vm_pull(const Context& c){
     default:throw std::invalid_argument("VM Pull requires M to be a multiple of 32 no greater than 256");
   }
 }
+
+// Production forms of the remaining kernel_lab dense candidates.  Unlike the
+// slot-aware kernels above, these kernels deliberately traverse the complete
+// incoming row and issue source*M+slot loads for every physical slot.  Live
+// filtering is confined to the epilogue; IEEE infinities are the identity for
+// all three supported relaxations.
+template<Algorithm Homogeneous,bool Mixed>
+__device__ __forceinline__ Algorithm dense_algorithm(const Context& c,uint32_t slot) {
+  if constexpr(Mixed)return c.slot_algorithms[slot];
+  else return Homogeneous;
+}
+template<int Q>
+__device__ __forceinline__ float dense_reduce(float value,Algorithm algorithm) {
+#pragma unroll
+  for(int offset=16;offset>=Q;offset>>=1){
+    const float other=__shfl_xor_sync(0xffffffffu,value,offset);
+    value=algorithm==Algorithm::SSWP?fmaxf(value,other):fminf(value,other);
+  }
+  return value;
+}
+__device__ __forceinline__ float dense_update(float best,float old,float weight,
+                                               Algorithm algorithm,int* error) {
+  if(algorithm==Algorithm::BFS && isfinite(old) && old>=16777216.f)
+    atomicExch(error,1);
+  const float candidate=relax(old,weight,algorithm);
+  return algorithm==Algorithm::SSWP?fmaxf(best,candidate):fminf(best,candidate);
+}
+__device__ __forceinline__ bool dense_epilogue(const Context& c,uint32_t target,
+                                               uint32_t slot,float reduced) {
+  if(slot>=c.slots || !c.live_slots[slot])return false;
+  const size_t position=size_t(target)*c.old_values.slots+slot;
+  const float previous=c.old_values.data[position];
+  const Algorithm algorithm=slot_algorithm(c,slot);
+  const bool improved=algorithm==Algorithm::SSWP?reduced>previous:reduced<previous;
+  if(improved){
+    c.new_values.data[position]=reduced;
+    if(c.frontier_output.mask && !c.frontier_output.mask64)mark_frontier_legacy(c,target,slot);
+  }
+  return improved;
+}
+
+template<Algorithm Homogeneous,bool Mixed,int M,int Q,bool UseSmem>
+__global__ void dense_fused_serial_kernel(Context c) {
+  static_assert(M%32==0 && M<=256 && (Q==32 || Q==16 || Q==8));
+  constexpr int Warps=4,Results=M/Q;
+  __shared__ uint32_t cached_source[Warps][32];
+  __shared__ float cached_weight[Warps][32];
+  const int warp=threadIdx.x/32,lane=threadIdx.x%32;
+  const int edge_group=lane/Q,query_lane=lane%Q;
+  const uint32_t target=blockIdx.x*Warps+warp;
+  const bool valid=target<c.graph.vertices;
+  float best[Results]; Algorithm algorithms[Results];
+#pragma unroll
+  for(int r=0;r<Results;++r){
+    const uint32_t slot=r*Q+query_lane;
+    algorithms[r]=dense_algorithm<Homogeneous,Mixed>(c,slot);
+    best[r]=valid?c.old_values.data[size_t(target)*M+slot]:identity(algorithms[r]);
+  }
+  const uint64_t begin=valid?c.graph.in_row[target]:0,end=valid?c.graph.in_row[target+1]:0;
+  if constexpr(UseSmem){
+    for(uint64_t base=begin;base<end;base+=32){
+      const uint64_t edge=base+lane;
+      if(edge<end){cached_source[warp][lane]=c.graph.in_col[edge];cached_weight[warp][lane]=c.graph.in_weight[edge];}
+      __syncwarp();
+      const int offset=edge_group*Q;
+      const int count=max(0,min(Q,int(end-base)-offset));
+      for(int j=0;j<count;++j){
+        const uint32_t source=cached_source[warp][offset+j];const float weight=cached_weight[warp][offset+j];
+#pragma unroll
+        for(int r=0;r<Results;++r){const uint32_t slot=r*Q+query_lane;
+          best[r]=dense_update(best[r],c.old_values.data[size_t(source)*M+slot],weight,algorithms[r],c.error_flag);}
+      }
+      __syncwarp();
+    }
+  }else{
+    constexpr int EdgeGroups=32/Q;
+    for(uint64_t edge=begin+edge_group;edge<end;edge+=EdgeGroups){
+      const uint32_t source=c.graph.in_col[edge];const float weight=c.graph.in_weight[edge];
+#pragma unroll
+      for(int r=0;r<Results;++r){const uint32_t slot=r*Q+query_lane;
+        best[r]=dense_update(best[r],c.old_values.data[size_t(source)*M+slot],weight,algorithms[r],c.error_flag);}
+    }
+  }
+  uint32_t improved_tiles[M/32]={};
+#pragma unroll
+  for(int r=0;r<Results;++r){
+    const float reduced=dense_reduce<Q>(best[r],algorithms[r]);
+    const bool improved=valid && edge_group==0 && dense_epilogue(c,target,r*Q+query_lane,reduced);
+    const uint32_t bits=__ballot_sync(0xffffffffu,improved);
+    if(lane==0)improved_tiles[(r*Q)/32]|=bits<<((r*Q)%32);
+  }
+  if(lane==0 && c.frontier_output.mask64)
+    for(int word=0;word<(M+63)/64;++word){const int tile=word*2;
+      const uint64_t bits=uint64_t(improved_tiles[tile])|
+        (tile+1<M/32?uint64_t(improved_tiles[tile+1])<<32:0);
+      mark_frontier_mask(c,target,word,bits);}
+}
+
+template<Algorithm Homogeneous,bool Mixed,int M,int Q,bool UseSmem,bool Shuffle>
+__global__ void dense_serial_kernel(Context c) {
+  constexpr int Warps=4,K=32/Q,EdgeGroups=32/Q;
+  __shared__ uint32_t cached_source[Warps][32];
+  __shared__ float cached_weight[Warps][32];
+  __shared__ float partial[Warps][32][K];
+  const int warp=threadIdx.x/32,lane=threadIdx.x%32;
+  const int edge_group=lane/Q,query_lane=lane%Q;
+  const uint32_t target=blockIdx.x*Warps+warp;const bool valid=target<c.graph.vertices;
+  const uint64_t begin=valid?c.graph.in_row[target]:0,end=valid?c.graph.in_row[target+1]:0;
+  uint64_t improved_word=0;
+  for(int tile=0;tile<M/32;++tile){
+    float best[K];Algorithm algorithms[K];
+#pragma unroll
+    for(int k=0;k<K;++k){const uint32_t slot=tile*32+k*Q+query_lane;
+      algorithms[k]=dense_algorithm<Homogeneous,Mixed>(c,slot);best[k]=valid?c.old_values.data[size_t(target)*M+slot]:identity(algorithms[k]);}
+    if constexpr(UseSmem){
+      for(uint64_t base=begin;base<end;base+=32){
+        const uint64_t edge=base+lane;if(edge<end){cached_source[warp][lane]=c.graph.in_col[edge];cached_weight[warp][lane]=c.graph.in_weight[edge];}
+        __syncwarp();const int offset=edge_group*Q;const int count=max(0,min(Q,int(end-base)-offset));
+        for(int j=0;j<count;++j){const uint32_t source=cached_source[warp][offset+j];const float weight=cached_weight[warp][offset+j];
+#pragma unroll
+          for(int k=0;k<K;++k){const uint32_t slot=tile*32+k*Q+query_lane;
+            best[k]=dense_update(best[k],c.old_values.data[size_t(source)*M+slot],weight,algorithms[k],c.error_flag);}}
+        __syncwarp();
+      }
+    }else{
+      for(uint64_t edge=begin+edge_group;edge<end;edge+=EdgeGroups){const uint32_t source=c.graph.in_col[edge];const float weight=c.graph.in_weight[edge];
+#pragma unroll
+        for(int k=0;k<K;++k){const uint32_t slot=tile*32+k*Q+query_lane;
+          best[k]=dense_update(best[k],c.old_values.data[size_t(source)*M+slot],weight,algorithms[k],c.error_flag);}}
+    }
+    uint32_t improved_tile=0;
+    if constexpr(Q==32){const bool improved=valid && dense_epilogue(c,target,tile*32+lane,best[0]);
+      improved_tile=__ballot_sync(0xffffffffu,improved);}
+    else if constexpr(Shuffle){
+#pragma unroll
+      for(int k=0;k<K;++k){const float reduced=dense_reduce<Q>(best[k],algorithms[k]);
+        const bool improved=valid && edge_group==0 && dense_epilogue(c,target,tile*32+k*Q+query_lane,reduced);
+        const uint32_t bits=__ballot_sync(0xffffffffu,improved);
+        if(lane==0)improved_tile|=bits<<(k*Q);}
+    }else{
+#pragma unroll
+      for(int k=0;k<K;++k)partial[warp][lane][k]=best[k];
+      __syncwarp();
+      if(valid && edge_group==0){
+#pragma unroll
+        for(int k=0;k<K;++k){float reduced=partial[warp][query_lane][k];
+#pragma unroll
+          for(int group=1;group<EdgeGroups;++group){const float other=partial[warp][group*Q+query_lane][k];
+            reduced=algorithms[k]==Algorithm::SSWP?fmaxf(reduced,other):fminf(reduced,other);}
+          const bool improved=dense_epilogue(c,target,tile*32+k*Q+query_lane,reduced);
+          const uint32_t bits=__ballot_sync((1u<<Q)-1,improved);
+          if(lane==0)improved_tile|=bits<<(k*Q);}}
+      __syncwarp();
+    }
+    if(lane==0 && c.frontier_output.mask64){improved_word|=uint64_t(improved_tile)<<((tile&1)*32);
+      if((tile&1) || tile+1==M/32){mark_frontier_mask(c,target,tile/2,improved_word);improved_word=0;}}
+  }
+}
+
+template<Algorithm Homogeneous,bool Mixed,int M,int Q,bool UseSmem,bool Shuffle>
+__global__ void dense_parallel_kernel(Context c) {
+  constexpr int K=32/Q,EdgeGroups=32/Q;
+  __shared__ uint32_t cached_source[32];__shared__ float cached_weight[32];
+  __shared__ float partial[M/32][32][K];
+  __shared__ uint32_t improved_tiles[M/32];
+  const uint32_t target=blockIdx.x;const int lane=threadIdx.x%32,tile=threadIdx.x/32;
+  const int edge_group=lane/Q,query_lane=lane%Q;
+  float best[K];Algorithm algorithms[K];
+#pragma unroll
+  for(int k=0;k<K;++k){const uint32_t slot=tile*32+k*Q+query_lane;
+    algorithms[k]=dense_algorithm<Homogeneous,Mixed>(c,slot);best[k]=c.old_values.data[size_t(target)*M+slot];}
+  const uint64_t begin=c.graph.in_row[target],end=c.graph.in_row[target+1];
+  if constexpr(UseSmem){
+    for(uint64_t base=begin;base<end;base+=32){
+      if(threadIdx.x<32){const uint64_t edge=base+lane;if(edge<end){cached_source[lane]=c.graph.in_col[edge];cached_weight[lane]=c.graph.in_weight[edge];}}
+      __syncthreads();const int offset=edge_group*Q;const int count=max(0,min(Q,int(end-base)-offset));
+      for(int j=0;j<count;++j){const uint32_t source=cached_source[offset+j];const float weight=cached_weight[offset+j];
+#pragma unroll
+        for(int k=0;k<K;++k){const uint32_t slot=tile*32+k*Q+query_lane;
+          best[k]=dense_update(best[k],c.old_values.data[size_t(source)*M+slot],weight,algorithms[k],c.error_flag);}}
+      __syncthreads();
+    }
+  }else{
+    for(uint64_t edge=begin+edge_group;edge<end;edge+=EdgeGroups){const uint32_t source=c.graph.in_col[edge];const float weight=c.graph.in_weight[edge];
+#pragma unroll
+      for(int k=0;k<K;++k){const uint32_t slot=tile*32+k*Q+query_lane;
+        best[k]=dense_update(best[k],c.old_values.data[size_t(source)*M+slot],weight,algorithms[k],c.error_flag);}}
+  }
+  uint32_t improved_tile=0;
+  if constexpr(Q==32){const bool improved=dense_epilogue(c,target,tile*32+lane,best[0]);
+    improved_tile=__ballot_sync(0xffffffffu,improved);}
+  else if constexpr(Shuffle){
+#pragma unroll
+    for(int k=0;k<K;++k){const float reduced=dense_reduce<Q>(best[k],algorithms[k]);
+      const bool improved=edge_group==0 && dense_epilogue(c,target,tile*32+k*Q+query_lane,reduced);
+      const uint32_t bits=__ballot_sync(0xffffffffu,improved);
+      if(lane==0)improved_tile|=bits<<(k*Q);}
+  }else{
+#pragma unroll
+    for(int k=0;k<K;++k)partial[tile][lane][k]=best[k];
+    __syncthreads();
+    if(edge_group==0){
+#pragma unroll
+      for(int k=0;k<K;++k){float reduced=partial[tile][query_lane][k];
+#pragma unroll
+        for(int group=1;group<EdgeGroups;++group){const float other=partial[tile][group*Q+query_lane][k];
+          reduced=algorithms[k]==Algorithm::SSWP?fmaxf(reduced,other):fminf(reduced,other);}
+        const bool improved=dense_epilogue(c,target,tile*32+k*Q+query_lane,reduced);
+        const uint32_t bits=__ballot_sync((1u<<Q)-1,improved);
+        if(lane==0)improved_tile|=bits<<(k*Q);}}
+  }
+  if(lane==0)improved_tiles[tile]=improved_tile;
+  __syncthreads();
+  if(threadIdx.x==0 && c.frontier_output.mask64)
+    for(int word=0;word<(M+63)/64;++word){const int first=word*2;
+      const uint64_t bits=uint64_t(improved_tiles[first])|
+        (first+1<M/32?uint64_t(improved_tiles[first+1])<<32:0);
+      mark_frontier_mask(c,target,word,bits);}
+}
+
+template<Algorithm Homogeneous,bool Mixed,int M>
+void launch_dense_candidate_capacity(KernelId id,const Context& c){
+  constexpr int Warps=4;
+  const dim3 serial_grid((c.graph.vertices+Warps-1)/Warps),serial_block(Warps*32);
+#define GW_SERIAL_FUSED(ID,Q,SMEM) if(id==KernelId::ID){dense_fused_serial_kernel<Homogeneous,Mixed,M,Q,SMEM><<<serial_grid,serial_block,0,c.stream>>>(c);return;}
+#define GW_SERIAL(ID,Q,SMEM,SHUFFLE) if(id==KernelId::ID){dense_serial_kernel<Homogeneous,Mixed,M,Q,SMEM,SHUFFLE><<<serial_grid,serial_block,0,c.stream>>>(c);return;}
+#define GW_PARALLEL(ID,Q,SMEM,SHUFFLE) if(id==KernelId::ID){dense_parallel_kernel<Homogeneous,Mixed,M,Q,SMEM,SHUFFLE><<<c.graph.vertices,M,0,c.stream>>>(c);return;}
+  GW_SERIAL_FUSED(DenseFusedSerialGlobalQ32,32,false)
+  GW_SERIAL_FUSED(DenseFusedSerialGlobalQ16,16,false)
+  GW_SERIAL_FUSED(DenseFusedSerialGlobalQ8,8,false)
+  GW_SERIAL_FUSED(VmFusedSerialSmemQ32,32,true)
+  GW_SERIAL_FUSED(VmFusedSerialSmemQ16,16,true)
+  GW_SERIAL_FUSED(VmFusedSerialSmemQ8,8,true)
+  GW_SERIAL(DenseSerialSharedQ16,16,false,false)
+  GW_SERIAL(DenseSerialSharedQ8,8,false,false)
+  GW_SERIAL(DenseSerialShuffleQ16,16,false,true)
+  GW_SERIAL(DenseSerialShuffleQ8,8,false,true)
+  GW_SERIAL(DenseSerialSmemQ32,32,true,true)
+  GW_SERIAL(DenseSerialSmemShuffleQ16,16,true,true)
+  GW_SERIAL(DenseSerialSmemShuffleQ8,8,true,true)
+  GW_PARALLEL(DenseParallelGlobalQ32,32,false,true)
+  GW_PARALLEL(DenseParallelSharedQ16,16,false,false)
+  GW_PARALLEL(DenseParallelSharedQ8,8,false,false)
+  GW_PARALLEL(DenseParallelShuffleQ16,16,false,true)
+  GW_PARALLEL(DenseParallelShuffleQ8,8,false,true)
+  GW_PARALLEL(VmParallelSmemShuffleQ32,32,true,true)
+  GW_PARALLEL(VmParallelSmemShuffleQ16,16,true,true)
+  GW_PARALLEL(VmParallelSmemShuffleQ8,8,true,true)
+#undef GW_SERIAL_FUSED
+#undef GW_SERIAL
+#undef GW_PARALLEL
+  throw std::invalid_argument("unknown dense Pull candidate");
+}
+template<Algorithm Homogeneous,bool Mixed>
+void launch_dense_candidate_algorithm(KernelId id,const Context& c){
+  switch(c.old_values.slots){
+    case 32:launch_dense_candidate_capacity<Homogeneous,Mixed,32>(id,c);break;
+    case 64:launch_dense_candidate_capacity<Homogeneous,Mixed,64>(id,c);break;
+    case 96:launch_dense_candidate_capacity<Homogeneous,Mixed,96>(id,c);break;
+    case 128:launch_dense_candidate_capacity<Homogeneous,Mixed,128>(id,c);break;
+    case 160:launch_dense_candidate_capacity<Homogeneous,Mixed,160>(id,c);break;
+    case 192:launch_dense_candidate_capacity<Homogeneous,Mixed,192>(id,c);break;
+    case 224:launch_dense_candidate_capacity<Homogeneous,Mixed,224>(id,c);break;
+    case 256:launch_dense_candidate_capacity<Homogeneous,Mixed,256>(id,c);break;
+    default:throw std::invalid_argument("dense Pull candidate requires M=32..256 in steps of 32");
+  }
+}
+void launch_dense_candidate(KernelId id,const Context& c){
+  if(c.old_values.layout!=Layout::VertexMajor || c.new_values.layout!=Layout::VertexMajor)
+    throw std::invalid_argument("dense Pull candidates require vertex-major values");
+  if(c.slot_algorithms){launch_dense_candidate_algorithm<Algorithm::BFS,true>(id,c);return;}
+  if(c.algorithm==Algorithm::BFS)launch_dense_candidate_algorithm<Algorithm::BFS,false>(id,c);
+  else if(c.algorithm==Algorithm::SSSP)launch_dense_candidate_algorithm<Algorithm::SSSP,false>(id,c);
+  else launch_dense_candidate_algorithm<Algorithm::SSWP,false>(id,c);
+}
 // A block owns one target/part.  Each group of QueryLanes cooperates on an
 // incoming edge; the other groups and warps traverse disjoint incoming edges.
 // QueryLanes is lanes per edge (q8 means four edge groups per warp). With
@@ -928,8 +1203,58 @@ bool is_pull_kernel(KernelId id) {
   const int raw=int(id);
   return id==KernelId::DensePull || id==KernelId::GroupedG8Edge4Warp4Pull ||
     (raw>=int(KernelId::VmFusedSerialSmemQ32) && raw<=int(KernelId::VmParallelSmemShuffleQ8)) ||
+    (raw>=int(KernelId::DenseFusedSerialGlobalQ32) && raw<=int(KernelId::DenseParallelShuffleQ8)) ||
     (raw>=int(KernelId::PullCheckFreeBase) && raw<int(KernelId::PullCheckFreeBase)+pull_partition_count) ||
     (raw>=int(KernelId::PullCheckBase) && raw<int(KernelId::PullCheckBase)+pull_partition_count);
+}
+bool is_dense_pull_kernel(KernelId id) {
+  const int raw=int(id);
+  return (raw>=int(KernelId::VmFusedSerialSmemQ32) && raw<=int(KernelId::VmParallelSmemShuffleQ8)) ||
+    (raw>=int(KernelId::DenseFusedSerialGlobalQ32) && raw<=int(KernelId::DenseParallelShuffleQ8));
+}
+const char* dense_pull_token(KernelId id) {
+  switch(id){
+    case KernelId::DenseFusedSerialGlobalQ32:return "pull-dense-fused-serial-global-q32";
+    case KernelId::DenseFusedSerialGlobalQ16:return "pull-dense-fused-serial-global-q16";
+    case KernelId::DenseFusedSerialGlobalQ8:return "pull-dense-fused-serial-global-q8";
+    case KernelId::VmFusedSerialSmemQ32:return "pull-dense-fused-serial-smem-q32";
+    case KernelId::VmFusedSerialSmemQ16:return "pull-dense-fused-serial-smem-q16";
+    case KernelId::VmFusedSerialSmemQ8:return "pull-dense-fused-serial-smem-q8";
+    case KernelId::DenseSerialSharedQ16:return "pull-dense-serial-shared-q16";
+    case KernelId::DenseSerialSharedQ8:return "pull-dense-serial-shared-q8";
+    case KernelId::DenseSerialShuffleQ16:return "pull-dense-serial-shuffle-q16";
+    case KernelId::DenseSerialShuffleQ8:return "pull-dense-serial-shuffle-q8";
+    case KernelId::DenseSerialSmemQ32:return "pull-dense-serial-smem-q32";
+    case KernelId::DenseSerialSmemShuffleQ16:return "pull-dense-serial-smem-shuffle-q16";
+    case KernelId::DenseSerialSmemShuffleQ8:return "pull-dense-serial-smem-shuffle-q8";
+    case KernelId::DenseParallelGlobalQ32:return "pull-dense-parallel-global-q32";
+    case KernelId::DenseParallelSharedQ16:return "pull-dense-parallel-shared-q16";
+    case KernelId::DenseParallelSharedQ8:return "pull-dense-parallel-shared-q8";
+    case KernelId::DenseParallelShuffleQ16:return "pull-dense-parallel-shuffle-q16";
+    case KernelId::DenseParallelShuffleQ8:return "pull-dense-parallel-shuffle-q8";
+    case KernelId::VmParallelSmemShuffleQ32:return "pull-dense-parallel-smem-q32";
+    case KernelId::VmParallelSmemShuffleQ16:return "pull-dense-parallel-smem-shuffle-q16";
+    case KernelId::VmParallelSmemShuffleQ8:return "pull-dense-parallel-smem-shuffle-q8";
+    default:return nullptr;
+  }
+}
+KernelId parse_dense_pull_token(const std::string& token) {
+  const KernelId ids[]={KernelId::DenseFusedSerialGlobalQ32,KernelId::DenseFusedSerialGlobalQ16,
+    KernelId::DenseFusedSerialGlobalQ8,KernelId::VmFusedSerialSmemQ32,KernelId::VmFusedSerialSmemQ16,
+    KernelId::VmFusedSerialSmemQ8,KernelId::DenseSerialSharedQ16,KernelId::DenseSerialSharedQ8,
+    KernelId::DenseSerialShuffleQ16,KernelId::DenseSerialShuffleQ8,KernelId::DenseSerialSmemQ32,
+    KernelId::DenseSerialSmemShuffleQ16,KernelId::DenseSerialSmemShuffleQ8,KernelId::DenseParallelGlobalQ32,
+    KernelId::DenseParallelSharedQ16,KernelId::DenseParallelSharedQ8,KernelId::DenseParallelShuffleQ16,
+    KernelId::DenseParallelShuffleQ8,KernelId::VmParallelSmemShuffleQ32,
+    KernelId::VmParallelSmemShuffleQ16,KernelId::VmParallelSmemShuffleQ8};
+  for(KernelId id:ids)if(token==dense_pull_token(id))return id;
+  if(token=="pull-vm-serial-q32")return KernelId::VmFusedSerialSmemQ32;
+  if(token=="pull-vm-serial-q16")return KernelId::VmFusedSerialSmemQ16;
+  if(token=="pull-vm-serial-q8")return KernelId::VmFusedSerialSmemQ8;
+  if(token=="pull-vm-parallel-q32")return KernelId::VmParallelSmemShuffleQ32;
+  if(token=="pull-vm-parallel-q16")return KernelId::VmParallelSmemShuffleQ16;
+  if(token=="pull-vm-parallel-q8")return KernelId::VmParallelSmemShuffleQ8;
+  throw std::invalid_argument("invalid dense Pull token: "+token);
 }
 template<Layout Storage>void launch_specialized(KernelId id,const Context& c) {
   int pull_index=int(id)-int(KernelId::PullCheckFreeBase);
@@ -960,12 +1285,9 @@ void launch(KernelId id,const Context& c) {
     else launch_pull_partition<Layout::VertexMajor,8,4,1,false>(c);
     check(cudaGetLastError());return;
   }
-  if(id==KernelId::VmFusedSerialSmemQ32){launch_vm_pull<32,false>(c);check(cudaGetLastError());return;}
-  if(id==KernelId::VmFusedSerialSmemQ16){launch_vm_pull<16,false>(c);check(cudaGetLastError());return;}
-  if(id==KernelId::VmFusedSerialSmemQ8){launch_vm_pull<8,false>(c);check(cudaGetLastError());return;}
-  if(id==KernelId::VmParallelSmemShuffleQ32){launch_vm_pull<32,true>(c);check(cudaGetLastError());return;}
-  if(id==KernelId::VmParallelSmemShuffleQ16){launch_vm_pull<16,true>(c);check(cudaGetLastError());return;}
-  if(id==KernelId::VmParallelSmemShuffleQ8){launch_vm_pull<8,true>(c);check(cudaGetLastError());return;}
+  if(is_dense_pull_kernel(id)){
+    launch_dense_candidate(id,c);check(cudaGetLastError());return;
+  }
   if(c.old_values.layout!=c.new_values.layout)throw std::invalid_argument("value layout mismatch");
   if(c.old_values.layout==Layout::VertexMajor)launch_specialized<Layout::VertexMajor>(id,c);
   else launch_specialized<Layout::Grouped>(id,c);

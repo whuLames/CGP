@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cuda_runtime.h>
+#include <string>
 namespace graphweft {
 enum class Algorithm : int { BFS, SSSP, SSWP };
 enum class Layout : int { VertexMajor, Grouped };
@@ -14,10 +15,48 @@ enum class KernelId : int { SharedPush, DensePull, AdaptivePush, PushPartitionBa
   VmFusedSerialSmemQ8 = 403,
   VmParallelSmemShuffleQ32 = 404,
   VmParallelSmemShuffleQ16 = 405,
-  VmParallelSmemShuffleQ8 = 406 };
+  VmParallelSmemShuffleQ8 = 406,
+  // Dense Pull additions deliberately start in a new range.  Values 0--406
+  // are checkpoint/replay ABI and must not be renumbered.
+  DenseFusedSerialGlobalQ32 = 500,
+  DenseFusedSerialGlobalQ16,
+  DenseFusedSerialGlobalQ8,
+  DenseSerialSharedQ16,
+  DenseSerialSharedQ8,
+  DenseSerialShuffleQ16,
+  DenseSerialShuffleQ8,
+  DenseSerialSmemQ32,
+  DenseSerialSmemShuffleQ16,
+  DenseSerialSmemShuffleQ8,
+  DenseParallelGlobalQ32,
+  DenseParallelSharedQ16,
+  DenseParallelSharedQ8,
+  DenseParallelShuffleQ16,
+  DenseParallelShuffleQ8 };
+static_assert(int(KernelId::SharedPush)==0 && int(KernelId::DensePull)==1 &&
+              int(KernelId::AdaptivePush)==2 && int(KernelId::PushPartitionBase)==100 &&
+              int(KernelId::PullCheckFreeBase)==200 && int(KernelId::PullCheckBase)==300 &&
+              int(KernelId::GroupedG8Edge4Warp4Pull)==400 &&
+              int(KernelId::VmFusedSerialSmemQ32)==401 &&
+              int(KernelId::VmParallelSmemShuffleQ8)==406,
+              "legacy replay KernelId ABI changed");
 constexpr int push_partition_count = 30;
 constexpr int pull_partition_count = 30;
 constexpr int adaptive_push_bucket_count = 5;
+inline constexpr KernelId dense_pull_candidates[] = {
+  KernelId::DenseFusedSerialGlobalQ32,KernelId::DenseFusedSerialGlobalQ16,
+  KernelId::DenseFusedSerialGlobalQ8,KernelId::VmFusedSerialSmemQ32,
+  KernelId::VmFusedSerialSmemQ16,KernelId::VmFusedSerialSmemQ8,
+  KernelId::DenseSerialSharedQ16,KernelId::DenseSerialSharedQ8,
+  KernelId::DenseSerialShuffleQ16,KernelId::DenseSerialShuffleQ8,
+  KernelId::DenseSerialSmemQ32,KernelId::DenseSerialSmemShuffleQ16,
+  KernelId::DenseSerialSmemShuffleQ8,KernelId::DenseParallelGlobalQ32,
+  KernelId::DenseParallelSharedQ16,KernelId::DenseParallelSharedQ8,
+  KernelId::DenseParallelShuffleQ16,KernelId::DenseParallelShuffleQ8,
+  KernelId::VmParallelSmemShuffleQ32,KernelId::VmParallelSmemShuffleQ16,
+  KernelId::VmParallelSmemShuffleQ8};
+inline constexpr int dense_pull_candidate_count =
+  int(sizeof(dense_pull_candidates)/sizeof(dense_pull_candidates[0]));
 // Returns -1 for zero work, then W1/W2/W4/B2/B4 for the fixed load bands.
 __host__ __device__ constexpr int adaptive_push_bucket(uint64_t load) {
   return load==0?-1:load<=256?0:load<=1024?1:load<=4096?2:load<=16384?3:4;
@@ -30,6 +69,12 @@ PushPartition pull_partition(int index);
 KernelId vm_pull_id(bool parallel, uint32_t query_width);
 KernelId default_pull_kernel(uint32_t physical_slots, uint32_t vertices, uint64_t edges);
 bool is_pull_kernel(KernelId);
+bool is_dense_pull_kernel(KernelId);
+// Canonical replay/override spelling. Returns nullptr for non-dense kernels.
+const char* dense_pull_token(KernelId);
+// Accepts the canonical pull-dense-* tokens and the six legacy pull-vm-*
+// aliases. Throws std::invalid_argument for an unknown token.
+KernelId parse_dense_pull_token(const std::string&);
 enum class FrontierMode : int { Unordered, Stable };
 enum class FrontierBuildMode : int { Scan, Fused, Direct };
 struct FrontierOutput {
