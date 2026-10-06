@@ -219,7 +219,7 @@ template<int QueryCount, int QueryLanes, bool Tiled>
 __global__ void parallel_vertex_smem_pull(
     const uint64_t* row, const uint32_t* col, const float* weight,
     const float* old_values, float* new_values, uint32_t vertex_count) {
-  static_assert(QueryCount == 128 || QueryCount == 256);
+  static_assert(QueryCount == 64 || QueryCount == 128 || QueryCount == 256);
   static_assert(QueryLanes == 32 || QueryLanes == 16 || QueryLanes == 8);
   constexpr int queries_per_lane = 32 / QueryLanes;
   __shared__ uint32_t cached_source[32];
@@ -286,7 +286,7 @@ template<int QueryCount, int QueryLanes, bool UseSmem, bool Tiled>
 __global__ void fused_serial_pull(
     const uint64_t* row, const uint32_t* col, const float* weight,
     const float* old_values, float* new_values, uint32_t vertex_count) {
-  static_assert(QueryCount == 128 || QueryCount == 256);
+  static_assert(QueryCount == 64 || QueryCount == 128 || QueryCount == 256);
   static_assert(QueryLanes == 32 || QueryLanes == 16 || QueryLanes == 8);
   constexpr int edge_groups = 32 / QueryLanes;
   constexpr int outputs_per_lane = QueryCount / QueryLanes;
@@ -523,7 +523,8 @@ int main(int argc,char** argv) {
     if(argc<3 || argc>7)throw std::invalid_argument(
         "usage: graphweft_pull_wide_smem_shuffle GRAPH D [GPU=0] [REPETITIONS=7] [SUITE=all|fused] [LAYOUT=vm|tile32]");
     const uint32_t query_count=uint32_t(std::stoul(argv[2]));
-    if(query_count!=128 && query_count!=256)throw std::invalid_argument("D must be 128 or 256");
+    if(query_count!=64 && query_count!=128 && query_count!=256)
+      throw std::invalid_argument("D must be 64, 128, or 256");
     const int gpu=argc>=4?std::stoi(argv[3]):0;
     const int repetitions=argc>=5?std::stoi(argv[4]):7;
     const std::string suite=argc>=6?argv[5]:"all";
@@ -532,7 +533,10 @@ int main(int argc,char** argv) {
     if(layout!="vm" && layout!="tile32")throw std::invalid_argument("layout must be vm or tile32");
     checked(cudaSetDevice(gpu));
     const auto graph=graphweft::HostGraph::load(argv[1],true,true);
-    if(query_count==128) {
+    if(query_count==64) {
+      if(layout=="tile32")run_all<64,true>(graph,gpu,repetitions,suite=="fused");
+      else run_all<64,false>(graph,gpu,repetitions,suite=="fused");
+    } else if(query_count==128) {
       if(layout=="tile32")run_all<128,true>(graph,gpu,repetitions,suite=="fused");
       else run_all<128,false>(graph,gpu,repetitions,suite=="fused");
     } else {

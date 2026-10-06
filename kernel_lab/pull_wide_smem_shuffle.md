@@ -2,8 +2,8 @@
 
 ## Scope
 
-This standalone weighted min-plus Pull experiment evaluates `D=128` and
-`D=256` with:
+This standalone weighted min-plus Pull experiment evaluates `D=64`, `D=128`,
+and `D=256` with:
 
 - `serial`: one warp owns a vertex and processes all 32-query tiles in order;
 - `parallel`: `D/32` query-tile warps process the same vertex concurrently;
@@ -31,6 +31,32 @@ once per vertex/tile instead of once per query-tile warp.
 
 Twitter-D256 is infeasible on a 32 GiB V100 because the two dense value
 matrices alone require about 43.6 GB.
+
+## D=64 results
+
+The D=64 extension uses the same three paired warmups, seven interleaved
+samples, vertex-major layout, and full-output fingerprint validation.  Times
+are median GPU-event milliseconds.  Parenthesized values are speedups over
+the legacy `serial-global-Q32`; the parallel cached-Q16 speedup composes its
+paired result with the `parallel-global-Q32` result.
+
+| Variant | cit-Patents | LiveJournal | indochina | Orkut | Twitter |
+|---|---:|---:|---:|---:|---:|
+| Legacy serial-global-Q32 | 20.376 | 43.998 | 174.464 | 91.217 | 524.175 |
+| Fused-serial-global-Q32 | **14.896 (1.368x)** | 27.730 (1.587x) | 58.142 (3.001x) | 63.139 (1.445x) | 217.710 (2.408x) |
+| Fused-serial-smem-Q32 | 16.376 (1.244x) | 31.605 (1.392x) | 119.684 (1.455x) | 71.956 (1.268x) | 340.550 (1.539x) |
+| Fused-serial-smem-Q16 | 15.352 (1.327x) | **27.378 (1.607x)** | 48.848 (3.572x) | 59.417 (1.536x) | 190.018 (2.746x) |
+| Parallel-global-Q32 | 16.017 (1.272x) | 29.887 (1.472x) | 63.829 (2.745x) | 62.469 (1.461x) | 205.492 (2.552x) |
+| Parallel-smem-shuffle-Q16 | 15.843 (1.286x) | 27.589 (1.595x) | **45.244 (3.873x)** | **58.155 (1.569x)** | **166.458 (3.168x)** |
+
+All candidates in the full suite passed fingerprint validation.  The overall
+winner is fused-global-Q32 on cit-Patents, fused-smem-Q16 on LiveJournal, and
+parallel-smem-shuffle-Q16 on indochina, Orkut, and Twitter.  Among the two
+families currently integrated into GraphWeft, parallel-smem-shuffle-Q16 beats
+fused-serial-smem-Q32 on all five graphs by 3.3%, 12.7%, 62.2%, 19.2%, and
+51.1%, respectively.  This dense result does not include GraphWeft's live-slot,
+reachability, improvement, or frontier-publication work, and the lab fused
+kernel uses eight warps per block rather than production's four.
 
 ## GE-SpMM-style fused serial correction
 
