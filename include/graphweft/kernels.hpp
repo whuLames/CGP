@@ -8,7 +8,13 @@ enum class Algorithm : int { BFS, SSSP, SSWP };
 enum class Layout : int { VertexMajor, Grouped };
 enum class KernelId : int { SharedPush, DensePull, AdaptivePush, PushPartitionBase = 100,
   PullCheckFreeBase = 200, PullCheckBase = 300,
-  GroupedG8Edge4Warp4Pull = 400 };
+  GroupedG8Edge4Warp4Pull = 400,
+  VmFusedSerialSmemQ32 = 401,
+  VmFusedSerialSmemQ16 = 402,
+  VmFusedSerialSmemQ8 = 403,
+  VmParallelSmemShuffleQ32 = 404,
+  VmParallelSmemShuffleQ16 = 405,
+  VmParallelSmemShuffleQ8 = 406 };
 constexpr int push_partition_count = 30;
 constexpr int pull_partition_count = 30;
 constexpr int adaptive_push_bucket_count = 5;
@@ -21,6 +27,9 @@ KernelId push_partition_id(int index);
 PushPartition push_partition(int index);
 KernelId pull_partition_id(int index, bool check);
 PushPartition pull_partition(int index);
+KernelId vm_pull_id(bool parallel, uint32_t query_width);
+KernelId default_pull_kernel(uint32_t physical_slots, uint32_t vertices, uint64_t edges);
+bool is_pull_kernel(KernelId);
 enum class FrontierMode : int { Unordered, Stable };
 enum class FrontierBuildMode : int { Scan, Fused, Direct };
 struct FrontierOutput {

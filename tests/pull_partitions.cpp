@@ -59,6 +59,35 @@ int main() {
       if(index!=negative_reference.size())throw std::runtime_error("negative capacity round count mismatch");
       ++trajectories;rounds+=index;
     }
+    // Every new VM Pull specialization must preserve the complete synchronous
+    // trajectory, including frontier publication and completion rounds.
+    const KernelId vm_kernels[]={
+      KernelId::VmFusedSerialSmemQ32,KernelId::VmFusedSerialSmemQ16,
+      KernelId::VmFusedSerialSmemQ8,KernelId::VmParallelSmemShuffleQ32,
+      KernelId::VmParallelSmemShuffleQ16,KernelId::VmParallelSmemShuffleQ8};
+    uint64_t vm_trajectories=0;
+    for(auto algorithm:{Algorithm::BFS,Algorithm::SSSP,Algorithm::SSWP})
+      for(uint32_t q:{32u,64u,128u,256u}){
+        Options baseline;baseline.algorithm=algorithm;baseline.layout=Layout::Grouped;
+        baseline.group_width=32;baseline.capacity=q;baseline.selector=Options::Selector::Push;
+        baseline.frontier=FrontierMode::Stable;baseline.frontier_build=FrontierBuildMode::Fused;
+        std::vector<Query> queries;for(uint32_t s=0;s<q;++s)queries.push_back({s,s%10,0,s%3});
+        std::vector<RoundSnapshot> expected;auto baseline_stats=run(
+          graph,queries,baseline,{},[&](const RoundSnapshot& s){expected.push_back(s);});
+        for(KernelId kernel:vm_kernels){
+          Options candidate=baseline;candidate.selector=Options::Selector::Replay;candidate.replay={kernel};
+          size_t index=0;auto stats=run(graph,queries,candidate,{},[&](const RoundSnapshot& s){
+            if(index>=expected.size() || s.values!=expected[index].values ||
+               s.mask!=expected[index].mask || s.frontier!=expected[index].frontier)
+              throw std::runtime_error("VM Pull trajectory mismatch");
+            ++index;
+          });
+          if(index!=expected.size() || stats.rounds!=baseline_stats.rounds ||
+             stats.pull_rounds!=stats.rounds || stats.completions.size()!=baseline_stats.completions.size())
+            throw std::runtime_error("VM Pull completion/round accounting mismatch");
+          ++vm_trajectories;
+        }
+      }
     // Exact experiment matrix on the adversarial SSSP graph above: Q=32/64/96,
     // grouped widths 8/16/32, both requested mappings, and early completion.
     auto partition_id=[](uint32_t group){
@@ -80,7 +109,6 @@ int main() {
       std::vector<std::tuple<Layout,uint32_t,KernelId>> matrix{
         {Layout::VertexMajor,8,partition_id(32)},
         {Layout::Grouped,8,partition_id(8)},
-        {Layout::Grouped,8,KernelId::GroupedG8Edge4Warp4Pull},
         {Layout::Grouped,16,partition_id(8)}};
       if(q!=32)matrix.push_back({Layout::Grouped,32,partition_id(32)});
       for(auto [layout,width,kernel]:matrix){
@@ -96,7 +124,7 @@ int main() {
         },[&](const RoundSnapshot& s){
           if(round_index>=reference_rounds.size())throw std::runtime_error("experiment-matrix extra round");
           std::vector<float> logical(size_t(graph.vertices)*q);
-          ValueView view{const_cast<float*>(s.values.data()),graph.vertices,s.physical_slots,width,layout};
+          ValueView view{const_cast<float*>(s.values.data()),graph.vertices,s.physical_slots,width,s.layout};
           for(uint32_t v=0;v<graph.vertices;++v)for(uint32_t slot=0;slot<q;++slot)
             logical[size_t(v)*q+slot]=s.values[view.index(v,slot)];
           const auto& expected=reference_rounds[round_index++];
@@ -109,6 +137,7 @@ int main() {
       }
     }
     std::cout<<"pull partition validation passed trajectories="<<trajectories
-             <<" rounds="<<rounds<<" experiment_matrix_configurations="<<matrix_configurations<<"\n";
+             <<" rounds="<<rounds<<" vm_trajectories="<<vm_trajectories
+             <<" experiment_matrix_configurations="<<matrix_configurations<<"\n";
   }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}
 }

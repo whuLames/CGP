@@ -23,6 +23,11 @@ __device__ Algorithm slot_algorithm(const Context& c,uint32_t slot) {
 __device__ Algorithm slot_algorithm(const FrontierContext& c,uint32_t slot) {
   return c.slot_algorithms?c.slot_algorithms[slot]:c.algorithm;
 }
+template<Layout Storage>
+__host__ __device__ __forceinline__ size_t value_index(const ValueView& v,uint32_t vertex,uint32_t slot) {
+  if constexpr(Storage==Layout::VertexMajor)return size_t(vertex)*v.slots+slot;
+  return (size_t(slot/v.group_width)*v.vertices+vertex)*v.group_width+slot%v.group_width;
+}
 
 __device__ bool reduce_min_float(float* p,float x) {
   int* q=reinterpret_cast<int*>(p); int old=*q;
@@ -110,27 +115,40 @@ __device__ __forceinline__ void mark_frontier(const Context& c,uint32_t vertex,u
     if(peers&(1u<<source_lane))combined|=__shfl_sync(peers,bit,source_lane);
   if(int(threadIdx.x&31)==leader)mark_frontier_mask(c,vertex,word_index,combined);
 }
-__device__ uint32_t slot_for_cell(ValueView v,size_t i) {
-  if(v.layout==Layout::VertexMajor)return uint32_t(i%v.slots);
-  const size_t group_cells=size_t(v.vertices)*v.group_width;
-  return uint32_t(i/group_cells)*v.group_width+uint32_t(i%v.group_width);
+template<Layout Storage>__device__ uint32_t slot_for_cell(ValueView v,size_t i) {
+  if constexpr(Storage==Layout::VertexMajor)return uint32_t(i%v.slots);
+  else {const size_t group_cells=size_t(v.vertices)*v.group_width;
+    return uint32_t(i/group_cells)*v.group_width+uint32_t(i%v.group_width);}
 }
-__global__ void init_kernel(ValueView v,Algorithm a,const Algorithm* algorithms,size_t size) {
+template<Layout Storage>__global__ void init_kernel(ValueView v,Algorithm a,const Algorithm* algorithms,size_t size) {
   size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;
-  if (i<size) v.data[i]=identity(algorithms?algorithms[slot_for_cell(v,i)]:a);
+  if (i<size) v.data[i]=identity(algorithms?algorithms[slot_for_cell<Storage>(v,i)]:a);
 }
-__global__ void reset_slots_kernel(ValueView v,const uint8_t* reset,Algorithm a,
+template<Layout Storage>__global__ void reset_slots_kernel(ValueView v,const uint8_t* reset,Algorithm a,
                                    const Algorithm* algorithms,size_t size) {
   size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;
-  if(i<size){uint32_t s=slot_for_cell(v,i);if(reset[s])v.data[i]=identity(algorithms?algorithms[s]:a);}
+  if(i<size){uint32_t s=slot_for_cell<Storage>(v,i);if(reset[s])v.data[i]=identity(algorithms?algorithms[s]:a);}
 }
-__global__ void reset_slot_range_kernel(ValueView v,uint32_t first_slot,uint32_t slot_count,
+template<Layout Storage>__global__ void reset_slot_range_kernel(ValueView v,uint32_t first_slot,uint32_t slot_count,
                                         Algorithm a,const Algorithm* algorithms,size_t size) {
   size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;
   if(i>=size)return;
   uint32_t local=uint32_t(i%slot_count),vertex=uint32_t(i/slot_count);
   uint32_t slot=first_slot+local;
-  v.data[v.index(vertex,slot)]=identity(algorithms?algorithms[slot]:a);
+  v.data[value_index<Storage>(v,vertex,slot)]=identity(algorithms?algorithms[slot]:a);
+}
+template<int GroupWidth>
+__global__ void vm_group_reset_kernel(float* data,uint32_t vertices,uint32_t physical_slots,
+                                      uint32_t first_slot,float value) {
+  static_assert(GroupWidth==8 || GroupWidth==16 || GroupWidth==32);
+  constexpr uint32_t VerticesPerWarp=32/GroupWidth;
+  const uint32_t lane=threadIdx.x&31;
+  const uint64_t first_warp=(uint64_t(blockIdx.x)*blockDim.x+threadIdx.x)/32;
+  const uint64_t warp_stride=uint64_t(gridDim.x)*(blockDim.x/32);
+  for(uint64_t warp=first_warp;warp*VerticesPerWarp<vertices;warp+=warp_stride){
+    const uint64_t vertex=warp*VerticesPerWarp+lane/GroupWidth;
+    if(vertex<vertices)data[vertex*physical_slots+first_slot+lane%GroupWidth]=value;
+  }
 }
 __global__ void fill_value_range_kernel(float* data,float value,size_t size) {
   size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;
@@ -139,13 +157,13 @@ __global__ void fill_value_range_kernel(float* data,float value,size_t size) {
 __global__ void clear_kernel(uint64_t* m,size_t count) {
   size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x; if(i<count)m[i]=0;
 }
-__global__ void activate_kernel(ValueView v,uint64_t* mask,const uint32_t* sources,const uint8_t* due,
+template<Layout Storage>__global__ void activate_kernel(ValueView v,uint64_t* mask,const uint32_t* sources,const uint8_t* due,
                                 uint32_t slots,uint32_t words,Algorithm algorithm,const Algorithm* algorithms) {
   uint32_t s=blockIdx.x*blockDim.x+threadIdx.x;
   if(s>=slots || !due[s])return;
   uint32_t source=sources[s];
   Algorithm a=algorithms?algorithms[s]:algorithm;
-  v.data[v.index(source,s)]=a==Algorithm::SSWP ? INFINITY : 0.f;
+  v.data[value_index<Storage>(v,source,s)]=a==Algorithm::SSWP ? INFINITY : 0.f;
   atomicOr(reinterpret_cast<unsigned long long*>(mask+size_t(source)*words+s/64),1ULL<<(s%64));
 }
 __global__ void clear_slot_mask_kernel(uint64_t* mask,uint32_t vertices,uint32_t words,
@@ -158,7 +176,7 @@ __global__ void clear_slot_mask_kernel(uint64_t* mask,uint32_t vertices,uint32_t
 }
 
 // A warp shares one frontier source. Each lane traverses different outgoing edges.
-__global__ void push_kernel(Context c) {
+template<Layout Storage>__global__ void push_kernel(Context c) {
   uint32_t warp=(blockIdx.x*blockDim.x+threadIdx.x)/32;
   uint32_t lane=threadIdx.x%32;
   uint32_t count=*c.frontier_count;
@@ -173,11 +191,11 @@ __global__ void push_kernel(Context c) {
         uint32_t slot=word*64+bit; bits &= bits-1;
         if(slot>=c.slots || !c.live_slots[slot])continue;
         Algorithm algorithm=slot_algorithm(c,slot);
-        float old=c.old_values.data[c.old_values.index(source,slot)];
+        float old=c.old_values.data[value_index<Storage>(c.old_values,source,slot)];
         if(!reachable(old,algorithm))continue;
         if(algorithm==Algorithm::BFS && old>=16777216.f) { atomicExch(c.error_flag,1); continue; }
         float candidate=relax(old,weight,algorithm);
-        float* target=c.new_values.data+c.new_values.index(dest,slot);
+        float* target=c.new_values.data+value_index<Storage>(c.new_values,dest,slot);
         bool improved=algorithm==Algorithm::SSWP?reduce_max_float(target,candidate):reduce_min_float(target,candidate);
         if(improved)mark_frontier_legacy(c,dest,slot);
       }
@@ -185,7 +203,7 @@ __global__ void push_kernel(Context c) {
   }
   }
 }
-__global__ void push_kernel_mask64(Context c) {
+template<Layout Storage>__global__ void push_kernel_mask64(Context c) {
   uint32_t warp=(blockIdx.x*blockDim.x+threadIdx.x)/32;
   uint32_t lane=threadIdx.x%32;
   uint32_t count=*c.frontier_count;
@@ -201,11 +219,11 @@ __global__ void push_kernel_mask64(Context c) {
           uint32_t slot=word*64+bit; bits &= bits-1;
           if(slot>=c.slots || !c.live_slots[slot])continue;
           Algorithm algorithm=slot_algorithm(c,slot);
-          float old=c.old_values.data[c.old_values.index(source,slot)];
+          float old=c.old_values.data[value_index<Storage>(c.old_values,source,slot)];
           if(!reachable(old,algorithm))continue;
           if(algorithm==Algorithm::BFS && old>=16777216.f) { atomicExch(c.error_flag,1); continue; }
           float candidate=relax(old,weight,algorithm);
-          float* target=c.new_values.data+c.new_values.index(dest,slot);
+          float* target=c.new_values.data+value_index<Storage>(c.new_values,dest,slot);
           bool improved=algorithm==Algorithm::SSWP?reduce_max_float(target,candidate):reduce_min_float(target,candidate);
           if(improved)improved_bits|=1ULL<<bit;
         }
@@ -216,7 +234,7 @@ __global__ void push_kernel_mask64(Context c) {
 }
 // Each warp compacts the same 32-column query tile, independently of its
 // edge/query grouping. Groups own edges; lanes within a group own query ranks.
-template<int QueryLanes, int Warps, int Blocks>
+template<Layout Storage,int QueryLanes, int Warps, int Blocks>
 __global__ void partition_push_kernel(Context c) {
   __shared__ uint32_t active_slots[Warps][32];
   constexpr int EdgeGroups=32/QueryLanes;
@@ -247,11 +265,11 @@ __global__ void partition_push_kernel(Context c) {
             if(base+query_lane>=active)continue;
             const uint32_t q=active_slots[warp][base+query_lane];
             const Algorithm algorithm=slot_algorithm(c,q);
-            const float old=c.old_values.data[c.old_values.index(source,q)];
+            const float old=c.old_values.data[value_index<Storage>(c.old_values,source,q)];
             if(!reachable(old,algorithm))continue;
             if(algorithm==Algorithm::BFS && old>=16777216.f){atomicExch(c.error_flag,1);continue;}
             const float candidate=relax(old,weight,algorithm);
-            float* target=c.new_values.data+c.new_values.index(dest,q);
+            float* target=c.new_values.data+value_index<Storage>(c.new_values,dest,q);
             bool improved=algorithm==Algorithm::SSWP?reduce_max_float(target,candidate):reduce_min_float(target,candidate);
             if(improved)mark_frontier(c,dest,q);
           }
@@ -261,23 +279,23 @@ __global__ void partition_push_kernel(Context c) {
     }
   }
 }
-template<int Q,int W,int B>void launch_partition(const Context& c) {
+template<Layout Storage,int Q,int W,int B>void launch_partition(const Context& c) {
   uint32_t n=c.frontier_size_hint==UINT32_MAX?c.graph.vertices:c.frontier_size_hint;
   if(!n)return;
   // The cap is divisible by four so parts of a vertex remain on separate blocks.
   uint32_t blocks=uint32_t(std::min<uint64_t>(65532,uint64_t(n)*B));
-  partition_push_kernel<Q,W,B><<<blocks,W*32,0,c.stream>>>(c);
+  partition_push_kernel<Storage,Q,W,B><<<blocks,W*32,0,c.stream>>>(c);
 }
-template<int Q>void launch_grain(int grain,const Context& c) {
+template<Layout Storage,int Q>void launch_grain(int grain,const Context& c) {
   switch(grain){
-    case 0:launch_partition<Q,1,1>(c);break;
-    case 1:launch_partition<Q,2,1>(c);break;
-    case 2:launch_partition<Q,4,1>(c);break;
-    case 3:launch_partition<Q,4,2>(c);break;
-    case 4:launch_partition<Q,4,4>(c);break;
+    case 0:launch_partition<Storage,Q,1,1>(c);break;
+    case 1:launch_partition<Storage,Q,2,1>(c);break;
+    case 2:launch_partition<Storage,Q,4,1>(c);break;
+    case 3:launch_partition<Storage,Q,4,2>(c);break;
+    case 4:launch_partition<Storage,Q,4,4>(c);break;
   }
 }
-template<int QueryLanes,int Warps,int Blocks>
+template<Layout Storage,int QueryLanes,int Warps,int Blocks>
 __device__ __forceinline__ void adaptive_push_tile(
     Context c,uint32_t source,uint32_t vertex_warp,uint32_t tile,
     uint32_t active,uint32_t active_slots[Warps][32]) {
@@ -296,17 +314,17 @@ __device__ __forceinline__ void adaptive_push_tile(
       if(base+query_lane>=active)continue;
       const uint32_t q=active_slots[warp][base+query_lane];
       const Algorithm algorithm=slot_algorithm(c,q);
-      const float old=c.old_values.data[c.old_values.index(source,q)];
+      const float old=c.old_values.data[value_index<Storage>(c.old_values,source,q)];
       if(!reachable(old,algorithm))continue;
       if(algorithm==Algorithm::BFS && old>=16777216.f){atomicExch(c.error_flag,1);continue;}
       const float candidate=relax(old,weight,algorithm);
-      float* target=c.new_values.data+c.new_values.index(dest,q);
+      float* target=c.new_values.data+value_index<Storage>(c.new_values,dest,q);
       const bool improved=algorithm==Algorithm::SSWP?reduce_max_float(target,candidate):reduce_min_float(target,candidate);
       if(improved)mark_frontier(c,dest,q);
     }
   }
 }
-template<int Warps,int Blocks>
+template<Layout Storage,int Warps,int Blocks>
 __global__ void adaptive_push_kernel(Context c,const uint32_t* vertices,uint32_t vertex_count) {
   __shared__ uint32_t active_slots[Warps][32];
   const uint32_t warp=threadIdx.x/32,lane=threadIdx.x%32;
@@ -323,23 +341,23 @@ __global__ void adaptive_push_kernel(Context c,const uint32_t* vertices,uint32_t
       if(enabled)active_slots[warp][__popc(bits&((1u<<lane)-1))]=slot;
       __syncwarp();
       if(!active){__syncwarp();continue;}
-      if(active<=1)adaptive_push_tile<1,Warps,Blocks>(c,source,vertex_warp,tile,active,active_slots);
-      else if(active<=2)adaptive_push_tile<2,Warps,Blocks>(c,source,vertex_warp,tile,active,active_slots);
-      else if(active<=4)adaptive_push_tile<4,Warps,Blocks>(c,source,vertex_warp,tile,active,active_slots);
-      else if(active<=8)adaptive_push_tile<8,Warps,Blocks>(c,source,vertex_warp,tile,active,active_slots);
-      else if(active<=16)adaptive_push_tile<16,Warps,Blocks>(c,source,vertex_warp,tile,active,active_slots);
-      else adaptive_push_tile<32,Warps,Blocks>(c,source,vertex_warp,tile,active,active_slots);
+      if(active<=1)adaptive_push_tile<Storage,1,Warps,Blocks>(c,source,vertex_warp,tile,active,active_slots);
+      else if(active<=2)adaptive_push_tile<Storage,2,Warps,Blocks>(c,source,vertex_warp,tile,active,active_slots);
+      else if(active<=4)adaptive_push_tile<Storage,4,Warps,Blocks>(c,source,vertex_warp,tile,active,active_slots);
+      else if(active<=8)adaptive_push_tile<Storage,8,Warps,Blocks>(c,source,vertex_warp,tile,active,active_slots);
+      else if(active<=16)adaptive_push_tile<Storage,16,Warps,Blocks>(c,source,vertex_warp,tile,active,active_slots);
+      else adaptive_push_tile<Storage,32,Warps,Blocks>(c,source,vertex_warp,tile,active,active_slots);
       __syncwarp();
     }
   }
 }
-template<int Warps,int Blocks>
+template<Layout Storage,int Warps,int Blocks>
 void launch_adaptive_bucket(const Context& c,const uint32_t* vertices,uint32_t count) {
   if(!count)return;
   const uint32_t blocks=uint32_t(std::min<uint64_t>(65532,uint64_t(count)*Blocks));
-  adaptive_push_kernel<Warps,Blocks><<<blocks,Warps*32,0,c.stream>>>(c,vertices,count);
+  adaptive_push_kernel<Storage,Warps,Blocks><<<blocks,Warps*32,0,c.stream>>>(c,vertices,count);
 }
-__global__ void pull_kernel(Context c,uint32_t tiles) {
+template<Layout Storage>__global__ void pull_kernel(Context c,uint32_t tiles) {
   uint64_t index=uint64_t(blockIdx.x)*blockDim.x+threadIdx.x;
   uint64_t total=uint64_t(c.graph.vertices)*tiles*32;
   if(index>=total)return;
@@ -347,26 +365,191 @@ __global__ void pull_kernel(Context c,uint32_t tiles) {
   uint32_t vertex=index/(uint64_t(tiles)*32);
   if(slot>=c.slots || !c.live_slots[slot])return;
   Algorithm algorithm=slot_algorithm(c,slot);
-  float best=c.old_values.data[c.old_values.index(vertex,slot)];
+  float best=c.old_values.data[value_index<Storage>(c.old_values,vertex,slot)];
   for(uint64_t e=c.graph.in_row[vertex];e<c.graph.in_row[vertex+1];++e) {
     uint32_t source=c.graph.in_col[e];
-    float old=c.old_values.data[c.old_values.index(source,slot)];
+    float old=c.old_values.data[value_index<Storage>(c.old_values,source,slot)];
     if(!reachable(old,algorithm))continue;
     if(algorithm==Algorithm::BFS && old>=16777216.f) { atomicExch(c.error_flag,1); continue; }
     float candidate=relax(old,c.graph.in_weight[e],algorithm);
     best=algorithm==Algorithm::SSWP ? fmaxf(best,candidate) : fminf(best,candidate);
   }
-  c.new_values.data[c.new_values.index(vertex,slot)]=best;
-  const bool improved=algorithm==Algorithm::SSWP?best>c.old_values.data[c.old_values.index(vertex,slot)]:
-    best<c.old_values.data[c.old_values.index(vertex,slot)];
+  c.new_values.data[value_index<Storage>(c.new_values,vertex,slot)]=best;
+  const bool improved=algorithm==Algorithm::SSWP?best>c.old_values.data[value_index<Storage>(c.old_values,vertex,slot)]:
+    best<c.old_values.data[value_index<Storage>(c.old_values,vertex,slot)];
   if(improved)mark_frontier(c,vertex,slot);
+}
+
+// Vertex-major Pull family.  M is the padded physical query capacity and is
+// deliberately a template argument: all value addresses in these kernels are
+// source*M+slot or target*M+slot with no layout decision in the hot loop.
+// The serial mapping keeps every query result for a target in registers while
+// a warp loads each 32-edge tile once into its private shared-memory cache.
+template<int M,int QueryLanes>
+__global__ void vm_fused_serial_smem_pull_kernel(Context c) {
+  static_assert(M%32==0 && M<=256);
+  static_assert(QueryLanes==32 || QueryLanes==16 || QueryLanes==8);
+  constexpr int Warps=4;
+  constexpr int QueriesPerLane=32/QueryLanes;
+  constexpr int ResultsPerLane=M/QueryLanes;
+  __shared__ uint32_t cached_source[Warps][32];
+  __shared__ float cached_weight[Warps][32];
+  const uint32_t warp=threadIdx.x/32,lane=threadIdx.x%32;
+  const uint32_t edge_group=lane/QueryLanes,query_lane=lane%QueryLanes;
+  const uint32_t target=blockIdx.x*Warps+warp;
+  const bool valid=target<c.graph.vertices;
+  float best[ResultsPerLane];
+#pragma unroll
+  for(int r=0;r<ResultsPerLane;++r){
+    const uint32_t tile=r/QueriesPerLane;
+    const uint32_t k=r%QueriesPerLane;
+    const uint32_t slot=tile*32+k*QueryLanes+query_lane;
+    best[r]=(valid && slot<c.slots && c.live_slots[slot])?
+      c.old_values.data[size_t(target)*M+slot]:identity(c.algorithm);
+  }
+  const uint64_t begin=valid?c.graph.in_row[target]:0;
+  const uint64_t end=valid?c.graph.in_row[target+1]:0;
+  for(uint64_t base=begin;base<end;base+=32){
+    const uint64_t edge=base+lane;
+    if(edge<end){cached_source[warp][lane]=c.graph.in_col[edge];
+      cached_weight[warp][lane]=c.graph.in_weight[edge];}
+    __syncwarp();
+    const int group_offset=int(edge_group*QueryLanes);
+    const int count=max(0,min(QueryLanes,int(end-base)-group_offset));
+    for(int j=0;j<count;++j){
+      const uint32_t source=cached_source[warp][group_offset+j];
+      const float weight=cached_weight[warp][group_offset+j];
+#pragma unroll
+      for(int r=0;r<ResultsPerLane;++r){
+        const uint32_t tile=r/QueriesPerLane;
+        const uint32_t k=r%QueriesPerLane;
+        const uint32_t slot=tile*32+k*QueryLanes+query_lane;
+        if(slot>=c.slots || !c.live_slots[slot])continue;
+        const Algorithm algorithm=slot_algorithm(c,slot);
+        const float old=c.old_values.data[size_t(source)*M+slot];
+        if(!reachable(old,algorithm))continue;
+        if(algorithm==Algorithm::BFS && old>=16777216.f){atomicExch(c.error_flag,1);continue;}
+        const float candidate=relax(old,weight,algorithm);
+        best[r]=algorithm==Algorithm::SSWP?fmaxf(best[r],candidate):fminf(best[r],candidate);
+      }
+    }
+    __syncwarp();
+  }
+#pragma unroll
+  for(int r=0;r<ResultsPerLane;++r){
+    const uint32_t tile=r/QueriesPerLane;
+    const uint32_t k=r%QueriesPerLane;
+    const uint32_t slot=tile*32+k*QueryLanes+query_lane;
+    if(slot>=c.slots)continue;
+    const Algorithm algorithm=slot_algorithm(c,slot);
+    float reduced=best[r];
+#pragma unroll
+    for(int offset=QueryLanes;offset<32;offset*=2){
+      const float other=__shfl_xor_sync(0xffffffffu,reduced,offset);
+      reduced=algorithm==Algorithm::SSWP?fmaxf(reduced,other):fminf(reduced,other);
+    }
+    if(valid && edge_group==0 && c.live_slots[slot]){
+      const size_t position=size_t(target)*M+slot;
+      const float previous=c.old_values.data[position];
+      const bool improved=algorithm==Algorithm::SSWP?reduced>previous:reduced<previous;
+      if(improved){c.new_values.data[position]=reduced;mark_frontier(c,target,slot);}
+    }
+  }
+}
+
+// One block owns a target and one warp owns each 32-query tile.  All M/32
+// warps share the same 32-edge cache; Q16/Q8 combine edge groups with shuffle.
+template<int M,int QueryLanes>
+__global__ void vm_parallel_smem_shuffle_pull_kernel(Context c) {
+  static_assert(M%32==0 && M<=256);
+  constexpr int QueriesPerLane=32/QueryLanes;
+  __shared__ uint32_t cached_source[32];
+  __shared__ float cached_weight[32];
+  const uint32_t target=blockIdx.x;
+  const uint32_t lane=threadIdx.x%32,tile=threadIdx.x/32;
+  const uint32_t edge_group=lane/QueryLanes,query_lane=lane%QueryLanes;
+  float best[QueriesPerLane];
+#pragma unroll
+  for(int k=0;k<QueriesPerLane;++k){
+    const uint32_t slot=tile*32+k*QueryLanes+query_lane;
+    best[k]=(slot<c.slots && c.live_slots[slot])?
+      c.old_values.data[size_t(target)*M+slot]:identity(c.algorithm);
+  }
+  const uint64_t begin=c.graph.in_row[target],end=c.graph.in_row[target+1];
+  for(uint64_t base=begin;base<end;base+=32){
+    if(threadIdx.x<32){const uint64_t edge=base+lane;if(edge<end){
+      cached_source[lane]=c.graph.in_col[edge];cached_weight[lane]=c.graph.in_weight[edge];}}
+    __syncthreads();
+    const int group_offset=int(edge_group*QueryLanes);
+    const int count=max(0,min(QueryLanes,int(end-base)-group_offset));
+    for(int j=0;j<count;++j){
+      const uint32_t source=cached_source[group_offset+j];
+      const float weight=cached_weight[group_offset+j];
+#pragma unroll
+      for(int k=0;k<QueriesPerLane;++k){
+        const uint32_t slot=tile*32+k*QueryLanes+query_lane;
+        if(slot>=c.slots || !c.live_slots[slot])continue;
+        const Algorithm algorithm=slot_algorithm(c,slot);
+        const float old=c.old_values.data[size_t(source)*M+slot];
+        if(!reachable(old,algorithm))continue;
+        if(algorithm==Algorithm::BFS && old>=16777216.f){atomicExch(c.error_flag,1);continue;}
+        const float candidate=relax(old,weight,algorithm);
+        best[k]=algorithm==Algorithm::SSWP?fmaxf(best[k],candidate):fminf(best[k],candidate);
+      }
+    }
+    __syncthreads();
+  }
+#pragma unroll
+  for(int k=0;k<QueriesPerLane;++k){
+    const uint32_t slot=tile*32+k*QueryLanes+query_lane;
+    if(slot>=c.slots)continue;
+    const Algorithm algorithm=slot_algorithm(c,slot);
+    float reduced=best[k];
+#pragma unroll
+    for(int offset=QueryLanes;offset<32;offset*=2){
+      const float other=__shfl_xor_sync(0xffffffffu,reduced,offset);
+      reduced=algorithm==Algorithm::SSWP?fmaxf(reduced,other):fminf(reduced,other);
+    }
+    if(edge_group==0 && c.live_slots[slot]){
+      const size_t position=size_t(target)*M+slot;
+      const float previous=c.old_values.data[position];
+      const bool improved=algorithm==Algorithm::SSWP?reduced>previous:reduced<previous;
+      if(improved){c.new_values.data[position]=reduced;mark_frontier(c,target,slot);}
+    }
+  }
+}
+
+template<int M,int Q,bool Parallel>void launch_vm_pull_capacity(const Context& c){
+  if(c.old_values.layout!=Layout::VertexMajor || c.new_values.layout!=Layout::VertexMajor ||
+     c.old_values.slots!=M || c.new_values.slots!=M)
+    throw std::invalid_argument("VM Pull requires matching vertex-major physical capacity");
+  if(!c.graph.vertices)return;
+  if constexpr(Parallel)
+    vm_parallel_smem_shuffle_pull_kernel<M,Q><<<c.graph.vertices,M,0,c.stream>>>(c);
+  else {
+    constexpr uint32_t Warps=4;
+    vm_fused_serial_smem_pull_kernel<M,Q><<<(c.graph.vertices+Warps-1)/Warps,Warps*32,0,c.stream>>>(c);
+  }
+}
+template<int Q,bool Parallel>void launch_vm_pull(const Context& c){
+  switch(c.old_values.slots){
+    case 32:launch_vm_pull_capacity<32,Q,Parallel>(c);break;
+    case 64:launch_vm_pull_capacity<64,Q,Parallel>(c);break;
+    case 96:launch_vm_pull_capacity<96,Q,Parallel>(c);break;
+    case 128:launch_vm_pull_capacity<128,Q,Parallel>(c);break;
+    case 160:launch_vm_pull_capacity<160,Q,Parallel>(c);break;
+    case 192:launch_vm_pull_capacity<192,Q,Parallel>(c);break;
+    case 224:launch_vm_pull_capacity<224,Q,Parallel>(c);break;
+    case 256:launch_vm_pull_capacity<256,Q,Parallel>(c);break;
+    default:throw std::invalid_argument("VM Pull requires M to be a multiple of 32 no greater than 256");
+  }
 }
 // A block owns one target/part.  Each group of QueryLanes cooperates on an
 // incoming edge; the other groups and warps traverse disjoint incoming edges.
 // QueryLanes is lanes per edge (q8 means four edge groups per warp). With
 // Q32 vertex-major float values, eight adjacent lanes fill one 32-byte sector;
 // narrower groups may revisit that sector as k advances through queries.
-template<int QueryLanes,int Warps,int Blocks,bool Check>
+template<Layout Storage,int QueryLanes,int Warps,int Blocks,bool Check>
 __global__ void partition_pull_kernel(Context c) {
   constexpr int EdgeGroups=32/QueryLanes;
   constexpr int Groups=Warps*EdgeGroups;
@@ -401,7 +584,7 @@ __global__ void partition_pull_kernel(Context c) {
           if(slot>=c.slots || !c.live_slots[slot])continue;
           const Algorithm algorithm=slot_algorithm(c,slot);
           if constexpr(Check) if(!((active>>(slot%64))&1ULL))continue;
-          const float old=c.old_values.data[c.old_values.index(source,slot)];
+          const float old=c.old_values.data[value_index<Storage>(c.old_values,source,slot)];
           if(!reachable(old,algorithm))continue;
           if(algorithm==Algorithm::BFS && old>=16777216.f){atomicExch(c.error_flag,1);continue;}
           const float candidate=relax(old,weight,algorithm);
@@ -422,8 +605,8 @@ __global__ void partition_pull_kernel(Context c) {
             reduced=algorithm==Algorithm::SSWP?
               fmaxf(reduced,partial[k][group*QueryLanes+query_lane_out]):
               fminf(reduced,partial[k][group*QueryLanes+query_lane_out]);
-          const size_t position=c.new_values.index(target,slot);
-          const float previous=c.old_values.data[c.old_values.index(target,slot)];
+          const size_t position=value_index<Storage>(c.new_values,target,slot);
+          const float previous=c.old_values.data[value_index<Storage>(c.old_values,target,slot)];
           if(algorithm==Algorithm::SSWP) {
             if(reduced>previous) {
               if constexpr(Blocks==1){c.new_values.data[position]=reduced;mark_frontier(c,target,slot);}
@@ -440,28 +623,28 @@ __global__ void partition_pull_kernel(Context c) {
   }
 }
 
-template<int Q,int W,int B,bool Check>void launch_pull_partition(const Context& c) {
+template<Layout Storage,int Q,int W,int B,bool Check>void launch_pull_partition(const Context& c) {
   if(!c.graph.vertices)return;
   const uint32_t blocks=uint32_t(std::min<uint64_t>(65532,uint64_t(c.graph.vertices)*B));
-  partition_pull_kernel<Q,W,B,Check><<<blocks,W*32,0,c.stream>>>(c);
+  partition_pull_kernel<Storage,Q,W,B,Check><<<blocks,W*32,0,c.stream>>>(c);
 }
-template<int Q,bool Check>void launch_pull_grain(int grain,const Context& c) {
+template<Layout Storage,int Q,bool Check>void launch_pull_grain(int grain,const Context& c) {
   switch(grain){
-    case 0:launch_pull_partition<Q,1,1,Check>(c);break;
-    case 1:launch_pull_partition<Q,2,1,Check>(c);break;
-    case 2:launch_pull_partition<Q,4,1,Check>(c);break;
-    case 3:launch_pull_partition<Q,4,2,Check>(c);break;
-    case 4:launch_pull_partition<Q,4,4,Check>(c);break;
+    case 0:launch_pull_partition<Storage,Q,1,1,Check>(c);break;
+    case 1:launch_pull_partition<Storage,Q,2,1,Check>(c);break;
+    case 2:launch_pull_partition<Storage,Q,4,1,Check>(c);break;
+    case 3:launch_pull_partition<Storage,Q,4,2,Check>(c);break;
+    case 4:launch_pull_partition<Storage,Q,4,4,Check>(c);break;
   }
 }
-template<bool Check>void launch_pull_group(int group,int grain,const Context& c) {
+template<Layout Storage,bool Check>void launch_pull_group(int group,int grain,const Context& c) {
   switch(group){
-    case 0:launch_pull_grain<1,Check>(grain,c);break;
-    case 1:launch_pull_grain<2,Check>(grain,c);break;
-    case 2:launch_pull_grain<4,Check>(grain,c);break;
-    case 3:launch_pull_grain<8,Check>(grain,c);break;
-    case 4:launch_pull_grain<16,Check>(grain,c);break;
-    case 5:launch_pull_grain<32,Check>(grain,c);break;
+    case 0:launch_pull_grain<Storage,1,Check>(grain,c);break;
+    case 1:launch_pull_grain<Storage,2,Check>(grain,c);break;
+    case 2:launch_pull_grain<Storage,4,Check>(grain,c);break;
+    case 3:launch_pull_grain<Storage,8,Check>(grain,c);break;
+    case 4:launch_pull_grain<Storage,16,Check>(grain,c);break;
+    case 5:launch_pull_grain<Storage,32,Check>(grain,c);break;
   }
 }
 
@@ -533,7 +716,7 @@ void launch_grouped_g8_edge4_warp4_pull(const Context& c) {
   const uint32_t blocks=uint32_t(std::min<uint64_t>(65532,c.graph.vertices));
   grouped_g8_edge4_warp4_pull_kernel<<<blocks,4*32,0,c.stream>>>(c);
 }
-__global__ void compare_kernel(FrontierContext c) {
+template<Layout Storage>__global__ void compare_kernel(FrontierContext c) {
   uint32_t v=blockIdx.x*blockDim.x+threadIdx.x;
   if(v>=c.old_values.vertices)return;
   uint32_t active=0;
@@ -544,8 +727,8 @@ __global__ void compare_kernel(FrontierContext c) {
       if(s>=c.slots)break;
       if(!c.live_slots[s])continue;
       Algorithm algorithm=slot_algorithm(c,s);
-      float old=c.old_values.data[c.old_values.index(v,s)];
-      float next=c.new_values.data[c.new_values.index(v,s)];
+      float old=c.old_values.data[value_index<Storage>(c.old_values,v,s)];
+      float next=c.new_values.data[value_index<Storage>(c.new_values,v,s)];
       bool improved=algorithm==Algorithm::SSWP ? next>old : next<old;
       if(improved) { bits|=1ULL<<b; ++active; atomicAdd(c.slot_count+s,1u); }
     }
@@ -613,11 +796,15 @@ void initialize_values(ValueView v,Algorithm a,cudaStream_t stream) {
 }
 void initialize_values(ValueView v,Algorithm a,const Algorithm* algorithms,cudaStream_t stream) {
   size_t count=size_t(v.vertices)*v.slots;
-  init_kernel<<<(count+255)/256,256,0,stream>>>(v,a,algorithms,count); check(cudaGetLastError());
+  if(v.layout==Layout::VertexMajor)init_kernel<Layout::VertexMajor><<<(count+255)/256,256,0,stream>>>(v,a,algorithms,count);
+  else init_kernel<Layout::Grouped><<<(count+255)/256,256,0,stream>>>(v,a,algorithms,count);
+  check(cudaGetLastError());
 }
 void reset_slots(ValueView v,const uint8_t* reset,Algorithm a,const Algorithm* algorithms,cudaStream_t stream) {
   size_t count=size_t(v.vertices)*v.slots;
-  reset_slots_kernel<<<(count+255)/256,256,0,stream>>>(v,reset,a,algorithms,count);check(cudaGetLastError());
+  if(v.layout==Layout::VertexMajor)reset_slots_kernel<Layout::VertexMajor><<<(count+255)/256,256,0,stream>>>(v,reset,a,algorithms,count);
+  else reset_slots_kernel<Layout::Grouped><<<(count+255)/256,256,0,stream>>>(v,reset,a,algorithms,count);
+  check(cudaGetLastError());
 }
 void reset_slot_range(ValueView v,uint32_t first_slot,uint32_t slot_count,Algorithm a,
                       const Algorithm* algorithms,cudaStream_t stream) {
@@ -633,8 +820,26 @@ void reset_slot_range(ValueView v,uint32_t first_slot,uint32_t slot_count,Algori
     fill_value_range_kernel<<<(count+255)/256,256,0,stream>>>(v.data+offset,value,count);
     check(cudaGetLastError());return;
   }
-  reset_slot_range_kernel<<<(count+255)/256,256,0,stream>>>(
-    v,first_slot,slot_count,a,algorithms,count);check(cudaGetLastError());
+  if(v.layout==Layout::VertexMajor && first_slot%v.group_width==0 &&
+     slot_count==v.group_width && !algorithms &&
+     (v.group_width==8 || v.group_width==16 || v.group_width==32)){
+    const float value=a==Algorithm::SSWP?-std::numeric_limits<float>::infinity():
+                                           std::numeric_limits<float>::infinity();
+    const uint64_t warps=(uint64_t(v.vertices)+32/v.group_width-1)/(32/v.group_width);
+    const uint32_t blocks=uint32_t(std::min<uint64_t>(65535,(warps+7)/8));
+    if(v.group_width==32)vm_group_reset_kernel<32><<<blocks,256,0,stream>>>(
+      v.data,v.vertices,v.slots,first_slot,value);
+    else if(v.group_width==16)vm_group_reset_kernel<16><<<blocks,256,0,stream>>>(
+      v.data,v.vertices,v.slots,first_slot,value);
+    else vm_group_reset_kernel<8><<<blocks,256,0,stream>>>(
+      v.data,v.vertices,v.slots,first_slot,value);
+    check(cudaGetLastError());return;
+  }
+  if(v.layout==Layout::VertexMajor)reset_slot_range_kernel<Layout::VertexMajor><<<(count+255)/256,256,0,stream>>>(
+    v,first_slot,slot_count,a,algorithms,count);
+  else reset_slot_range_kernel<Layout::Grouped><<<(count+255)/256,256,0,stream>>>(
+    v,first_slot,slot_count,a,algorithms,count);
+  check(cudaGetLastError());
 }
 void clear_mask(uint64_t* mask,uint32_t vertices,uint32_t words,cudaStream_t stream) {
   size_t count=size_t(vertices)*words;
@@ -646,7 +851,9 @@ void activate(ValueView v,uint64_t* mask,const uint32_t* sources,const uint8_t* 
 }
 void activate(ValueView v,uint64_t* mask,const uint32_t* sources,const uint8_t* due,
               uint32_t slots,uint32_t words,Algorithm algorithm,const Algorithm* algorithms,cudaStream_t stream) {
-  activate_kernel<<<(slots+255)/256,256,0,stream>>>(v,mask,sources,due,slots,words,algorithm,algorithms); check(cudaGetLastError());
+  if(v.layout==Layout::VertexMajor)activate_kernel<Layout::VertexMajor><<<(slots+255)/256,256,0,stream>>>(v,mask,sources,due,slots,words,algorithm,algorithms);
+  else activate_kernel<Layout::Grouped><<<(slots+255)/256,256,0,stream>>>(v,mask,sources,due,slots,words,algorithm,algorithms);
+  check(cudaGetLastError());
 }
 void clear_slot_mask(uint64_t* mask,uint32_t vertices,uint32_t words,const uint8_t* reset,
                      uint32_t slots,cudaStream_t stream) {
@@ -656,24 +863,37 @@ void clear_slot_mask(uint64_t* mask,uint32_t vertices,uint32_t words,const uint8
 void shared_push(const Context& c) {
   // Launch for every possible frontier vertex because count is held on device.
   uint32_t warps=4; uint32_t blocks=std::min(65535u,(c.graph.vertices+warps-1)/warps);
-  if(c.frontier_output.mask && c.frontier_output.mask64)
-    push_kernel_mask64<<<blocks,warps*32,0,c.stream>>>(c);
-  else push_kernel<<<blocks,warps*32,0,c.stream>>>(c);
+  if(c.old_values.layout!=c.new_values.layout)throw std::invalid_argument("value layout mismatch");
+  if(c.frontier_output.mask && c.frontier_output.mask64){
+    if(c.old_values.layout==Layout::VertexMajor)push_kernel_mask64<Layout::VertexMajor><<<blocks,warps*32,0,c.stream>>>(c);
+    else push_kernel_mask64<Layout::Grouped><<<blocks,warps*32,0,c.stream>>>(c);
+  }else{
+    if(c.old_values.layout==Layout::VertexMajor)push_kernel<Layout::VertexMajor><<<blocks,warps*32,0,c.stream>>>(c);
+    else push_kernel<Layout::Grouped><<<blocks,warps*32,0,c.stream>>>(c);
+  }
   check(cudaGetLastError());
 }
 void dense_pull(const Context& c) {
   uint32_t tiles=(c.slots+31)/32;
   uint64_t count=uint64_t(c.graph.vertices)*tiles*32;
-  pull_kernel<<<(count+255)/256,256,0,c.stream>>>(c,tiles); check(cudaGetLastError());
+  if(c.old_values.layout!=c.new_values.layout)throw std::invalid_argument("value layout mismatch");
+  if(c.old_values.layout==Layout::VertexMajor)pull_kernel<Layout::VertexMajor><<<(count+255)/256,256,0,c.stream>>>(c,tiles);
+  else pull_kernel<Layout::Grouped><<<(count+255)/256,256,0,c.stream>>>(c,tiles);
+  check(cudaGetLastError());
 }
 void adaptive_push(const Context& c,const uint32_t* buckets,
                    const uint32_t counts[adaptive_push_bucket_count]) {
   uint32_t offset=0;
-  launch_adaptive_bucket<1,1>(c,buckets+offset,counts[0]);offset+=counts[0];
-  launch_adaptive_bucket<2,1>(c,buckets+offset,counts[1]);offset+=counts[1];
-  launch_adaptive_bucket<4,1>(c,buckets+offset,counts[2]);offset+=counts[2];
-  launch_adaptive_bucket<4,2>(c,buckets+offset,counts[3]);offset+=counts[3];
-  launch_adaptive_bucket<4,4>(c,buckets+offset,counts[4]);
+  if(c.old_values.layout!=c.new_values.layout)throw std::invalid_argument("value layout mismatch");
+#define GRAPHWEFT_ADAPTIVE(Storage) \
+  launch_adaptive_bucket<Storage,1,1>(c,buckets+offset,counts[0]);offset+=counts[0]; \
+  launch_adaptive_bucket<Storage,2,1>(c,buckets+offset,counts[1]);offset+=counts[1]; \
+  launch_adaptive_bucket<Storage,4,1>(c,buckets+offset,counts[2]);offset+=counts[2]; \
+  launch_adaptive_bucket<Storage,4,2>(c,buckets+offset,counts[3]);offset+=counts[3]; \
+  launch_adaptive_bucket<Storage,4,4>(c,buckets+offset,counts[4])
+  if(c.old_values.layout==Layout::VertexMajor){GRAPHWEFT_ADAPTIVE(Layout::VertexMajor);}
+  else {GRAPHWEFT_ADAPTIVE(Layout::Grouped);}
+#undef GRAPHWEFT_ADAPTIVE
   check(cudaGetLastError());
 }
 KernelId push_partition_id(int index) {
@@ -690,31 +910,65 @@ KernelId pull_partition_id(int index,bool check) {
   return static_cast<KernelId>(int(check?KernelId::PullCheckBase:KernelId::PullCheckFreeBase)+index);
 }
 PushPartition pull_partition(int index) { return push_partition(index); }
+KernelId vm_pull_id(bool parallel,uint32_t query_width) {
+  if(query_width!=32 && query_width!=16 && query_width!=8)
+    throw std::invalid_argument("invalid VM Pull query width");
+  if(parallel)return query_width==32?KernelId::VmParallelSmemShuffleQ32:
+    query_width==16?KernelId::VmParallelSmemShuffleQ16:KernelId::VmParallelSmemShuffleQ8;
+  return query_width==32?KernelId::VmFusedSerialSmemQ32:
+    query_width==16?KernelId::VmFusedSerialSmemQ16:KernelId::VmFusedSerialSmemQ8;
+}
+KernelId default_pull_kernel(uint32_t physical_slots,uint32_t vertices,uint64_t edges) {
+  if(!physical_slots || physical_slots%32 || physical_slots>256)return KernelId::DensePull;
+  const double mean_indegree=vertices?double(edges)/vertices:0;
+  return physical_slots<=32 || mean_indegree<20.0?KernelId::VmFusedSerialSmemQ32:
+                                                   KernelId::VmParallelSmemShuffleQ16;
+}
+bool is_pull_kernel(KernelId id) {
+  const int raw=int(id);
+  return id==KernelId::DensePull || id==KernelId::GroupedG8Edge4Warp4Pull ||
+    (raw>=int(KernelId::VmFusedSerialSmemQ32) && raw<=int(KernelId::VmParallelSmemShuffleQ8)) ||
+    (raw>=int(KernelId::PullCheckFreeBase) && raw<int(KernelId::PullCheckFreeBase)+pull_partition_count) ||
+    (raw>=int(KernelId::PullCheckBase) && raw<int(KernelId::PullCheckBase)+pull_partition_count);
+}
+template<Layout Storage>void launch_specialized(KernelId id,const Context& c) {
+  int pull_index=int(id)-int(KernelId::PullCheckFreeBase);
+  if(pull_index>=0 && pull_index<pull_partition_count){
+    launch_pull_group<Storage,false>(pull_index/5,pull_index%5,c);return;
+  }
+  pull_index=int(id)-int(KernelId::PullCheckBase);
+  if(pull_index>=0 && pull_index<pull_partition_count){
+    launch_pull_group<Storage,true>(pull_index/5,pull_index%5,c);return;
+  }
+  const int index=int(id)-int(KernelId::PushPartitionBase);
+  push_partition_id(index);
+  switch(index/5){
+    case 0:launch_grain<Storage,1>(index%5,c);break;
+    case 1:launch_grain<Storage,2>(index%5,c);break;
+    case 2:launch_grain<Storage,4>(index%5,c);break;
+    case 3:launch_grain<Storage,8>(index%5,c);break;
+    case 4:launch_grain<Storage,16>(index%5,c);break;
+    case 5:launch_grain<Storage,32>(index%5,c);break;
+  }
+}
 void launch(KernelId id,const Context& c) {
   if(id==KernelId::SharedPush){shared_push(c);return;}
   if(id==KernelId::DensePull){dense_pull(c);return;}
   if(id==KernelId::AdaptivePush)throw std::invalid_argument("adaptive Push requires prepared buckets");
   if(id==KernelId::GroupedG8Edge4Warp4Pull){
-    launch_grouped_g8_edge4_warp4_pull(c);check(cudaGetLastError());return;
+    if(c.old_values.layout==Layout::Grouped)launch_grouped_g8_edge4_warp4_pull(c);
+    else launch_pull_partition<Layout::VertexMajor,8,4,1,false>(c);
+    check(cudaGetLastError());return;
   }
-  int pull_index=int(id)-int(KernelId::PullCheckFreeBase);
-  if(pull_index>=0 && pull_index<pull_partition_count){
-    launch_pull_group<false>(pull_index/5,pull_index%5,c);check(cudaGetLastError());return;
-  }
-  pull_index=int(id)-int(KernelId::PullCheckBase);
-  if(pull_index>=0 && pull_index<pull_partition_count){
-    launch_pull_group<true>(pull_index/5,pull_index%5,c);check(cudaGetLastError());return;
-  }
-  int index=int(id)-int(KernelId::PushPartitionBase);
-  push_partition_id(index);
-  switch(index/5){
-    case 0:launch_grain<1>(index%5,c);break;
-    case 1:launch_grain<2>(index%5,c);break;
-    case 2:launch_grain<4>(index%5,c);break;
-    case 3:launch_grain<8>(index%5,c);break;
-    case 4:launch_grain<16>(index%5,c);break;
-    case 5:launch_grain<32>(index%5,c);break;
-  }
+  if(id==KernelId::VmFusedSerialSmemQ32){launch_vm_pull<32,false>(c);check(cudaGetLastError());return;}
+  if(id==KernelId::VmFusedSerialSmemQ16){launch_vm_pull<16,false>(c);check(cudaGetLastError());return;}
+  if(id==KernelId::VmFusedSerialSmemQ8){launch_vm_pull<8,false>(c);check(cudaGetLastError());return;}
+  if(id==KernelId::VmParallelSmemShuffleQ32){launch_vm_pull<32,true>(c);check(cudaGetLastError());return;}
+  if(id==KernelId::VmParallelSmemShuffleQ16){launch_vm_pull<16,true>(c);check(cudaGetLastError());return;}
+  if(id==KernelId::VmParallelSmemShuffleQ8){launch_vm_pull<8,true>(c);check(cudaGetLastError());return;}
+  if(c.old_values.layout!=c.new_values.layout)throw std::invalid_argument("value layout mismatch");
+  if(c.old_values.layout==Layout::VertexMajor)launch_specialized<Layout::VertexMajor>(id,c);
+  else launch_specialized<Layout::Grouped>(id,c);
   check(cudaGetLastError());
 }
 size_t stable_temp_bytes(uint32_t n) {
@@ -729,7 +983,10 @@ void build_frontier(const FrontierContext& c,cudaEvent_t compare_start,cudaEvent
   uint32_t n=c.old_values.vertices;
   check(cudaMemsetAsync(c.slot_count,0,size_t(c.slots)*sizeof(uint32_t),c.stream));
   if(compare_start)check(cudaEventRecord(compare_start,c.stream));
-  compare_kernel<<<(n+255)/256,256,0,c.stream>>>(c); check(cudaGetLastError());
+  if(c.old_values.layout!=c.new_values.layout)throw std::invalid_argument("value layout mismatch");
+  if(c.old_values.layout==Layout::VertexMajor)compare_kernel<Layout::VertexMajor><<<(n+255)/256,256,0,c.stream>>>(c);
+  else compare_kernel<Layout::Grouped><<<(n+255)/256,256,0,c.stream>>>(c);
+  check(cudaGetLastError());
   if(compare_end)check(cudaEventRecord(compare_end,c.stream));
   if(c.mode==FrontierMode::Unordered) {
     unordered_kernel<<<(n+255)/256,256,0,c.stream>>>(c.flags,c.list,c.count,n); check(cudaGetLastError());
@@ -843,12 +1100,12 @@ __device__ __forceinline__ uint64_t fingerprint_mix(uint64_t value) {
   value^=value>>27;value*=0x94d049bb133111ebULL;
   return value^(value>>31);
 }
-__global__ void fingerprint_kernel(ValueView values,uint32_t first_slot,uint64_t* sums,uint64_t* xors) {
+template<Layout Storage>__global__ void fingerprint_kernel(ValueView values,uint32_t first_slot,uint64_t* sums,uint64_t* xors) {
   const uint32_t local_slot=blockIdx.y,slot=first_slot+local_slot;
   uint64_t sum=0,xor_value=0;
   for(uint32_t vertex=blockIdx.x*blockDim.x+threadIdx.x;vertex<values.vertices;
       vertex+=gridDim.x*blockDim.x){
-    uint32_t bits=__float_as_uint(values.data[values.index(vertex,slot)]);
+    uint32_t bits=__float_as_uint(values.data[value_index<Storage>(values,vertex,slot)]);
     uint64_t mixed=fingerprint_mix((uint64_t(vertex)<<32)^bits^0x9e3779b97f4a7c15ULL);
     sum+=mixed;xor_value^=mixed;
   }
@@ -868,7 +1125,9 @@ void fingerprint_values(ValueView values,uint32_t first_slot,uint32_t slot_count
   check(cudaMemsetAsync(sums,0,size_t(slot_count)*sizeof(uint64_t),stream));
   check(cudaMemsetAsync(xors,0,size_t(slot_count)*sizeof(uint64_t),stream));
   uint32_t blocks=std::max(1u,std::min(4096u,(values.vertices+255)/256));
-  fingerprint_kernel<<<dim3(blocks,slot_count),256,0,stream>>>(values,first_slot,sums,xors);
+  if(values.layout==Layout::VertexMajor)
+    fingerprint_kernel<Layout::VertexMajor><<<dim3(blocks,slot_count),256,0,stream>>>(values,first_slot,sums,xors);
+  else fingerprint_kernel<Layout::Grouped><<<dim3(blocks,slot_count),256,0,stream>>>(values,first_slot,sums,xors);
   check(cudaGetLastError());
 }
 }

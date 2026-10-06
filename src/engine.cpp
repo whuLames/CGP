@@ -27,12 +27,20 @@ struct KernelDescription {
   const char* family;
   uint32_t group_size=0,warps_per_block=0,blocks_per_vertex=0;
   bool check=false;
+  const char* pull_mapping="";
+  uint32_t pull_query_width=0;
 };
 KernelDescription describe(KernelId id) {
   if(id==KernelId::SharedPush)return {"shared_push"};
   if(id==KernelId::DensePull)return {"dense_pull"};
   if(id==KernelId::AdaptivePush)return {"adaptive_push"};
   if(id==KernelId::GroupedG8Edge4Warp4Pull)return {"grouped_g8_edge4_warp4_pull",8,4,1,false};
+  if(id==KernelId::VmFusedSerialSmemQ32)return {"vm_fused_serial_smem",0,4,1,false,"serial",32};
+  if(id==KernelId::VmFusedSerialSmemQ16)return {"vm_fused_serial_smem",0,4,1,false,"serial",16};
+  if(id==KernelId::VmFusedSerialSmemQ8)return {"vm_fused_serial_smem",0,4,1,false,"serial",8};
+  if(id==KernelId::VmParallelSmemShuffleQ32)return {"vm_parallel_smem_shuffle",0,0,1,false,"parallel",32};
+  if(id==KernelId::VmParallelSmemShuffleQ16)return {"vm_parallel_smem_shuffle",0,0,1,false,"parallel",16};
+  if(id==KernelId::VmParallelSmemShuffleQ8)return {"vm_parallel_smem_shuffle",0,0,1,false,"parallel",8};
   int raw=int(id),base=int(KernelId::PullCheckFreeBase);
   bool check=false;
   if(raw>=int(KernelId::PullCheckBase) && raw<int(KernelId::PullCheckBase)+pull_partition_count){
@@ -222,6 +230,9 @@ RunStats run(const HostGraph& g,std::vector<Query> queries,const Options& o,cons
   DeviceGraph dg(g);
   auto task_wall_start=Clock::now();
   uint32_t q=o.capacity,words=(q+63)/64,p=physical_slots(o,q);size_t cells=mul(g.vertices,p);
+  // Options::layout remains a scheduling/padding contract.  Production value
+  // arrays are always physically [vertex][padded slot].
+  constexpr Layout storage_layout=Layout::VertexMajor;
   Device<float> value0(cells,"value0"),value1(cells,"value1");
   Device<uint64_t> mask0(mul(g.vertices,words),"mask0"),mask1(mul(g.vertices,words),"mask1");
   Device<uint32_t> list0(g.vertices,"frontier0"),list1(g.vertices,"frontier1"),flags(g.vertices,"flags");
@@ -269,7 +280,7 @@ RunStats run(const HostGraph& g,std::vector<Query> queries,const Options& o,cons
     if(!parent.empty())std::filesystem::create_directories(parent);
     round_metrics.open(o.round_metrics_path,std::ios::trunc);
     if(!round_metrics)throw std::runtime_error("cannot write round metrics: "+o.round_metrics_path);
-    round_metrics<<"batch,round,live_queries,kernel_id,kernel_family,group_size,warps_per_block,blocks_per_vertex,check,kernel_gpu_ms,adaptive_preparation_ms,adaptive_w1_vertices,adaptive_w2_vertices,adaptive_w4_vertices,adaptive_b2_vertices,adaptive_b4_vertices,frontier_vertices,vertex_pairs,edge_pairs,density,mean_active_queries,mean_degree,mean_edge_pairs,selector_ms,predicted_log_cost,predicted_relative_cost,iteration_model_version,group_mapping_launches,group_mapping_divergent,group_mappings\n";
+    round_metrics<<"batch,round,live_queries,kernel_id,kernel_family,pull_mapping,pull_query_width,group_size,warps_per_block,blocks_per_vertex,check,kernel_gpu_ms,adaptive_preparation_ms,adaptive_w1_vertices,adaptive_w2_vertices,adaptive_w4_vertices,adaptive_b2_vertices,adaptive_b4_vertices,frontier_vertices,vertex_pairs,edge_pairs,density,mean_active_queries,mean_degree,mean_edge_pairs,selector_ms,predicted_log_cost,predicted_relative_cost,iteration_model_version,group_mapping_launches,group_mapping_divergent,group_mappings\n";
   }
   bool checkpoint_saved=false;
   auto execution_start=Clock::now();
@@ -309,7 +320,7 @@ RunStats run(const HostGraph& g,std::vector<Query> queries,const Options& o,cons
     if(!o.group_refill)pending=used;
     sources.upload(host_sources);slot_algorithms.upload(host_algorithms);
     auto t=Clock::now();
-    initialize_values({old,g.vertices,p,o.group_width,o.layout},o.algorithm,slot_algorithms.get(),stream);
+    initialize_values({old,g.vertices,p,o.group_width,storage_layout},o.algorithm,slot_algorithms.get(),stream);
     clear_mask(current_mask,g.vertices,words,stream);clear_mask(next_mask,g.vertices,words,stream);
     check(cudaMemsetAsync(current_count,0,4,stream),"reset count");
     check(cudaStreamSynchronize(stream),"initialize batch");stats.initialization_ms+=elapsed(t);
@@ -324,8 +335,8 @@ RunStats run(const HostGraph& g,std::vector<Query> queries,const Options& o,cons
       if(activated){
         live.upload(host_live);due.upload(host_due);
         t=Clock::now();
-        activate({old,g.vertices,p,o.group_width,o.layout},current_mask,sources.get(),due.get(),q,words,o.algorithm,slot_algorithms.get(),stream);
-        FrontierContext fc{{old,g.vertices,p,o.group_width,o.layout},{next,g.vertices,p,o.group_width,o.layout},current_mask,
+        activate({old,g.vertices,p,o.group_width,storage_layout},current_mask,sources.get(),due.get(),q,words,o.algorithm,slot_algorithms.get(),stream);
+        FrontierContext fc{{old,g.vertices,p,o.group_width,storage_layout},{next,g.vertices,p,o.group_width,storage_layout},current_mask,
           flags.get(),current_list,current_count,current_pair,slot_counts.get(),live.get(),q,words,o.algorithm,o.frontier,
           temp.get(),o.frontier==FrontierMode::Stable?stable_temp_bytes(g.vertices):0,stream,slot_algorithms.get()};
         rebuild_frontier(fc);check(cudaStreamSynchronize(stream),"activate frontier");stats.frontier_ms+=elapsed(t);
@@ -342,7 +353,7 @@ RunStats run(const HostGraph& g,std::vector<Query> queries,const Options& o,cons
         break;
       }
       if(!checkpoint_saved && !o.checkpoint_path.empty() && global_round==o.checkpoint_round){
-        Checkpoint cp;cp.graph_identity=g.identity;cp.algorithm=o.algorithm;cp.layout=o.layout;
+        Checkpoint cp;cp.graph_identity=g.identity;cp.algorithm=o.algorithm;cp.layout=storage_layout;
         cp.vertices=g.vertices;cp.slots=q;cp.physical_slots=p;cp.group_width=o.group_width;
         cp.words=words;cp.round=global_round;
         check(cudaMemcpy(&cp.frontier_count,current_count,4,cudaMemcpyDeviceToHost),"checkpoint frontier count");
@@ -393,10 +404,12 @@ RunStats run(const HostGraph& g,std::vector<Query> queries,const Options& o,cons
       t=Clock::now();
       KernelId chosen=selector.choose({pairs,active,rho,g.edges()!=0,vertex_pairs,
         iteration_features?frontier_vertices:0,g.vertices,g.edges()},stats.rounds);
-      if(chosen==KernelId::DensePull ||
-         chosen==KernelId::GroupedG8Edge4Warp4Pull ||
-         (int(chosen)>=int(KernelId::PullCheckFreeBase) && int(chosen)<int(KernelId::PullCheckFreeBase)+pull_partition_count) ||
-         (int(chosen)>=int(KernelId::PullCheckBase) && int(chosen)<int(KernelId::PullCheckBase)+pull_partition_count))
+      // Preserve the Push/Pull decision exactly; only refine a default Pull
+      // into the VM family. Explicit Replay remains byte-for-byte ordered.
+      if(chosen==KernelId::DensePull && o.selector!=Options::Selector::Replay &&
+         p%32==0 && p<=256)
+        chosen=default_pull_kernel(p,g.vertices,g.edges());
+      if(is_pull_kernel(chosen))
         ++stats.pull_rounds;
       else ++stats.push_rounds;
       std::vector<int> round_group_mappings;
@@ -436,14 +449,14 @@ RunStats run(const HostGraph& g,std::vector<Query> queries,const Options& o,cons
           frontier_vertices=launch_frontier_size;
         }
       }
-      Context context{dg.view,{old,g.vertices,p,o.group_width,o.layout},{next,g.vertices,p,o.group_width,o.layout},
+      Context context{dg.view,{old,g.vertices,p,o.group_width,storage_layout},{next,g.vertices,p,o.group_width,storage_layout},
                       current_mask,current_list,current_count,live.get(),q,words,o.algorithm,stream,error.get(),launch_frontier_size,
                       slot_algorithms.get()};
       if(probe)probe(context,stats.batches-1,global_round);
       t=Clock::now();check(cudaMemcpyAsync(next,old,cells*sizeof(float),cudaMemcpyDeviceToDevice,stream),"value copy");
       check(cudaMemsetAsync(error.get(),0,4,stream),"error reset");
       check(cudaStreamSynchronize(stream),"copy");stats.copy_ms+=elapsed(t);
-      FrontierContext fc{{old,g.vertices,p,o.group_width,o.layout},{next,g.vertices,p,o.group_width,o.layout},next_mask,
+      FrontierContext fc{{old,g.vertices,p,o.group_width,storage_layout},{next,g.vertices,p,o.group_width,storage_layout},next_mask,
         flags.get(),next_list,next_count,next_pair,slot_counts.get(),live.get(),q,words,o.algorithm,o.frontier,
         temp.get(),o.frontier==FrontierMode::Stable?stable_temp_bytes(g.vertices):0,stream,slot_algorithms.get()};
       if(update_driven_frontier){
@@ -491,7 +504,7 @@ RunStats run(const HostGraph& g,std::vector<Query> queries,const Options& o,cons
       if(round_metrics.is_open()){
         auto d=describe(chosen);
         round_metrics<<(stats.batches-1)<<','<<global_round<<','<<active<<','<<int(chosen)<<','<<d.family<<','
-          <<d.group_size<<','<<d.warps_per_block<<','<<d.blocks_per_vertex<<','<<int(d.check)<<','<<kernel_gpu_ms<<','
+          <<d.pull_mapping<<','<<d.pull_query_width<<','<<d.group_size<<','<<d.warps_per_block<<','<<d.blocks_per_vertex<<','<<int(d.check)<<','<<kernel_gpu_ms<<','
           <<round_adaptive_preparation_ms<<','<<host_adaptive_counts[0]<<','<<host_adaptive_counts[1]<<','
           <<host_adaptive_counts[2]<<','<<host_adaptive_counts[3]<<','<<host_adaptive_counts[4]<<','
           <<(frontier_vertices==UINT32_MAX?0:frontier_vertices)<<','<<vertex_pairs<<','<<pairs<<','<<rho<<','
@@ -542,7 +555,7 @@ RunStats run(const HostGraph& g,std::vector<Query> queries,const Options& o,cons
       std::swap(current_count,next_count);std::swap(current_pair,next_pair);
       if(round_callback){
         RoundSnapshot snap{};snap.batch_index=stats.batches-1;snap.global_round=global_round;
-        snap.used_slots=used;snap.physical_slots=p;snap.words=words;snap.layout=o.layout;
+        snap.used_slots=used;snap.physical_slots=p;snap.words=words;snap.layout=storage_layout;
         for(uint32_t s=0;s<used;++s)if(slot_query[s]!=SIZE_MAX)snap.query_ids.push_back(queries[slot_query[s]].id);
         snap.values.resize(cells);snap.mask.resize(size_t(g.vertices)*words);
         uint32_t count=0;
@@ -598,7 +611,7 @@ RunStats run(const HostGraph& g,std::vector<Query> queries,const Options& o,cons
           if(o.copy_results_to_cpu){
             auto transfer_start=Clock::now();host_values.resize(cells);
             check(cudaMemcpy(host_values.data(),old,cells*sizeof(float),cudaMemcpyDeviceToHost),"reclaimed result transfer");
-            ValueView view{host_values.data(),g.vertices,p,o.group_width,o.layout};
+            ValueView view{host_values.data(),g.vertices,p,o.group_width,storage_layout};
             for(uint32_t base:reclaimed)for(uint32_t s=base;s<base+o.group_width;++s)if(slot_query[s]!=SIZE_MAX){
               const auto& query=queries[slot_query[s]];
               QueryResult result{query.id,query.source,completion[s],std::vector<float>(g.vertices)};
@@ -610,7 +623,7 @@ RunStats run(const HostGraph& g,std::vector<Query> queries,const Options& o,cons
           if(fingerprint_callback){
             std::vector<uint64_t> sums(o.group_width),xors(o.group_width);
             for(uint32_t base:reclaimed){
-              fingerprint_values({old,g.vertices,p,o.group_width,o.layout},base,o.group_width,
+              fingerprint_values({old,g.vertices,p,o.group_width,storage_layout},base,o.group_width,
                                  fingerprint_sum.get(),fingerprint_xor.get(),stream);
               check(cudaMemcpyAsync(sums.data(),fingerprint_sum.get(),o.group_width*sizeof(uint64_t),cudaMemcpyDeviceToHost,stream),"fingerprint sums");
               check(cudaMemcpyAsync(xors.data(),fingerprint_xor.get(),o.group_width*sizeof(uint64_t),cudaMemcpyDeviceToHost,stream),"fingerprint xors");
@@ -622,12 +635,7 @@ RunStats run(const HostGraph& g,std::vector<Query> queries,const Options& o,cons
           }
           std::fill(host_reset.begin(),host_reset.end(),0);
           const uint32_t resident_groups=occupied_groups-uint32_t(reclaimed.size());
-          const bool round_was_pull=chosen==KernelId::DensePull ||
-            chosen==KernelId::GroupedG8Edge4Warp4Pull ||
-            (int(chosen)>=int(KernelId::PullCheckFreeBase) &&
-             int(chosen)<int(KernelId::PullCheckFreeBase)+pull_partition_count) ||
-            (int(chosen)>=int(KernelId::PullCheckBase) &&
-             int(chosen)<int(KernelId::PullCheckBase)+pull_partition_count);
+          const bool round_was_pull=is_pull_kernel(chosen);
           const bool bridge_survives=bridge_base!=UINT32_MAX &&
             std::find(reclaimed.begin(),reclaimed.end(),bridge_base)==reclaimed.end();
           const bool old_cohort_completed=std::any_of(reclaimed.begin(),reclaimed.end(),
@@ -702,14 +710,14 @@ RunStats run(const HostGraph& g,std::vector<Query> queries,const Options& o,cons
           const bool live_after_reclaim=std::any_of(host_live.begin(),host_live.begin()+used,
                                                     [](uint8_t x){return x!=0;});
           for(uint32_t base:refilled_bases)
-            reset_slot_range({old,g.vertices,p,o.group_width,o.layout},base,o.group_width,
+            reset_slot_range({old,g.vertices,p,o.group_width,storage_layout},base,o.group_width,
                              host_algorithms[base],nullptr,stream);
           if(refilled || live_after_reclaim){
             reset.upload(host_reset);
             clear_slot_mask(current_mask,g.vertices,words,reset.get(),q,stream);
           }
           if(!refilled && live_after_reclaim){
-            FrontierContext refill_fc{{old,g.vertices,p,o.group_width,o.layout},{next,g.vertices,p,o.group_width,o.layout},current_mask,
+            FrontierContext refill_fc{{old,g.vertices,p,o.group_width,storage_layout},{next,g.vertices,p,o.group_width,storage_layout},current_mask,
               flags.get(),current_list,current_count,current_pair,slot_counts.get(),live.get(),q,words,o.algorithm,o.frontier,
               temp.get(),o.frontier==FrontierMode::Stable?stable_temp_bytes(g.vertices):0,stream,slot_algorithms.get()};
             rebuild_frontier(refill_fc);
@@ -722,7 +730,8 @@ RunStats run(const HostGraph& g,std::vector<Query> queries,const Options& o,cons
           int(chosen)<int(KernelId::PullCheckFreeBase)+pull_partition_count) ||
           (int(chosen)>=int(KernelId::PullCheckBase) &&
           int(chosen)<int(KernelId::PullCheckBase)+pull_partition_count) ||
-          chosen==KernelId::GroupedG8Edge4Warp4Pull;
+          chosen==KernelId::GroupedG8Edge4Warp4Pull ||
+          (int(chosen)>=int(KernelId::VmFusedSerialSmemQ32) && int(chosen)<=int(KernelId::VmParallelSmemShuffleQ8));
       spdlog::debug("scheduler round={} active={} edge_pairs={} density={} kernel={} kernel_id={}",global_round,active,pairs,rho,
                     chosen==KernelId::DensePull?"dense_pull":chosen==KernelId::SharedPush?"shared_push":partition_pull?"partition_pull":"partition_push",int(chosen));
       stats.round_ms+=elapsed(round_start);
@@ -733,7 +742,7 @@ RunStats run(const HostGraph& g,std::vector<Query> queries,const Options& o,cons
       check(cudaMemcpy(host_values.data(),old,cells*sizeof(float),cudaMemcpyDeviceToHost),"result transfer");
       for(uint32_t s=0;s<used;++s){
         QueryResult result{queries[begin+s].id,host_sources[s],completion[s],std::vector<float>(g.vertices)};
-        ValueView view{host_values.data(),g.vertices,p,o.group_width,o.layout};
+        ValueView view{host_values.data(),g.vertices,p,o.group_width,storage_layout};
         for(uint32_t v=0;v<g.vertices;++v)result.values[v]=host_values[view.index(v,s)];
         if(callback)callback(result);
       }
@@ -741,7 +750,7 @@ RunStats run(const HostGraph& g,std::vector<Query> queries,const Options& o,cons
     }
     if(fingerprint_callback && !o.group_refill){
       std::vector<uint64_t> sums(used),xors(used);
-      fingerprint_values({old,g.vertices,p,o.group_width,o.layout},0,used,
+      fingerprint_values({old,g.vertices,p,o.group_width,storage_layout},0,used,
                          fingerprint_sum.get(),fingerprint_xor.get(),stream);
       check(cudaMemcpyAsync(sums.data(),fingerprint_sum.get(),used*sizeof(uint64_t),cudaMemcpyDeviceToHost,stream),"fingerprint sums");
       check(cudaMemcpyAsync(xors.data(),fingerprint_xor.get(),used*sizeof(uint64_t),cudaMemcpyDeviceToHost,stream),"fingerprint xors");

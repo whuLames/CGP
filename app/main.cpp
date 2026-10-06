@@ -140,6 +140,12 @@ int main(int argc,char** argv){
       while(std::getline(in,token,',')){
         if(token=="push")o.replay.push_back(gw::KernelId::SharedPush);
         else if(token=="pull")o.replay.push_back(gw::KernelId::DensePull);
+        else if(token=="pull-vm-serial-q32")o.replay.push_back(gw::KernelId::VmFusedSerialSmemQ32);
+        else if(token=="pull-vm-serial-q16")o.replay.push_back(gw::KernelId::VmFusedSerialSmemQ16);
+        else if(token=="pull-vm-serial-q8")o.replay.push_back(gw::KernelId::VmFusedSerialSmemQ8);
+        else if(token=="pull-vm-parallel-q32")o.replay.push_back(gw::KernelId::VmParallelSmemShuffleQ32);
+        else if(token=="pull-vm-parallel-q16")o.replay.push_back(gw::KernelId::VmParallelSmemShuffleQ16);
+        else if(token=="pull-vm-parallel-q8")o.replay.push_back(gw::KernelId::VmParallelSmemShuffleQ8);
         else if(token=="pull-grouped-g8-edge4-warp4")
           o.replay.push_back(gw::KernelId::GroupedG8Edge4Warp4Pull);
         else {

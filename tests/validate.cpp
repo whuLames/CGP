@@ -92,6 +92,12 @@ int main(){
     ConfiguredSelector hybrid(o);o.selector=Options::Selector::Threshold;o.pull_threshold=.05;
     if(hybrid.choose(iteration_features,0)!=KernelId::DensePull || hybrid.used_iteration_model())
       throw std::runtime_error("iteration model ran on Pull round");
+    if(default_pull_kernel(32,100,5000)!=KernelId::VmFusedSerialSmemQ32 ||
+       default_pull_kernel(64,100,1900)!=KernelId::VmFusedSerialSmemQ32 ||
+       default_pull_kernel(64,100,2000)!=KernelId::VmParallelSmemShuffleQ16 ||
+       default_pull_kernel(33,100,5000)!=KernelId::DensePull ||
+       default_pull_kernel(288,100,5000)!=KernelId::DensePull)
+      throw std::runtime_error("default VM Pull selection boundary");
     const uint64_t loads[]={0,1,256,257,1024,1025,4096,4097,16384,16385};
     const int expected[]={-1,0,0,1,1,2,2,3,3,4};
     for(int i=0;i<10;++i)if(adaptive_push_bucket(loads[i])!=expected[i])
@@ -213,6 +219,20 @@ int main(){
       reused_across_algorithms|=algorithms[i]!=algorithms[i-1];
     if(!reused_across_algorithms)throw std::runtime_error("physical slots were not reused across algorithms");
   }
+  // Exercise each coalesced VM group-reset specialization, including a final
+  // partially filled logical group admitted through refill.
+  for(uint32_t width:{8u,16u,32u}){
+    Options o;o.algorithm=Algorithm::BFS;o.capacity=2*width;o.group_width=width;
+    o.layout=Layout::Grouped;o.group_refill=true;o.copy_results_to_cpu=true;
+    o.selector=Options::Selector::Push;o.frontier_build=FrontierBuildMode::Direct;
+    std::vector<Query> qs;for(uint32_t i=0;i<2*width+3;++i)qs.push_back({7000+i,i%directed.vertices});
+    std::map<uint64_t,QueryResult> results;
+    auto stats=run(directed,qs,o,[&](const QueryResult& r){results.emplace(r.id,r);});
+    if(results.size()!=qs.size() || !stats.group_refills)
+      throw std::runtime_error("VM group reset/refill accounting mismatch");
+    for(const auto& query:qs)if(results.at(query.id).values!=reference(directed,Algorithm::BFS,query.source))
+      throw std::runtime_error("VM group reset changed result");
+  }
   // Interference-aware refill may leave completed physical groups vacant, but
   // must eventually admit every waiting group without changing query results.
   for(auto selector:{Options::Selector::Push,Options::Selector::Threshold}){
@@ -266,8 +286,9 @@ int main(){
             target=a==Algorithm::SSWP?std::max(target,candidate):std::min(target,candidate);
           }
           for(uint32_t v=0;v<directed.vertices;++v){
-            size_t index=layout==Layout::VertexMajor?size_t(v)*snap.physical_slots+slot:
-              (size_t(slot/8)*directed.vertices+v)*8+slot%8;
+            if(snap.layout!=Layout::VertexMajor)
+              throw std::runtime_error("production snapshot is not vertex-major");
+            size_t index=size_t(v)*snap.physical_slots+slot;
             if(snap.values[index]!=next[v])throw std::runtime_error("round value mismatch");
             bool improved=a==Algorithm::SSWP?next[v]>previous[slot][v]:next[v]<previous[slot][v];
             if(improved)expected_mask[size_t(v)*2+slot/64]|=1ULL<<(slot%64);
