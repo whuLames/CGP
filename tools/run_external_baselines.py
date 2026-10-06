@@ -28,6 +28,8 @@ GRAPHS = {
     "indochina": Path("/home/zyl/data/ggr_data/graphweft-exact/indochina.gr"),
     "soc-orkut": Path("/home/zyl/data/ggr_data/singlegpu/soc-orkut.gr"),
     "soc-twitter": Path("/home/zyl/data/ggr_data/singlegpu/soc-twitter.gr"),
+    "roadNet-CA": Path("/home/zyl/data/ggr_data/roadNet-CA.gr"),
+    "roadNet-TX": Path("/home/zyl/data/ggr_data/roadNet-TX.gr"),
 }
 
 
@@ -186,9 +188,11 @@ def append_rows(path, rows):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, default=PROJECT / "experiments/20260928_external_baselines")
+    parser.add_argument("--workload-root", type=Path, default=WORKLOAD_ROOT,
+                        help="Root containing <dataset>/<algorithm>.csv or <dataset>/workloads/*.csv")
     parser.add_argument("--datasets", nargs="+", choices=tuple(GRAPHS), default=list(GRAPHS))
     parser.add_argument("--systems", nargs="+", choices=("gunrock", "groute"), default=["gunrock", "groute"])
-    parser.add_argument("--workloads", nargs="+", choices=("bfs", "sssp", "mixed_tail"),
+    parser.add_argument("--workloads", nargs="+", choices=("bfs", "sssp", "sswp", "mixed_tail"),
                         default=["bfs", "sssp", "mixed_tail"])
     parser.add_argument("--modes", nargs="+", choices=("sequential", "concurrent"),
                         default=["sequential", "concurrent"])
@@ -211,19 +215,29 @@ def main():
     for dataset in args.datasets:
         graph = GRAPHS[dataset]
         ordinary = {}
-        for algorithm in ("bfs", "sssp"):
-            rows = load_workload(WORKLOAD_ROOT / dataset / "workloads" / f"{algorithm}.csv")
+        required_algorithms = {workload for workload in args.workloads if workload != "mixed_tail"}
+        if "mixed_tail" in args.workloads:
+            required_algorithms.update(("bfs", "sssp"))
+        for algorithm in sorted(required_algorithms):
+            direct = args.workload_root / dataset / f"{algorithm}.csv"
+            workload_path = direct if direct.exists() else args.workload_root / dataset / "workloads" / f"{algorithm}.csv"
+            rows = load_workload(workload_path)
             ordinary[algorithm] = rows
             write_sources(args.output / "inputs" / dataset / f"{algorithm}.txt", rows)
-        mixed = load_workload(WORKLOAD_ROOT / dataset / "workloads/mixed_tail.csv")
-        mixed_parts = {"bfs": [r for r in mixed if r["algorithm"] == 0],
-                       "sssp": [r for r in mixed if r["algorithm"] == 1]}
-        for algorithm, rows in mixed_parts.items():
-            write_sources(args.output / "inputs" / dataset / f"mixed_tail-{algorithm}.txt", rows)
+        mixed_parts = {}
+        if "mixed_tail" in args.workloads:
+            mixed_path = args.workload_root / dataset / "mixed_tail.csv"
+            if not mixed_path.exists():
+                mixed_path = args.workload_root / dataset / "workloads/mixed_tail.csv"
+            mixed = load_workload(mixed_path)
+            mixed_parts = {"bfs": [r for r in mixed if r["algorithm"] == 0],
+                           "sssp": [r for r in mixed if r["algorithm"] == 1]}
+            for algorithm, rows in mixed_parts.items():
+                write_sources(args.output / "inputs" / dataset / f"mixed_tail-{algorithm}.txt", rows)
         for system in args.systems:
             capacities = {}
             if "concurrent" in args.modes:
-                for algorithm in ("bfs", "sssp"):
+                for algorithm in sorted(required_algorithms):
                     capacities[algorithm] = probe_capacity(system, dataset, algorithm, graph,
                         ordinary[algorithm], args.output, env, args.timeout)
             for workload in args.workloads:

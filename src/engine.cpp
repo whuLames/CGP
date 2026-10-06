@@ -94,6 +94,22 @@ void validate(const HostGraph& g,const Options& o,const std::vector<Query>& quer
   if((o.push_mapping==Options::PushMapping::Adaptive || o.push_mapping==Options::PushMapping::Iteration) &&
      (o.layout!=Layout::Grouped || o.group_width!=32))
     throw std::invalid_argument("adaptive/iteration Push mapping requires --layout=grouped --group_width=32");
+  if(o.eager_sssp_refill && !o.group_refill)
+    throw std::invalid_argument("eager SSSP refill requires group refill");
+  if(o.interference_aware_refill && !o.group_refill)
+    throw std::invalid_argument("interference-aware refill requires group refill");
+  if(o.interference_bridge_refill && !o.group_refill)
+    throw std::invalid_argument("interference bridge refill requires group refill");
+  if(o.interference_aware_refill && o.eager_sssp_refill)
+    throw std::invalid_argument("interference-aware and eager SSSP refill are mutually exclusive");
+  if(o.interference_bridge_refill && (o.eager_sssp_refill || o.interference_aware_refill))
+    throw std::invalid_argument("interference bridge refill is mutually exclusive with other experimental refill policies");
+  if(o.interference_bridge_refill && o.predictor!=Options::Predictor::ImportedKey)
+    throw std::invalid_argument("interference bridge refill requires imported length-prediction keys");
+  if(!o.refill_max_active_groups)
+    throw std::invalid_argument("refill active-group budget must be positive");
+  if(o.group_iteration_mapping && (!o.group_refill || o.push_mapping!=Options::PushMapping::Iteration))
+    throw std::invalid_argument("group Iteration mapping requires group refill and iteration Push mapping");
   if((o.group_refill||o.same_algorithm_groups) && (o.capacity%o.group_width)!=0)throw std::invalid_argument("group scheduling requires capacity divisible by group width");
   if(o.group_refill && o.use_offsets)throw std::invalid_argument("group refill uses zero offsets");
   std::unordered_set<uint64_t> ids;
@@ -132,6 +148,8 @@ AllocationPlan allocation_plan(const HostGraph& g,const Options& o,uint32_t q) {
   // lookup must also be valid for padded physical slots.
   a.bytes["slot_algorithms"]=mul(p,sizeof(Algorithm));
   a.bytes["group_metadata"]=mul((q+o.group_width-1)/o.group_width,32);
+  a.bytes["group_iteration_features"]=o.group_iteration_mapping?
+    mul((q+o.group_width-1)/o.group_width,sizeof(uint32_t)+2*sizeof(uint64_t)):0;
   a.bytes["scalars"]=2*4+3*8+4;
   a.bytes["stable_temp"]=o.frontier==FrontierMode::Stable?stable_temp_bytes(g.vertices):0;
   a.bytes["adaptive_categories"]=o.push_mapping==Options::PushMapping::Adaptive?mul(v,1):0;
@@ -213,6 +231,10 @@ RunStats run(const HostGraph& g,std::vector<Query> queries,const Options& o,cons
   Device<uint8_t> reset(q,"reset");
   Device<Algorithm> slot_algorithms(p,"slot algorithms");
   Device<uint64_t> pair0(1,"pair0"),pair1(1,"pair1"),edge_pairs(1,"edge_pairs");
+  const uint32_t group_count=q/o.group_width;
+  Device<uint32_t> group_frontier_vertices(o.group_iteration_mapping?group_count:0,"group frontier vertices");
+  Device<uint64_t> group_vertex_pairs(o.group_iteration_mapping?group_count:0,"group vertex pairs");
+  Device<uint64_t> group_edge_pairs(o.group_iteration_mapping?group_count:0,"group edge pairs");
   Device<uint8_t> adaptive_categories(o.push_mapping==Options::PushMapping::Adaptive?g.vertices:0,"adaptive categories");
   Device<uint32_t> adaptive_buckets(o.push_mapping==Options::PushMapping::Adaptive?g.vertices:0,"adaptive buckets");
   Device<uint32_t> adaptive_counts(o.push_mapping==Options::PushMapping::Adaptive?adaptive_push_bucket_count:0,"adaptive counts");
@@ -237,6 +259,9 @@ RunStats run(const HostGraph& g,std::vector<Query> queries,const Options& o,cons
   std::vector<uint32_t> host_sources(q),host_slot_counts(q),start_round(q),completion(q);
   std::vector<double> activation_wall_ms(q,0.0);
   std::vector<uint64_t> host_active_words(words);
+  std::vector<uint32_t> host_group_frontier_vertices(group_count);
+  std::vector<uint64_t> host_group_vertex_pairs(group_count),host_group_edge_pairs(group_count);
+  std::vector<uint8_t> group_launch_live(q);
   ConfiguredSelector selector(o);
   std::ofstream round_metrics;
   if(!o.round_metrics_path.empty()){
@@ -244,7 +269,7 @@ RunStats run(const HostGraph& g,std::vector<Query> queries,const Options& o,cons
     if(!parent.empty())std::filesystem::create_directories(parent);
     round_metrics.open(o.round_metrics_path,std::ios::trunc);
     if(!round_metrics)throw std::runtime_error("cannot write round metrics: "+o.round_metrics_path);
-    round_metrics<<"batch,round,live_queries,kernel_id,kernel_family,group_size,warps_per_block,blocks_per_vertex,check,kernel_gpu_ms,adaptive_preparation_ms,adaptive_w1_vertices,adaptive_w2_vertices,adaptive_w4_vertices,adaptive_b2_vertices,adaptive_b4_vertices,frontier_vertices,vertex_pairs,edge_pairs,density,mean_active_queries,mean_degree,mean_edge_pairs,selector_ms,predicted_log_cost,predicted_relative_cost,iteration_model_version\n";
+    round_metrics<<"batch,round,live_queries,kernel_id,kernel_family,group_size,warps_per_block,blocks_per_vertex,check,kernel_gpu_ms,adaptive_preparation_ms,adaptive_w1_vertices,adaptive_w2_vertices,adaptive_w4_vertices,adaptive_b2_vertices,adaptive_b4_vertices,frontier_vertices,vertex_pairs,edge_pairs,density,mean_active_queries,mean_degree,mean_edge_pairs,selector_ms,predicted_log_cost,predicted_relative_cost,iteration_model_version,group_mapping_launches,group_mapping_divergent,group_mappings\n";
   }
   bool checkpoint_saved=false;
   auto execution_start=Clock::now();
@@ -265,6 +290,7 @@ RunStats run(const HostGraph& g,std::vector<Query> queries,const Options& o,cons
     std::fill(completion.begin(),completion.end(),0);std::fill(slot_query.begin(),slot_query.end(),SIZE_MAX);
     std::fill(activation_wall_ms.begin(),activation_wall_ms.end(),0.0);
     size_t next_query=begin;uint32_t pending=0,global_round=0,last_refill_round=0;
+    uint32_t bridge_base=UINT32_MAX;bool bridge_attempted=false;
     auto fill_group=[&](uint32_t base){
       if(next_query>=queries.size())return uint32_t(0);
       Algorithm a=queries[next_query].algorithm<0?o.algorithm:Algorithm(queries[next_query].algorithm);
@@ -303,7 +329,10 @@ RunStats run(const HostGraph& g,std::vector<Query> queries,const Options& o,cons
           flags.get(),current_list,current_count,current_pair,slot_counts.get(),live.get(),q,words,o.algorithm,o.frontier,
           temp.get(),o.frontier==FrontierMode::Stable?stable_temp_bytes(g.vertices):0,stream,slot_algorithms.get()};
         rebuild_frontier(fc);check(cudaStreamSynchronize(stream),"activate frontier");stats.frontier_ms+=elapsed(t);
-        const double activation_timestamp_ms=elapsed(task_start);
+        // Query latency starts when execution begins, after one-time graph and
+        // device setup.  Those costs are not queueing delay and can vary by
+        // seconds between otherwise identical large-graph processes.
+        const double activation_timestamp_ms=elapsed(execution_start);
         for(uint32_t s=0;s<used;++s)if(host_due[s])activation_wall_ms[s]=activation_timestamp_ms;
       }
       uint32_t active=0;for(uint32_t s=0;s<used;++s)active+=host_live[s];
@@ -340,6 +369,19 @@ RunStats run(const HostGraph& g,std::vector<Query> queries,const Options& o,cons
         classify_edge_pairs(dg.view,current_mask,current_list,current_count,words,edge_pairs.get(),
                             adaptive_categories.get(),adaptive_counts.get(),stream);
       else count_edge_pairs(dg.view,current_mask,current_list,current_count,words,edge_pairs.get(),stream);
+      if(o.group_iteration_mapping){
+        check(cudaMemsetAsync(group_frontier_vertices.get(),0,group_count*sizeof(uint32_t),stream),"reset group frontier features");
+        check(cudaMemsetAsync(group_vertex_pairs.get(),0,group_count*sizeof(uint64_t),stream),"reset group vertex features");
+        check(cudaMemsetAsync(group_edge_pairs.get(),0,group_count*sizeof(uint64_t),stream),"reset group edge features");
+        count_group_features(dg.view,current_mask,current_list,current_count,words,group_count,
+                             group_frontier_vertices.get(),group_vertex_pairs.get(),group_edge_pairs.get(),stream);
+        check(cudaMemcpyAsync(host_group_frontier_vertices.data(),group_frontier_vertices.get(),
+                              group_count*sizeof(uint32_t),cudaMemcpyDeviceToHost,stream),"group frontier features");
+        check(cudaMemcpyAsync(host_group_vertex_pairs.data(),group_vertex_pairs.get(),
+                              group_count*sizeof(uint64_t),cudaMemcpyDeviceToHost,stream),"group vertex features");
+        check(cudaMemcpyAsync(host_group_edge_pairs.data(),group_edge_pairs.get(),
+                              group_count*sizeof(uint64_t),cudaMemcpyDeviceToHost,stream),"group edge features");
+      }
       check(cudaMemcpyAsync(&pairs,edge_pairs.get(),8,cudaMemcpyDeviceToHost,stream),"edge pairs");
       check(cudaMemcpyAsync(&vertex_pairs,current_pair,8,cudaMemcpyDeviceToHost,stream),"vertex pairs");
       if(iteration_features)check(cudaMemcpyAsync(&frontier_vertices,current_count,4,cudaMemcpyDeviceToHost,stream),"iteration frontier count");
@@ -357,6 +399,21 @@ RunStats run(const HostGraph& g,std::vector<Query> queries,const Options& o,cons
          (int(chosen)>=int(KernelId::PullCheckBase) && int(chosen)<int(KernelId::PullCheckBase)+pull_partition_count))
         ++stats.pull_rounds;
       else ++stats.push_rounds;
+      std::vector<int> round_group_mappings;
+      if(o.group_iteration_mapping && int(chosen)>=int(KernelId::PushPartitionBase) &&
+         int(chosen)<int(KernelId::PushPartitionBase)+push_partition_count){
+        round_group_mappings.assign(group_count,-1);
+        for(uint32_t group=0;group<group_count;++group){
+          uint32_t group_active=0;
+          for(uint32_t s=group*o.group_width;s<(group+1)*o.group_width;++s)group_active+=host_live[s];
+          if(!group_active)continue;
+          const double group_density=g.edges()?double(host_group_edge_pairs[group])/
+            (double(g.edges())*group_active):0;
+          auto prediction=predict_iteration_push({host_group_edge_pairs[group],group_active,group_density,
+            g.edges()!=0,host_group_vertex_pairs[group],host_group_frontier_vertices[group],g.vertices,g.edges()});
+          round_group_mappings[group]=prediction.candidate;
+        }
+      }
       const double round_selector_ms=elapsed(t);stats.selector_ms+=round_selector_ms;
       if(chosen==KernelId::AdaptivePush){
         auto feature_start=Clock::now();
@@ -398,7 +455,27 @@ RunStats run(const HostGraph& g,std::vector<Query> queries,const Options& o,cons
       }
       t=Clock::now();
       if(profile_kernel)check(cudaEventRecord(kernel_start.get(),stream),"kernel event start");
-      if(chosen==KernelId::AdaptivePush)adaptive_push(context,adaptive_buckets.get(),host_adaptive_counts);
+      uint32_t round_group_launches=0;
+      bool round_group_divergent=false;
+      if(!round_group_mappings.empty()){
+        std::vector<int> distinct;
+        for(int candidate:round_group_mappings)if(candidate>=0 &&
+            std::find(distinct.begin(),distinct.end(),candidate)==distinct.end())distinct.push_back(candidate);
+        round_group_launches=uint32_t(distinct.size());round_group_divergent=distinct.size()>1;
+        ++stats.group_mapping_rounds;stats.group_mapping_launches+=round_group_launches;
+        stats.group_mapping_divergent_rounds+=round_group_divergent;
+        for(int candidate:distinct){
+          std::fill(group_launch_live.begin(),group_launch_live.end(),0);
+          for(uint32_t group=0;group<group_count;++group)if(round_group_mappings[group]==candidate)
+            std::copy(host_live.begin()+group*o.group_width,host_live.begin()+(group+1)*o.group_width,
+                      group_launch_live.begin()+group*o.group_width);
+          check(cudaMemcpyAsync(live.get(),group_launch_live.data(),q*sizeof(uint8_t),cudaMemcpyHostToDevice,stream),
+                "group mapping live mask");
+          launch(push_partition_id(candidate),context);
+        }
+        check(cudaMemcpyAsync(live.get(),host_live.data(),q*sizeof(uint8_t),cudaMemcpyHostToDevice,stream),
+              "restore live mask");
+      }else if(chosen==KernelId::AdaptivePush)adaptive_push(context,adaptive_buckets.get(),host_adaptive_counts);
       else launch(chosen,context);
       if(profile_kernel)check(cudaEventRecord(kernel_end.get(),stream),"kernel event end");
       check(cudaStreamSynchronize(stream),"kernel");stats.kernel_ms+=elapsed(t);
@@ -426,6 +503,8 @@ RunStats run(const HostGraph& g,std::vector<Query> queries,const Options& o,cons
           <<selector.iteration_prediction().relative_cost<<',';
         else round_metrics<<"nan,nan,";
         if(o.push_mapping==Options::PushMapping::Iteration)round_metrics<<iteration_model_version();
+        round_metrics<<','<<round_group_launches<<','<<int(round_group_divergent)<<',';
+        for(size_t i=0;i<round_group_mappings.size();++i){if(i)round_metrics<<'|';round_metrics<<round_group_mappings[i];}
         round_metrics<<'\n';
         if(!round_metrics)throw std::runtime_error("round metrics write failed: "+o.round_metrics_path);
       }
@@ -441,7 +520,7 @@ RunStats run(const HostGraph& g,std::vector<Query> queries,const Options& o,cons
       else
         check(cudaMemcpyAsync(host_slot_counts.data(),slot_counts.get(),size_t(q)*4,cudaMemcpyDeviceToHost,stream),"slot counts");
       check(cudaStreamSynchronize(stream),"frontier");stats.frontier_ms+=elapsed(t);
-      const double completion_timestamp_ms=elapsed(task_start);
+      const double completion_timestamp_ms=elapsed(execution_start);
       if(o.profile_compare && o.frontier_build==FrontierBuildMode::Scan){
         float ms=0;check(cudaEventElapsedTime(&ms,compare_start.get(),compare_end.get()),"compare elapsed");stats.compare_ms+=ms;
       }
@@ -505,7 +584,15 @@ RunStats run(const HostGraph& g,std::vector<Query> queries,const Options& o,cons
         // soon as an individual group completes.
         const uint32_t resident_algorithms=uint32_t(resident_algorithm[0])+uint32_t(resident_algorithm[1])+
           uint32_t(resident_algorithm[2]);
-        if(resident_algorithms>1 && reclaimed.size()<occupied_groups)reclaimed.clear();
+        // SSSP is also wave-scheduled: advancing one SSSP group ahead of its
+        // peers changes the resident frontier mix enough to cost more kernel
+        // time than refill can recover on the long-tail workloads.  BFS keeps
+        // eager refill, where the shorter rounds do benefit from replenishment.
+        const bool sssp_wave=!o.eager_sssp_refill && !o.interference_aware_refill &&
+          !o.interference_bridge_refill && resident_algorithms==1 &&
+          resident_algorithm[int(Algorithm::SSSP)];
+        if((resident_algorithms>1 || sssp_wave) && reclaimed.size()<occupied_groups)
+          reclaimed.clear();
         if(!reclaimed.empty()){
           auto recycle_start=Clock::now();
           if(o.copy_results_to_cpu){
@@ -534,14 +621,76 @@ RunStats run(const HostGraph& g,std::vector<Query> queries,const Options& o,cons
             }
           }
           std::fill(host_reset.begin(),host_reset.end(),0);
-          bool refilled=false;
-          std::vector<uint32_t> refilled_bases;
+          const uint32_t resident_groups=occupied_groups-uint32_t(reclaimed.size());
+          const bool round_was_pull=chosen==KernelId::DensePull ||
+            chosen==KernelId::GroupedG8Edge4Warp4Pull ||
+            (int(chosen)>=int(KernelId::PullCheckFreeBase) &&
+             int(chosen)<int(KernelId::PullCheckFreeBase)+pull_partition_count) ||
+            (int(chosen)>=int(KernelId::PullCheckBase) &&
+             int(chosen)<int(KernelId::PullCheckBase)+pull_partition_count);
+          const bool bridge_survives=bridge_base!=UINT32_MAX &&
+            std::find(reclaimed.begin(),reclaimed.end(),bridge_base)==reclaimed.end();
+          const bool old_cohort_completed=std::any_of(reclaimed.begin(),reclaimed.end(),
+            [&](uint32_t base){return base!=bridge_base;});
           for(uint32_t base:reclaimed){
             for(uint32_t s=base;s<base+o.group_width;++s){host_reset[s]=1;host_live[s]=host_due[s]=0;
               slot_query[s]=SIZE_MAX;start_round[s]=UINT32_MAX;completion[s]=0;activation_wall_ms[s]=0;
               host_sources[s]=0;host_algorithms[s]=o.algorithm;}
-            if(fill_group(base)){++stats.group_refills;last_refill_round=global_round+1;refilled=true;
+          }
+          if(bridge_base!=UINT32_MAX && !bridge_survives)bridge_base=UINT32_MAX;
+          std::vector<uint32_t> available_bases;
+          for(uint32_t base=0;base<q;base+=o.group_width)if(slot_query[base]==SIZE_MAX)
+            available_bases.push_back(base);
+          const uint32_t waiting_groups=uint32_t((queries.size()-next_query+o.group_width-1)/o.group_width);
+          const uint32_t eligible_groups=std::min<uint32_t>(uint32_t(available_bases.size()),waiting_groups);
+          uint64_t resident_prediction_key=0,candidate_prediction_key=0;
+          for(uint32_t s=0;s<q;++s)if(host_live[s] && slot_query[s]!=SIZE_MAX)
+            resident_prediction_key=std::max(resident_prediction_key,queries[slot_query[s]].feature_key);
+          for(size_t i=next_query;i<std::min(queries.size(),next_query+o.group_width);++i)
+            candidate_prediction_key=std::max(candidate_prediction_key,queries[i].feature_key);
+          // Imported weighted-boundary keys are ordered with predicted-long
+          // groups first.  Admit a bridge only if it is at least as long as
+          // the lone resident group; short groups do not preempt a long tail.
+          const bool bridge_compatible=candidate_prediction_key<=resident_prediction_key;
+          uint32_t admission_budget=std::min<uint32_t>(uint32_t(reclaimed.size()),eligible_groups);
+          bool opening_bridge=false;
+          if(o.interference_aware_refill && resident_groups){
+            if(round_was_pull)admission_budget=0;
+            else if(resident_groups>=o.refill_max_active_groups)admission_budget=0;
+            else admission_budget=std::min<uint32_t>(admission_budget,
+              o.refill_max_active_groups-resident_groups);
+          }else if(o.interference_bridge_refill){
+            admission_budget=0;
+            if(!resident_groups){
+              admission_budget=eligible_groups;bridge_attempted=false;bridge_base=UINT32_MAX;
+            }else if(bridge_survives && old_cohort_completed){
+              // The old cohort drained while its one bridge group is still
+              // alive.  Fill every vacancy to recover normal batch width.
+              admission_budget=eligible_groups;bridge_attempted=false;bridge_base=UINT32_MAX;
+            }else if(!bridge_attempted && resident_groups==1 && !round_was_pull &&
+                     bridge_compatible && eligible_groups){
+              admission_budget=1;opening_bridge=true;
+            }
+          }
+          bool refilled=false;
+          std::vector<uint32_t> refilled_bases;
+          uint32_t admitted=0;
+          for(uint32_t base:available_bases){
+            if(admitted>=admission_budget)break;
+            for(uint32_t s=base;s<base+o.group_width;++s)host_reset[s]=1;
+            if(fill_group(base)){++admitted;++stats.group_refills;
+              ++stats.refill_admitted_groups;last_refill_round=global_round+1;refilled=true;
               refilled_bases.push_back(base);}
+          }
+          if(opening_bridge && admitted){bridge_base=refilled_bases.front();bridge_attempted=true;}
+          if((o.interference_aware_refill || o.interference_bridge_refill) && admitted<eligible_groups){
+            const uint64_t deferred=eligible_groups-admitted;
+            stats.refill_deferred_groups+=deferred;
+            if(round_was_pull && resident_groups)stats.refill_deferred_pull_groups+=deferred;
+            else if(o.interference_aware_refill && resident_groups>=o.refill_max_active_groups)
+              stats.refill_deferred_capacity_groups+=deferred;
+            else if(o.interference_bridge_refill && resident_groups==1 && !bridge_attempted &&
+                    !bridge_compatible)stats.refill_deferred_incompatible_groups+=deferred;
           }
           live.upload(host_live);sources.upload(host_sources);slot_algorithms.upload(host_algorithms);
           // Only `old` survives into the next iteration: the normal round copy

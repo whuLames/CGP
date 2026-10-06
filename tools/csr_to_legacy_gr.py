@@ -24,8 +24,10 @@ def main():
     weights_path = args.csr / "csr_weightlist.bin"
     offset_bytes = offsets_path.stat().st_size
     edge_bytes = edges_path.stat().st_size
-    if offset_bytes % 4 or edge_bytes % 4 or weights_path.stat().st_size != edge_bytes:
-        raise ValueError("expected int32 offsets, destinations and weights")
+    if offset_bytes % 4 or edge_bytes % 4:
+        raise ValueError("expected int32 offsets and destinations")
+    if weights_path.exists() and weights_path.stat().st_size != edge_bytes:
+        raise ValueError("CSR weight count mismatch")
     vertices = offset_bytes // 4 - 1
     edges = edge_bytes // 4
 
@@ -54,7 +56,15 @@ def main():
         padding = (8 - (edge_bytes % 8)) % 8
         if padding:
             output.write(bytes(padding))
-        copy_file(weights_path, output)
+        if weights_path.exists():
+            copy_file(weights_path, output)
+        else:
+            unit = struct.pack("<I", 1) * (1 << 20)
+            remaining = edges
+            while remaining:
+                count = min(remaining, 1 << 20)
+                output.write(unit[:count * 4])
+                remaining -= count
     os.replace(temporary, args.output)
     print(f"wrote {args.output}: V={vertices} E={edges}")
 

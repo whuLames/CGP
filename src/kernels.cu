@@ -778,6 +778,42 @@ void count_edge_pairs(GraphView g,const uint64_t* mask,const uint32_t* list,cons
   edge_pairs_kernel<<<(g.vertices+255)/256,256,0,stream>>>(g,mask,list,count,words,output);
   check(cudaGetLastError());
 }
+
+__global__ void count_group_features_kernel(GraphView g,const uint64_t* mask,
+                                            const uint32_t* list,const uint32_t* count,
+                                            uint32_t words,uint32_t group_count,
+                                            uint32_t* frontier_vertices,
+                                            uint64_t* vertex_pairs,uint64_t* edge_pairs) {
+  uint32_t index=blockIdx.x*blockDim.x+threadIdx.x;
+  if(index>=*count)return;
+  const uint32_t vertex=list[index];
+  const uint64_t degree=g.out_row[vertex+1]-g.out_row[vertex];
+  for(uint32_t group=0;group<group_count;++group){
+    const uint32_t first_slot=group*32;
+    const uint32_t word=first_slot/64;
+    const uint32_t shift=first_slot%64;
+    if(word>=words)break;
+    const uint32_t bits=uint32_t(mask[size_t(vertex)*words+word]>>shift);
+    if(!bits)continue;
+    const uint32_t pairs=__popc(bits);
+    atomicAdd(frontier_vertices+group,1u);
+    atomicAdd(reinterpret_cast<unsigned long long*>(vertex_pairs+group),
+              static_cast<unsigned long long>(pairs));
+    atomicAdd(reinterpret_cast<unsigned long long*>(edge_pairs+group),
+              static_cast<unsigned long long>(degree)*pairs);
+  }
+}
+
+void count_group_features(GraphView g,const uint64_t* mask,const uint32_t* list,
+                          const uint32_t* count,uint32_t words,
+                          uint32_t group_count,uint32_t* frontier_vertices,
+                          uint64_t* vertex_pairs,uint64_t* edge_pairs,
+                          cudaStream_t stream) {
+  if(!group_count)return;
+  count_group_features_kernel<<<(g.vertices+255)/256,256,0,stream>>>(
+    g,mask,list,count,words,group_count,frontier_vertices,vertex_pairs,edge_pairs);
+  check(cudaGetLastError());
+}
 void classify_edge_pairs(GraphView g,const uint64_t* mask,const uint32_t* list,
                          const uint32_t* count,uint32_t words,uint64_t* output,
                          uint8_t* categories,uint32_t* category_counts,

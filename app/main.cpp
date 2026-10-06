@@ -23,6 +23,11 @@ DEFINE_bool(auto_q,false,"Choose largest capacity within budget, bounded by N");
 DEFINE_string(layout,"vertex","vertex or grouped");
 DEFINE_int32(group_width,8,"Grouped layout width");
 DEFINE_bool(group_refill,false,"Reclaim and refill a same-algorithm group as soon as it completes");
+DEFINE_bool(eager_sssp_refill,false,"Experimental: refill completed SSSP groups without waiting for a synchronized wave");
+DEFINE_bool(interference_aware_refill,false,"Selectively refill only under a Push round and a bounded active-group budget");
+DEFINE_int32(refill_max_active_groups,2,"Maximum simultaneously resident groups after interference-aware refill");
+DEFINE_bool(interference_bridge_refill,false,"Give one next-cohort group a Push-only head start, then restore full cohorts");
+DEFINE_bool(group_iteration_mapping,false,"Experimental: select Iteration Push mapping per G and merge equal mappings");
 DEFINE_bool(same_algorithm_groups,false,"Form same-algorithm groups even with batch-barrier reclamation");
 DEFINE_bool(oracle_order,false,"Diagnostic only: sort within each algorithm by imported reference rounds");
 DEFINE_string(planner,"fifo","fifo or length");
@@ -87,6 +92,12 @@ int main(int argc,char** argv){
     if(FLAGS_group_width<=0 || FLAGS_q<=0)throw std::invalid_argument("Q and group width must be positive");
     o.group_width=FLAGS_group_width;o.capacity=FLAGS_q;o.use_offsets=FLAGS_offsets;
     o.group_refill=FLAGS_group_refill;o.same_algorithm_groups=FLAGS_same_algorithm_groups||FLAGS_group_refill;
+    o.eager_sssp_refill=FLAGS_eager_sssp_refill;
+    o.interference_aware_refill=FLAGS_interference_aware_refill;
+    o.interference_bridge_refill=FLAGS_interference_bridge_refill;
+    if(FLAGS_refill_max_active_groups<=0)throw std::invalid_argument("--refill_max_active_groups must be positive");
+    o.refill_max_active_groups=uint32_t(FLAGS_refill_max_active_groups);
+    o.group_iteration_mapping=FLAGS_group_iteration_mapping;
     o.oracle_order=FLAGS_oracle_order;
     if(FLAGS_offset_source=="phase")o.phase_offsets=true;
     else if(FLAGS_offset_source!="import")throw std::invalid_argument("invalid offset source");
@@ -102,6 +113,20 @@ int main(int argc,char** argv){
     if((o.push_mapping==gw::Options::PushMapping::Adaptive || o.push_mapping==gw::Options::PushMapping::Iteration) &&
        (o.layout!=gw::Layout::Grouped || o.group_width!=32))
       throw std::invalid_argument(FLAGS_push_mapping+" Push mapping requires --layout=grouped --group_width=32");
+    if(o.eager_sssp_refill && !o.group_refill)
+      throw std::invalid_argument("--eager_sssp_refill requires --group_refill");
+    if(o.interference_aware_refill && !o.group_refill)
+      throw std::invalid_argument("--interference_aware_refill requires --group_refill");
+    if(o.interference_bridge_refill && !o.group_refill)
+      throw std::invalid_argument("--interference_bridge_refill requires --group_refill");
+    if(o.interference_aware_refill && o.eager_sssp_refill)
+      throw std::invalid_argument("--interference_aware_refill and --eager_sssp_refill are mutually exclusive");
+    if(o.interference_bridge_refill && (o.eager_sssp_refill || o.interference_aware_refill))
+      throw std::invalid_argument("--interference_bridge_refill is mutually exclusive with other experimental refill policies");
+    if(o.interference_bridge_refill && o.predictor!=gw::Options::Predictor::ImportedKey)
+      throw std::invalid_argument("--interference_bridge_refill requires --predictor=import_key");
+    if(o.group_iteration_mapping && (!o.group_refill || o.push_mapping!=gw::Options::PushMapping::Iteration))
+      throw std::invalid_argument("--group_iteration_mapping requires --group_refill --push_mapping=iteration");
     o.push_query_lanes=FLAGS_push_query_lanes;o.push_grain=FLAGS_push_grain;
     o.copy_results_to_cpu=FLAGS_copy_results_to_cpu || !FLAGS_binary_output.empty();o.profile_compare=FLAGS_profile_compare;
     o.profile_kernel=FLAGS_profile_kernel;o.round_metrics_path=FLAGS_round_metrics;
@@ -247,6 +272,14 @@ int main(int argc,char** argv){
              <<" copy_ms="<<stats.copy_ms<<" kernel_ms="<<stats.kernel_ms<<" kernel_gpu_ms="<<stats.kernel_gpu_ms
              <<" frontier_ms="<<stats.frontier_ms<<" compare_ms="<<stats.compare_ms<<" feature_ms="<<stats.feature_ms<<" adaptive_preparation_ms="<<stats.adaptive_preparation_ms<<" selector_ms="<<stats.selector_ms<<" round_ms="<<stats.round_ms
              <<" transfer_ms="<<stats.transfer_ms<<" group_refills="<<stats.group_refills
+             <<" refill_admitted_groups="<<stats.refill_admitted_groups
+             <<" refill_deferred_groups="<<stats.refill_deferred_groups
+             <<" refill_deferred_pull_groups="<<stats.refill_deferred_pull_groups
+             <<" refill_deferred_capacity_groups="<<stats.refill_deferred_capacity_groups
+             <<" refill_deferred_incompatible_groups="<<stats.refill_deferred_incompatible_groups
+             <<" group_mapping_rounds="<<stats.group_mapping_rounds
+             <<" group_mapping_divergent_rounds="<<stats.group_mapping_divergent_rounds
+             <<" group_mapping_launches="<<stats.group_mapping_launches
              <<" completed_slot_rounds="<<stats.completed_slot_rounds<<" final_drain_rounds="<<stats.final_drain_rounds<<" active_slot_ratio="
              <<(stats.capacity_slot_rounds?double(stats.active_slot_rounds)/stats.capacity_slot_rounds:0.0)<<'\n';
     return 0;

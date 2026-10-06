@@ -1,0 +1,6 @@
+graph=c476f4df35515f1e V=2997166 E=212698418 Q=32 gpu=0
+q16_w1,baseline_ms=35.418114,candidate_ms=38.127617,speedup=0.928936,edge_groups=2,queries_per_lane=2,exact=1
+q8_w1,baseline_ms=35.418114,candidate_ms=36.559872,speedup=0.968770,edge_groups=4,queries_per_lane=4,exact=1
+q4_w1,baseline_ms=35.422207,candidate_ms=38.114304,speedup=0.929368,edge_groups=8,queries_per_lane=8,exact=1
+q2_w1,baseline_ms=35.421185,candidate_ms=67.353600,speedup=0.525899,edge_groups=16,queries_per_lane=16,exact=1
+q1_w1,baseline_ms=35.417088,candidate_ms=101.204994,speedup=0.349954,edge_groups=32,queries_per_lane=32,exact=1

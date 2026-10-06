@@ -1,0 +1,8 @@
+graph=602c3c05f06f04f5 V=1965206 E=5533214 Q=32 gpu=0
+adaptive,C=32,baseline_ms=1.590272,adaptive_ms=1.589248,speedup=1.000644,W1_V=1965206,W1_E=5533214,W2_V=0,W2_E=0,W4_V=0,W4_E=0,W8_V=0,W8_E=0,exact=1
+adaptive,C=64,baseline_ms=1.540096,adaptive_ms=1.538048,speedup=1.001332,W1_V=1965206,W1_E=5533214,W2_V=0,W2_E=0,W4_V=0,W4_E=0,W8_V=0,W8_E=0,exact=1
+adaptive,C=128,baseline_ms=1.504256,adaptive_ms=1.503232,speedup=1.000681,W1_V=1965206,W1_E=5533214,W2_V=0,W2_E=0,W4_V=0,W4_E=0,W8_V=0,W8_E=0,exact=1
+adaptive,C=256,baseline_ms=1.503232,adaptive_ms=1.503232,speedup=1.000000,W1_V=1965206,W1_E=5533214,W2_V=0,W2_E=0,W4_V=0,W4_E=0,W8_V=0,W8_E=0,exact=1
+adaptive,C=512,baseline_ms=1.504256,adaptive_ms=1.503232,speedup=1.000681,W1_V=1965206,W1_E=5533214,W2_V=0,W2_E=0,W4_V=0,W4_E=0,W8_V=0,W8_E=0,exact=1
+adaptive,C=1024,baseline_ms=1.505280,adaptive_ms=1.504256,speedup=1.000681,W1_V=1965206,W1_E=5533214,W2_V=0,W2_E=0,W4_V=0,W4_E=0,W8_V=0,W8_E=0,exact=1
+adaptive,C=2048,baseline_ms=1.503232,adaptive_ms=1.503232,speedup=1.000000,W1_V=1965206,W1_E=5533214,W2_V=0,W2_E=0,W4_V=0,W4_E=0,W8_V=0,W8_E=0,exact=1

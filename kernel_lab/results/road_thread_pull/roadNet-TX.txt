@@ -1,0 +1,13 @@
+graph=6e7e85f09c88db7e V=1379917 E=3843320 Q=32 gpu=0
+TV-G1-QT4,baseline_ms=0.937984,candidate_ms=5.105664,speedup=0.183714,exact=1
+TV-G1-QT8,baseline_ms=0.903168,candidate_ms=2.754560,speedup=0.327881,exact=1
+TV-G1-QT16,baseline_ms=0.881664,candidate_ms=2.237440,speedup=0.394050,exact=1
+TV-G1-QT32,baseline_ms=0.880640,candidate_ms=2.312192,speedup=0.380868,exact=1
+TV-G2-QT4,baseline_ms=0.882688,candidate_ms=8.539136,speedup=0.103370,exact=1
+TV-G2-QT8,baseline_ms=0.882688,candidate_ms=3.718144,speedup=0.237400,exact=1
+TV-G2-QT16,baseline_ms=0.880640,candidate_ms=2.514944,speedup=0.350163,exact=1
+TV-G2-QT32,baseline_ms=0.880640,candidate_ms=2.368512,speedup=0.371812,exact=1
+TV-G4-QT4,baseline_ms=0.880640,candidate_ms=11.476992,speedup=0.076731,exact=1
+TV-G4-QT8,baseline_ms=0.880640,candidate_ms=5.716992,speedup=0.154039,exact=1
+TV-G8-QT4,baseline_ms=0.881664,candidate_ms=16.163839,speedup=0.054545,exact=1
+TV-G8-QT8,baseline_ms=0.881664,candidate_ms=8.170496,speedup=0.107908,exact=1

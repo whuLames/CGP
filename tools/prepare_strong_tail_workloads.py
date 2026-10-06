@@ -11,6 +11,7 @@ The original graph is never modified.  The derived graph must be identified by
 GraphWeft before ``workloads`` is run (the CLI prints ``graph=<identity>``).
 """
 import argparse
+import array
 import csv
 import hashlib
 import json
@@ -34,10 +35,16 @@ def digest(path):
 
 
 def read_i32(path):
-    raw = path.read_bytes()
-    if len(raw) % 4:
+    values = array.array("i")
+    with path.open("rb") as f:
+        values.fromfile(f, path.stat().st_size // values.itemsize)
+    if path.stat().st_size % values.itemsize:
         raise ValueError(f"unaligned int32 file: {path}")
-    return struct.unpack(f"<{len(raw)//4}i", raw)
+    if values.itemsize != 4:
+        raise ValueError("native int is not 32 bits")
+    if __import__("sys").byteorder != "little":
+        values.byteswap()
+    return values
 
 
 def path_lengths(count, minimum, maximum, alpha, seed):
@@ -84,8 +91,8 @@ def augment(args):
         raise ValueError("derived CSR exceeds legacy int32 range")
 
     with (out / "csr_vlist.bin").open("wb") as f:
-        f.write(struct.pack(f"<{len(rows)-1}i", *rows[:-1]))
-        f.write(struct.pack(f"<{len(appended_rows)}i", *appended_rows))
+        rows[:-1].tofile(f)
+        array.array("i", appended_rows).tofile(f)
     shutil.copyfile(col_path, out / "csr_elist.bin")
     with (out / "csr_elist.bin").open("ab") as f:
         f.write(struct.pack(f"<{len(appended_cols)}i", *appended_cols))
@@ -109,7 +116,8 @@ def augment(args):
         "original_graph": str(src), "original_vertices": original_vertices,
         "original_edges": original_edges, "derived_vertices": vertex,
         "derived_edges": edge,
-        "original_files_sha256": {p.name: digest(p) for p in (row_path, col_path, weight_path)},
+        "original_files_sha256": {p.name: digest(p) for p in
+                                    (row_path, col_path, weight_path) if p.exists()},
         "derived_files_sha256": {p.name: digest(p) for p in
                                   (out / "csr_vlist.bin", out / "csr_elist.bin",
                                    out / "csr_weightlist.bin")},

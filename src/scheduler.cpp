@@ -101,7 +101,10 @@ void WeightedBoundaryProvider::predict(const HostGraph& g,std::vector<Query>& qu
     uint32_t v=query.source;
     uint32_t mean=reachable[v]?std::min<uint32_t>(65535,uint64_t(sum_hops[v])*256/reachable[v]):0;
     query.feature_key=uint64_t(mean)+128ULL*max_hops[v];
-    if(query.feature_key>65535)throw std::overflow_error("weighted-boundary score exceeds uint16");
+    // Query::feature_key and the frozen CSV format are uint64.  Earlier
+    // social-graph indexes happened to fit in uint16, but road diameters can
+    // legitimately produce larger scores.  Preserve the full value so their
+    // relative length ordering is not collapsed by saturation.
   }
 }
 std::vector<Query> BatchPlanner::plan(std::vector<Query> queries,const Options& options){

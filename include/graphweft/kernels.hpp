@@ -91,6 +91,14 @@ void finish_fused_frontier(const FrontierContext&);
 void finish_direct_frontier(const FrontierContext&);
 void rebuild_frontier(const FrontierContext&);
 void count_edge_pairs(GraphView, const uint64_t* mask, const uint32_t* list, const uint32_t* count, uint32_t words, uint64_t* output, cudaStream_t);
+// Aggregate the Iteration model's work features independently for aligned
+// query groups. Outputs contain group_count entries and must be zeroed by the
+// caller. This diagnostic path currently requires group_width=32.
+void count_group_features(GraphView, const uint64_t* mask, const uint32_t* list,
+                          const uint32_t* count, uint32_t words,
+                          uint32_t group_count, uint32_t* frontier_vertices,
+                          uint64_t* vertex_pairs, uint64_t* edge_pairs,
+                          cudaStream_t);
 void classify_edge_pairs(GraphView, const uint64_t* mask, const uint32_t* list,
                          const uint32_t* count, uint32_t words, uint64_t* output,
                          uint8_t* categories, uint32_t* category_counts,

@@ -24,6 +24,21 @@ struct Options {
   // Reclaim a physical group as soon as all its members finish.  Queries are
   // grouped by algorithm and groups from algorithm queues are interleaved.
   bool group_refill = false;
+  // Experimental refill ablation: allow homogeneous SSSP groups to be
+  // reclaimed independently instead of waiting for a synchronized wave.
+  bool eager_sssp_refill = false;
+  // Admit a replacement group only when the current resident set is below a
+  // bounded concurrency level and the last round remained Push.  This turns
+  // refill into slack stealing instead of unconditional slot replacement.
+  bool interference_aware_refill = false;
+  uint32_t refill_max_active_groups = 2;
+  // Start at most one group from the next cohort while the current cohort has
+  // a lone Push straggler, then restore a full cohort when that straggler
+  // retires.  This preserves batch efficiency after crossing the barrier.
+  bool interference_bridge_refill = false;
+  // Experimental Iteration ablation: predict one Push mapping per G-sized
+  // group and merge groups which select the same partition kernel.
+  bool group_iteration_mapping = false;
   bool same_algorithm_groups = false;
   bool oracle_order = false;
   double memory_fraction = .8;
@@ -82,6 +97,10 @@ struct CompletionRecord {
 struct RunStats {
   uint64_t batches = 0, rounds = 0, push_rounds = 0, pull_rounds = 0;
   uint64_t group_refills = 0, completed_slot_rounds = 0, active_slot_rounds = 0, capacity_slot_rounds = 0;
+  uint64_t refill_admitted_groups = 0, refill_deferred_groups = 0;
+  uint64_t refill_deferred_pull_groups = 0, refill_deferred_capacity_groups = 0;
+  uint64_t refill_deferred_incompatible_groups = 0;
+  uint64_t group_mapping_rounds = 0, group_mapping_divergent_rounds = 0, group_mapping_launches = 0;
   uint64_t final_drain_rounds = 0;
   double planning_ms = 0, prediction_ms = 0, initialization_ms = 0, recycle_ms = 0, copy_ms = 0, kernel_ms = 0, kernel_gpu_ms = 0, frontier_ms = 0, compare_ms = 0, feature_ms = 0, adaptive_preparation_ms = 0, selector_ms = 0, transfer_ms = 0, round_ms = 0, execution_ms = 0, task_wall_ms = 0, total_ms = 0;
   double workload_ms = 0;

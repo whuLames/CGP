@@ -125,6 +125,15 @@ int main(){
     }catch(const std::invalid_argument&){rejected=true;}
     if(!rejected)throw std::runtime_error("direct frontier silently accepted stable ordering");
   }
+  {
+    bool rejected=false;
+    try{
+      Options o;o.layout=Layout::Grouped;o.capacity=32;o.group_width=32;o.group_refill=true;
+      o.interference_bridge_refill=true;
+      run(directed,{{0,0}},o);
+    }catch(const std::invalid_argument&){rejected=true;}
+    if(!rejected)throw std::runtime_error("bridge refill accepted missing prediction keys");
+  }
   for(const auto& g:{undirected,directed})for(auto a:{Algorithm::BFS,Algorithm::SSSP,Algorithm::SSWP}){
     if(a==Algorithm::SSSP && !g.directed)continue; // negative edge rejection has a separate assertion.
     for(auto layout:{Layout::VertexMajor,Layout::Grouped})for(auto mode:{FrontierMode::Unordered,FrontierMode::Stable}){
@@ -203,6 +212,34 @@ int main(){
     for(const auto& [_,algorithms]:history)for(size_t i=1;i<algorithms.size();++i)
       reused_across_algorithms|=algorithms[i]!=algorithms[i-1];
     if(!reused_across_algorithms)throw std::runtime_error("physical slots were not reused across algorithms");
+  }
+  // Interference-aware refill may leave completed physical groups vacant, but
+  // must eventually admit every waiting group without changing query results.
+  for(auto selector:{Options::Selector::Push,Options::Selector::Threshold}){
+    Options o;o.algorithm=Algorithm::SSSP;o.capacity=4;o.group_width=2;o.layout=Layout::Grouped;
+    o.group_refill=true;o.interference_aware_refill=true;o.refill_max_active_groups=1;
+    o.copy_results_to_cpu=true;o.selector=selector;o.frontier_build=FrontierBuildMode::Direct;
+    std::vector<Query> qs;for(uint32_t i=0;i<9;++i)qs.push_back({500+i,i%directed.vertices});
+    std::map<uint64_t,QueryResult> results;
+    auto stats=run(directed,qs,o,[&](const QueryResult& r){results.emplace(r.id,r);});
+    if(results.size()!=qs.size() || stats.completions.size()!=qs.size() || !stats.refill_admitted_groups)
+      throw std::runtime_error("interference-aware refill accounting mismatch");
+    for(const auto& q:qs)if(results.at(q.id).values!=reference(directed,Algorithm::SSSP,q.source))
+      throw std::runtime_error("interference-aware refill changed result");
+  }
+  for(auto selector:{Options::Selector::Push,Options::Selector::Threshold}){
+    Options o;o.algorithm=Algorithm::SSSP;o.capacity=4;o.group_width=2;o.layout=Layout::Grouped;
+    o.group_refill=true;o.interference_bridge_refill=true;o.copy_results_to_cpu=true;
+    o.predictor=Options::Predictor::ImportedKey;
+    o.selector=selector;o.frontier_build=FrontierBuildMode::Direct;
+    std::vector<Query> qs;for(uint32_t i=0;i<11;++i){Query q{600+i,i%directed.vertices};
+      q.feature_key=10-i;qs.push_back(q);}
+    std::map<uint64_t,QueryResult> results;
+    auto stats=run(directed,qs,o,[&](const QueryResult& r){results.emplace(r.id,r);});
+    if(results.size()!=qs.size() || stats.completions.size()!=qs.size() || !stats.refill_admitted_groups)
+      throw std::runtime_error("interference bridge refill accounting mismatch");
+    for(const auto& q:qs)if(results.at(q.id).values!=reference(directed,Algorithm::SSSP,q.source))
+      throw std::runtime_error("interference bridge refill changed result");
   }
   // Compare every synchronous state, multiword mask and frontier set with a CPU recurrence.
   for(auto a:{Algorithm::BFS,Algorithm::SSSP,Algorithm::SSWP})for(auto layout:{Layout::VertexMajor,Layout::Grouped})

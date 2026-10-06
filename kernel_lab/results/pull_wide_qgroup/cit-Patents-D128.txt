@@ -1,0 +1,6 @@
+graph=ca71a63d2bc4aa14 V=3774768 E=33037895 D=128 gpu=0
+serial-q16,baseline_ms=40.369152,candidate_ms=38.843391,speedup=1.039280,fingerprint_match=1
+serial-q8,baseline_ms=40.361984,candidate_ms=53.569534,speedup=0.753450,fingerprint_match=1
+parallel-q32,baseline_ms=40.369152,candidate_ms=30.201857,speedup=1.336645,fingerprint_match=1
+parallel-q16,baseline_ms=40.356865,candidate_ms=32.599041,speedup=1.237977,fingerprint_match=1
+parallel-q8,baseline_ms=40.360958,candidate_ms=34.399231,speedup=1.173310,fingerprint_match=1

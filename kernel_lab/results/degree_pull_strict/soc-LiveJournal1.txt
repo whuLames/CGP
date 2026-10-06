@@ -1,0 +1,8 @@
+graph=61876d811dd317b5 V=4847571 E=137987546 Q=32 gpu=0
+strict,C=32,baseline_ms=20.213760,strict_ms=19.936256,speedup=1.013920,warp_tasks=7702600,max_edges_per_warp=32,exact=1
+strict,C=64,baseline_ms=20.212736,strict_ms=19.414017,speedup=1.041141,warp_tasks=5910413,max_edges_per_warp=64,exact=1
+strict,C=128,baseline_ms=20.206593,strict_ms=19.198977,speedup=1.052483,warp_tasks=5178915,max_edges_per_warp=128,exact=1
+strict,C=256,baseline_ms=20.216831,strict_ms=19.182592,speedup=1.053915,warp_tasks=4932484,max_edges_per_warp=256,exact=1
+strict,C=512,baseline_ms=20.211712,strict_ms=19.218431,speedup=1.051684,warp_tasks=4865930,max_edges_per_warp=512,exact=1
+strict,C=1024,baseline_ms=20.214785,strict_ms=19.231745,speedup=1.051115,warp_tasks=4850528,max_edges_per_warp=1024,exact=1
+strict,C=2048,baseline_ms=20.212736,strict_ms=19.305471,speedup=1.046995,warp_tasks=4847986,max_edges_per_warp=2048,exact=1

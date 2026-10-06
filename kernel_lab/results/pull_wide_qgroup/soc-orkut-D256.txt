@@ -1,0 +1,6 @@
+graph=c476f4df35515f1e V=2997166 E=212698418 D=256 gpu=0
+serial-q16,baseline_ms=392.294403,candidate_ms=401.478668,speedup=0.977124,fingerprint_match=1
+serial-q8,baseline_ms=392.354828,candidate_ms=631.740417,speedup=0.621070,fingerprint_match=1
+parallel-q32,baseline_ms=392.347656,candidate_ms=245.871613,speedup=1.595742,fingerprint_match=1
+parallel-q16,baseline_ms=392.297485,candidate_ms=253.955078,speedup=1.544751,fingerprint_match=1
+parallel-q8,baseline_ms=392.238068,candidate_ms=254.907394,speedup=1.538747,fingerprint_match=1
