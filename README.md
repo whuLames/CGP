@@ -2,6 +2,11 @@
 
 Independent C++17/CUDA implementation of concurrent BFS, SSSP and SSWP on one graph. It uses synchronous float32 double buffering, a shared CSR for undirected Push/Pull, and CSR plus CSC for directed graphs. The previous `ocgp/puercgp` project is a reference only; GraphWeft builds on its own.
 
+The `experiment/dense-pull-integration` branch architecture, 21 production
+Dense Pull candidates, dispatch/frontier semantics, validation evidence, and
+handoff checklist are documented in
+[`docs/dense_pull_integration_design.md`](docs/dense_pull_integration_design.md).
+
 ## Build
 
 ```bash
