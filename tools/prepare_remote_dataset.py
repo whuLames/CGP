@@ -48,18 +48,16 @@ def run_monitored(command,root,log,low=25*GIB):
     return True
 
 
-def extract_monitored(command,target_path,root,log,low=25*GIB):
-    with target_path.open("wb") as target,log.open("w") as errors:
-        process=subprocess.Popen(command,stdout=target,stderr=errors)
-        while process.poll() is None:
+def extract_member(archive,member,target_path,root,low=25*GIB):
+    with zipfile.ZipFile(archive) as bundle,bundle.open(member) as source,target_path.open("wb") as target:
+        while True:
+            block=source.read(8<<20)
+            if not block:break
+            target.write(block)
             if shutil.disk_usage(root).free<low:
-                process.terminate()
-                try:process.wait(timeout=30)
-                except subprocess.TimeoutExpired:process.kill();process.wait()
-                pause(root,"runtime free space below 25 GiB",{"command":command,"log":str(log)})
+                pause(root,"runtime free space below 25 GiB",
+                      {"archive":str(archive),"member":member.filename})
                 return False
-            time.sleep(10)
-    if process.returncode:raise RuntimeError(f"extraction failed ({process.returncode}); see {log}")
     return True
 
 
@@ -105,7 +103,7 @@ def main():
         if not run_monitored(["curl","-fL","--retry","5","--continue-at","-","--output",str(archive),entry["url"]],
                              root,temporary/"download.log"):raise SystemExit(2)
         member=choose_member(archive)
-        if not extract_monitored(["unzip","-p",str(archive),member.filename],edge_text,root,temporary/"extract.log"):
+        if not extract_member(archive,member,edge_text,root):
             raise SystemExit(2)
         indexing=entry.get("indexing","auto");vertices=str(entry.get("vertices",0));seed=str(catalog.get("weight_seed",20261007))
         if not run_monitored([str(args.converter),str(edge_text),str(dataset),indexing,vertices,seed],
