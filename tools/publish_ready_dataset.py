@@ -28,13 +28,18 @@ def main():
     manifest=json.loads(fragment.read_text())
     if args.dataset not in manifest.get("datasets",{}):raise RuntimeError("manifest lacks base dataset")
     paths=[status_path,fragment]
-    for name in ("csr_vlist.bin","csr_elist.bin","csr_weightlist.bin"):
-        paths.append(root/"datasets"/args.dataset/name)
     for dataset in manifest["datasets"].values():
+        graph=Path(dataset["graph"])
+        for name in ("csr_vlist.bin","csr_elist.bin","csr_weightlist.bin"):
+            paths.append(graph/name)
+        for name in ("conversion_manifest.json","augmentation_manifest.json"):
+            if (graph/name).is_file():paths.append(graph/name)
         paths.extend(Path(path) for path in dataset.get("workloads",{}).values())
-    artifacts=[]
+    artifacts=[];seen=set()
     for path in paths:
         path=path.resolve()
+        if path in seen:continue
+        seen.add(path)
         try:path.relative_to(root)
         except ValueError:raise RuntimeError(f"artifact is outside campaign root: {path}")
         if not path.is_file():raise RuntimeError(f"missing artifact: {path}")
