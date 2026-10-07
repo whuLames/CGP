@@ -24,10 +24,18 @@ def remote(base, command, capture=True):
 def source_ready(source, root, dataset):
     status = f"{root}/status/{dataset}.json"
     fragment = f"{root}/workloads/{dataset}/campaign_manifest_fragment.json"
-    command = ("python3 -c " + shlex.quote(
-        "import json,sys; s=json.load(open(sys.argv[1])); "
-        "raise SystemExit(0 if s.get('status') == 'success' else 1)") +
-        f" {shlex.quote(status)} && test -f {shlex.quote(fragment)}")
+    validator = (
+        "import json,sys; from pathlib import Path; "
+        "s=json.load(open(sys.argv[1])); m=json.load(open(sys.argv[2])); "
+        "paths=[]; "
+        "[(paths.extend([Path(d['graph'])/n for n in "
+        "('csr_vlist.bin','csr_elist.bin','csr_weightlist.bin')]), "
+        "paths.extend(Path(p) for p in d.get('workloads',{}).values())) "
+        "for d in m.get('datasets',{}).values()]; "
+        "raise SystemExit(0 if s.get('status')=='success' and paths and "
+        "all(p.is_file() for p in paths) else 1)")
+    command = ("python3 -c " + shlex.quote(validator) + f" {shlex.quote(status)} "
+               f"{shlex.quote(fragment)}")
     return subprocess.run(source + [command], stdout=subprocess.DEVNULL,
                           stderr=subprocess.DEVNULL).returncode == 0
 
