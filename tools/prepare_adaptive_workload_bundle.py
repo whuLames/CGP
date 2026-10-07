@@ -51,7 +51,8 @@ def main():
                "required_reserve_bytes":30*GIB,"dataset":args.name}
         (args.output/"PAUSED_INSUFFICIENT_SPACE.json").write_text(json.dumps(state,indent=2)+"\n")
         print("*** WORKLOAD PREPARATION PAUSED: less than 30 GiB free ***");raise SystemExit(2)
-    logs=args.output/"logs";identity,fit128=inspect(args.cli,args.graph,128,logs/"inspect_m128.log")
+    logs=args.output/"logs";logs.mkdir(parents=True,exist_ok=True)
+    identity,fit128=inspect(args.cli,args.graph,128,logs/"inspect_m128.log")
     if not fit128:raise RuntimeError("base graph does not pass the M=128 memory gate")
     _,fit256=inspect(args.cli,args.graph,256,logs/"inspect_m256.log")
     sampled=args.output/"sampled_m128"

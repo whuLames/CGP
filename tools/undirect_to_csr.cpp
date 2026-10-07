@@ -38,6 +38,7 @@ int main(int argc,char** argv){
       if(line.empty())continue;
       if(line.rfind("%%MatrixMarket",0)==0){matrix_market=true;continue;}
       if(line[0]=='#' || line[0]=='%')continue;
+      std::replace(line.begin(),line.end(),',',' ');
       std::istringstream row(line);uint64_t a=0,b=0,third=0;
       if(!(row>>a>>b))continue;
       if(matrix_market && !dimensions_seen){

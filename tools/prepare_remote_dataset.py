@@ -101,33 +101,39 @@ def main():
     archive=temporary/(args.name+".zip");edge_text=temporary/(args.name+".input")
     record={"status":"running","entry":entry,"started_utc":datetime.now(timezone.utc).isoformat()}
     atomic_json(complete,record)
-    if not run_monitored(["curl","-fL","--retry","5","--continue-at","-","--output",str(archive),entry["url"]],
-                         root,temporary/"download.log"):raise SystemExit(2)
-    member=choose_member(archive)
-    if not extract_monitored(["unzip","-p",str(archive),member.filename],edge_text,root,temporary/"extract.log"):
-        raise SystemExit(2)
-    indexing=entry.get("indexing","auto");vertices=str(entry.get("vertices",0));seed=str(catalog.get("weight_seed",20261007))
-    if not run_monitored([str(args.converter),str(edge_text),str(dataset),indexing,vertices,seed],
-                         root,temporary/"convert.log"):raise SystemExit(2)
-    conversion=json.loads((dataset/"conversion_manifest.json").read_text())
-    files={name:sha256(dataset/name) for name in ("csr_vlist.bin","csr_elist.bin","csr_weightlist.bin")}
-    identities=[]
-    for other in (root/"status").glob("*.json"):
-        if other==complete:continue
-        try:value=json.loads(other.read_text())
-        except (OSError,json.JSONDecodeError):continue
-        if value.get("files_sha256")==files:identities.append(value.get("dataset",other.stem))
-    budget=int(.8*32*GIB)
-    allocation={str(capacity):allocation_bytes(conversion["vertices"],conversion["symmetric_edges"],capacity)
-                for capacity in (128,256)}
-    record.update({"status":"success","dataset":args.name,"archive_member":member.filename,
-                   "archive_sha256":sha256(archive),"conversion":conversion,"files_sha256":files,
-                   "duplicate_of":identities,"allocation_bytes":allocation,
-                   "fits_v100_32g_80pct":{key:value<=budget for key,value in allocation.items()},
-                   "completed_utc":datetime.now(timezone.utc).isoformat()})
-    atomic_json(complete,record)
-    archive.unlink();edge_text.unlink()
-    print(json.dumps(record,indent=2))
+    try:
+        if not run_monitored(["curl","-fL","--retry","5","--continue-at","-","--output",str(archive),entry["url"]],
+                             root,temporary/"download.log"):raise SystemExit(2)
+        member=choose_member(archive)
+        if not extract_monitored(["unzip","-p",str(archive),member.filename],edge_text,root,temporary/"extract.log"):
+            raise SystemExit(2)
+        indexing=entry.get("indexing","auto");vertices=str(entry.get("vertices",0));seed=str(catalog.get("weight_seed",20261007))
+        if not run_monitored([str(args.converter),str(edge_text),str(dataset),indexing,vertices,seed],
+                             root,temporary/"convert.log"):raise SystemExit(2)
+        conversion=json.loads((dataset/"conversion_manifest.json").read_text())
+        files={name:sha256(dataset/name) for name in ("csr_vlist.bin","csr_elist.bin","csr_weightlist.bin")}
+        identities=[]
+        for other in (root/"status").glob("*.json"):
+            if other==complete:continue
+            try:value=json.loads(other.read_text())
+            except (OSError,json.JSONDecodeError):continue
+            if value.get("files_sha256")==files:identities.append(value.get("dataset",other.stem))
+        budget=int(.8*32*GIB)
+        allocation={str(capacity):allocation_bytes(conversion["vertices"],conversion["symmetric_edges"],capacity)
+                    for capacity in (128,256)}
+        record.update({"status":"success","dataset":args.name,"archive_member":member.filename,
+                       "archive_sha256":sha256(archive),"conversion":conversion,"files_sha256":files,
+                       "duplicate_of":identities,"allocation_bytes":allocation,
+                       "fits_v100_32g_80pct":{key:value<=budget for key,value in allocation.items()},
+                       "completed_utc":datetime.now(timezone.utc).isoformat()})
+        atomic_json(complete,record)
+        archive.unlink();edge_text.unlink()
+        print(json.dumps(record,indent=2))
+    except Exception as error:
+        record.update({"status":"failed","dataset":args.name,"error":repr(error),
+                       "failed_utc":datetime.now(timezone.utc).isoformat()})
+        atomic_json(complete,record)
+        raise
 
 
 if __name__=="__main__":main()
