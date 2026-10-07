@@ -26,4 +26,15 @@ The seven pre-existing graphs (`cit-Patents`, `indochina`, `roadNet-CA`, `roadNe
 
 ## Status
 
-Dataset placement, canonical hashes, workload hashes, run IDs, and completion state are filled from the two remote `status/` trees after preparation. Large raw timing tables remain under `/data` on the owning server.
+The campaign is sharded as follows. These assignments are stable across resume; a failed or memory-gated graph is recorded and skipped rather than silently moved to another host.
+
+| Host / GPU | Dataset queue |
+|---|---|
+| `v100-a / 0` | `tech-ip`, `delicious-ti`, `wb-edu`, `wikipedia-link-de`, `graph500-scale23-ef16-adj` |
+| `v100-a / 1` | `socfb-A-anon`, `ljournal-2008`, `uk-2002`, `wikipedia-link-it`, `rgg-n-2-24-s0` |
+| `v100-b / 0` | `soc-flickr-growth`, `soc-livejournal`, `soc-sinaweibo`, `wikipedia-link-fr`, `delaunay-n24` |
+| `v100-b / 1` | `socfb-B-anon`, `livejournal-heter`, `wikipedia-growth`, `web-wikipedia-link-en13-all`, `nlpkkt160` |
+
+Per-dataset preparation state and canonical hashes are in `/data/graphweft-adaptive-v1/status/`. Per-GPU campaign state is in `pipeline/gpu0.json` and `pipeline/gpu1.json`; detailed logs are in `pipeline/`. Generated graphs and workload bundles are in `datasets/` and `workloads/`, while raw and analyzed timing data remain in `results/` on the owning host. Temporary download archives and extracted edge lists are deleted after each successful conversion.
+
+As of the initial 2026-10-07 launch, `tech-ip`, `delicious-ti`, and `socfb-A-anon` passed conversion on `v100-a`; `soc-flickr-growth`, `soc-livejournal`, and `socfb-B-anon` passed on `v100-b`. Preparation continues sequentially per host before the GPU campaign is resumed so conversion traffic cannot contaminate formal measurements.

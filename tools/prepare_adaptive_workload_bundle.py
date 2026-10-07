@@ -17,9 +17,9 @@ def run(command,log):
     if result.returncode:raise RuntimeError(f"failed command; see {log}: {command}")
 
 
-def inspect(cli,graph,capacity,log):
+def inspect(cli,graph,capacity,device,log):
     command=[str(cli),f"--graph={graph}","--legacy_int_weights","--n=0",f"--q={capacity}",
-             "--layout=grouped","--group_width=32","--frontier_build=fused","--device=0","--log_level=warn"]
+             "--layout=grouped","--group_width=32","--frontier_build=fused",f"--device={device}","--log_level=warn"]
     result=subprocess.run(command,cwd=PROJECT,text=True,capture_output=True)
     log.write_text(result.stdout+result.stderr)
     if result.returncode:raise RuntimeError(f"graph inspection failed: {log}")
@@ -52,9 +52,9 @@ def main():
         (args.output/"PAUSED_INSUFFICIENT_SPACE.json").write_text(json.dumps(state,indent=2)+"\n")
         print("*** WORKLOAD PREPARATION PAUSED: less than 30 GiB free ***");raise SystemExit(2)
     logs=args.output/"logs";logs.mkdir(parents=True,exist_ok=True)
-    identity,fit128=inspect(args.cli,args.graph,128,logs/"inspect_m128.log")
+    identity,fit128=inspect(args.cli,args.graph,128,args.device,logs/"inspect_m128.log")
     if not fit128:raise RuntimeError("base graph does not pass the M=128 memory gate")
-    _,fit256=inspect(args.cli,args.graph,256,logs/"inspect_m256.log")
+    _,fit256=inspect(args.cli,args.graph,256,args.device,logs/"inspect_m256.log")
     sampled=args.output/"sampled_m128"
     if not sampled.exists():run([str(args.sampler),str(args.graph),str(sampled),identity,"128",str(args.seed)],logs/"sample.log")
     completions=args.output/"candidate_completions.csv"
@@ -68,9 +68,9 @@ def main():
     if not derived.exists():
         run(["python3",str(PROJECT/"tools/prepare_strong_tail_workloads.py"),"augment",f"--graph={args.graph}",
              f"--output={derived}","--paths=256","--bands=256,512,1024,2048",f"--seed={args.seed}"],logs/"augment.log")
-    derived_identity,derived_fit128=inspect(args.cli,derived,128,logs/"inspect_derived_m128.log")
+    derived_identity,derived_fit128=inspect(args.cli,derived,128,args.device,logs/"inspect_derived_m128.log")
     if not derived_fit128:raise RuntimeError("derived graph does not pass the M=128 memory gate")
-    _,derived_fit256=inspect(args.cli,derived,256,logs/"inspect_derived_m256.log")
+    _,derived_fit256=inspect(args.cli,derived,256,args.device,logs/"inspect_derived_m256.log")
     long128=args.output/"long_tail_m128"
     if not long128.exists():
         run(["python3",str(PROJECT/"tools/prepare_adaptive_sssp_workload.py"),
