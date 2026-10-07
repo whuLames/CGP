@@ -3,6 +3,8 @@
 #include "graphweft/iteration_model.hpp"
 #include <algorithm>
 #include <cmath>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <map>
@@ -117,6 +119,20 @@ int main(){
     {2,2,0,0,3,3,4,4,-2,-2},false);
   auto directed=HostGraph::from_edges(6,{0,1,0,2,2,3,4},{1,2,2,3,3,3,5},{2,0,8,3,4,4,1},true);
   if(undirected.directed || undirected.incoming_row.size() || directed.incoming_row.empty())throw std::runtime_error("graph view storage");
+  {
+    const auto path=std::filesystem::temp_directory_path()/"graphweft_round_oracle_validate.csv";
+    Options o;o.algorithm=Algorithm::SSSP;o.capacity=32;o.group_width=32;o.layout=Layout::Grouped;
+    o.selector=Options::Selector::Threshold;o.push_mapping=Options::PushMapping::Iteration;
+    o.frontier_build=FrontierBuildMode::Fused;o.frontier_mask64=true;
+    o.round_oracle_profile=true;o.round_oracle_output_path=path.string();
+    std::vector<Query> queries;for(uint32_t i=0;i<32;++i)queries.push_back({9000+i,i%directed.vertices});
+    auto stats=run(directed,queries,o);
+    std::ifstream input(path);std::string line;uint64_t rows=0;
+    while(std::getline(input,line))if(rows || line.rfind("batch,round,",0)!=0)++rows;
+    std::filesystem::remove(path);
+    if(rows!=stats.rounds*uint64_t(push_partition_count+2+dense_pull_candidate_count))
+      throw std::runtime_error("round oracle row count mismatch");
+  }
   {
     bool rejected=false;
     try{

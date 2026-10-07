@@ -1,0 +1,27 @@
+{
+  "schema": 1,
+  "weight_seed": 20261007,
+  "selection_policy": "real-first; post-symmetry V100 M=128 allocation gate; canonical CSR hashes deduplicate aliases",
+  "datasets": [
+    {"name":"tech-ip","role":"real","family":"internet topology","vertices":2250498,"edges":21644714,"url":"https://nrvis.com/download/data/tech/tech-ip.zip","indexing":"auto"},
+    {"name":"soc-flickr-growth","role":"real","family":"temporal social","vertices":2302925,"edges":33140017,"url":"https://nrvis.com/download/data/dynamic/soc-flickr-growth.zip","indexing":"auto"},
+    {"name":"socfb-B-anon","role":"real","family":"social","vertices":2937612,"edges":20959854,"url":"https://nrvis.com/download/data/socfb/socfb-B-anon.zip","indexing":"auto"},
+    {"name":"socfb-A-anon","role":"real","family":"social","vertices":3097165,"edges":23667394,"url":"https://nrvis.com/download/data/socfb/socfb-A-anon.zip","indexing":"auto"},
+    {"name":"delicious-ti","role":"real","family":"temporal interaction","vertices":4006816,"edges":26284873,"url":"https://nrvis.com/download/data/misc/delicious-ti.zip","indexing":"auto"},
+    {"name":"soc-livejournal","role":"real","family":"social","vertices":4033137,"edges":27933062,"url":"https://nrvis.com/download/data/soc/soc-livejournal.zip","indexing":"auto"},
+    {"name":"ljournal-2008","role":"real","family":"web-social","vertices":5363201,"edges":79023142,"url":"https://nrvis.com/download/data/misc/ljournal-2008.zip","indexing":"auto"},
+    {"name":"wb-edu","role":"real","family":"web","vertices":9469213,"edges":57156537,"url":"https://nrvis.com/download/data/misc/wb-edu.zip","indexing":"auto"},
+    {"name":"livejournal-heter","role":"real","family":"heterogeneous social","vertices":12692837,"edges":161017006,"url":"https://nrvis.com/download/data/heter/livejournal.zip","indexing":"auto"},
+    {"name":"uk-2002","role":"real","family":"web","vertices":18484117,"edges":298113762,"url":"https://nrvis.com/download/data/misc/uk-2002.zip","indexing":"auto"},
+    {"name":"soc-sinaweibo","role":"real","family":"social","vertices":21000000,"edges":261000000,"url":"https://nrvis.com/download/data/massive/soc-sinaweibo.zip","indexing":"auto"},
+    {"name":"wikipedia-growth","role":"real","family":"temporal web","url":"https://nrvis.com/download/data/misc/wikipedia-growth.zip","indexing":"auto"},
+    {"name":"wikipedia-link-de","role":"real","family":"encyclopedia web","url":"https://nrvis.com/download/data/misc/wikipedia_link_de.zip","indexing":"auto"},
+    {"name":"wikipedia-link-fr","role":"real","family":"encyclopedia web","url":"https://nrvis.com/download/data/misc/wikipedia_link_fr.zip","indexing":"auto"},
+    {"name":"wikipedia-link-it","role":"real","family":"encyclopedia web","url":"https://nrvis.com/download/data/misc/wikipedia_link_it.zip","indexing":"auto"},
+    {"name":"web-wikipedia-link-en13-all","role":"real-fallback","family":"encyclopedia web","url":"https://nrvis.com/download/data/massive/web-wikipedia_link_en13-all.zip","indexing":"auto"},
+    {"name":"graph500-scale23-ef16-adj","role":"structural","family":"power-law synthetic","vertices":4606314,"edges":258501410,"url":"https://nrvis.com/download/data/graph500/graph500-scale23-ef16_adj.zip","indexing":"auto"},
+    {"name":"rgg-n-2-24-s0","role":"structural","family":"random geometric","vertices":16777216,"edges":132557200,"url":"https://nrvis.com/download/data/dimacs10/rgg_n_2_24_s0.zip","indexing":"auto"},
+    {"name":"delaunay-n24","role":"structural","family":"planar geometric","vertices":16777216,"edges":50331601,"url":"https://nrvis.com/download/data/dimacs10/delaunay_n24.zip","indexing":"auto"},
+    {"name":"nlpkkt160","role":"structural","family":"KKT matrix","vertices":8345600,"edges":118931856,"url":"https://nrvis.com/download/data/misc/nlpkkt160.zip","indexing":"auto"}
+  ]
+}

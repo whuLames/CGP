@@ -92,11 +92,47 @@ HostGraph HostGraph::load(const std::string& path, bool directed, bool legacy_in
       }else w=read_binary<float>(wp);
     } else w.assign(cols.size(),1.f);
     if (w.size()!=cols.size()) throw std::runtime_error("CSR weight count mismatch");
-    src.reserve(cols.size()); dst.reserve(cols.size());
+    bool sorted_unique=true;
     for (uint32_t v=0;v<n;++v) {
       if (row[v]>row[v+1] || row[v+1]>cols.size()) throw std::runtime_error("invalid CSR row");
-      for (uint64_t j=row[v];j<row[v+1];++j) { src.push_back(v); dst.push_back(uint32_t(cols[j])); }
+      uint32_t previous=0;bool have_previous=false;
+      for(uint64_t j=row[v];j<row[v+1];++j){
+        if(cols[j]<0 || uint32_t(cols[j])>=n)throw std::runtime_error("CSR destination out of range");
+        if(have_previous && uint32_t(cols[j])<=previous)sorted_unique=false;
+        previous=uint32_t(cols[j]);have_previous=true;
+      }
     }
+    // The campaign converter emits sorted, duplicate-free rows.  Adopt that
+    // representation directly so billion-edge CSR inputs are not expanded to
+    // src/dst tuples and sorted again merely to reconstruct the same CSR.
+    if(sorted_unique){
+      HostGraph g;g.vertices=n;g.directed=directed;g.row=std::move(row);
+      g.col.reserve(cols.size());for(int32_t value:cols)g.col.push_back(uint32_t(value));g.weight=std::move(w);
+      if(!directed){
+        for(uint32_t u=0;u<n;++u)for(uint64_t e=g.row[u];e<g.row[u+1];++e){
+          const uint32_t v=g.col[e];const auto first=g.col.begin()+g.row[v],last=g.col.begin()+g.row[v+1];
+          const auto reverse=std::lower_bound(first,last,u);
+          if(reverse==last || *reverse!=u || bits(g.weight[size_t(reverse-g.col.begin())])!=bits(g.weight[e]))
+            throw std::invalid_argument("undirected graph requires matching reverse edges and exact weights");
+        }
+      }else{
+        g.incoming_row.assign(size_t(n)+1,0);
+        for(uint32_t v:g.col)++g.incoming_row[v+1];
+        std::partial_sum(g.incoming_row.begin(),g.incoming_row.end(),g.incoming_row.begin());
+        g.incoming_col.resize(g.col.size());g.incoming_weight.resize(g.weight.size());auto cursor=g.incoming_row;
+        for(uint32_t u=0;u<n;++u)for(uint64_t e=g.row[u];e<g.row[u+1];++e){
+          const auto index=cursor[g.col[e]]++;g.incoming_col[index]=u;g.incoming_weight[index]=g.weight[e];
+        }
+      }
+      uint64_t h=14695981039346656037ULL;hash_bytes(h,&n,sizeof(n));hash_bytes(h,&directed,sizeof(directed));
+      for(uint32_t u=0;u<n;++u)for(uint64_t e=g.row[u];e<g.row[u+1];++e){
+        const uint32_t b=bits(g.weight[e]);hash_bytes(h,&u,4);hash_bytes(h,&g.col[e],4);hash_bytes(h,&b,4);
+      }
+      std::ostringstream os;os<<std::hex<<std::setw(16)<<std::setfill('0')<<h;g.identity=os.str();return g;
+    }
+    src.reserve(cols.size()); dst.reserve(cols.size());
+    for (uint32_t v=0;v<n;++v)
+      for (uint64_t j=row[v];j<row[v+1];++j) { src.push_back(v); dst.push_back(uint32_t(cols[j])); }
   } else {
     std::ifstream f(p); if (!f) throw std::runtime_error("cannot open graph: "+path);
     std::string line; uint32_t a,b; float weight;

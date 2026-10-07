@@ -47,8 +47,11 @@ def read_i32(path):
     return values
 
 
-def path_lengths(count, minimum, maximum, alpha, seed):
+def path_lengths(count, minimum, maximum, alpha, seed, bands=()):
     rng = random.Random(seed)
+    if bands:
+        values=[bands[index%len(bands)] for index in range(count)]
+        rng.shuffle(values);return values
     values = [min(maximum, int(round(minimum * rng.paretovariate(alpha))))
               for _ in range(count)]
     # Stable order makes the first subset representative for Mixed as well.
@@ -71,7 +74,9 @@ def augment(args):
     if weight_path.exists() and weight_path.stat().st_size != original_edges * 4:
         raise ValueError("CSR weight count mismatch")
 
-    lengths = path_lengths(args.paths, args.min_edges, args.max_edges, args.alpha, args.seed)
+    bands=tuple(int(value) for value in args.bands.split(",") if value) if args.bands else ()
+    if bands and (min(bands)<1 or max(bands)>=2**31):raise ValueError("invalid path-length bands")
+    lengths = path_lengths(args.paths, args.min_edges, args.max_edges, args.alpha, args.seed,bands)
     heads, appended_rows, appended_cols = [], [], []
     vertex = original_vertices
     edge = original_edges
@@ -112,7 +117,7 @@ def augment(args):
         "schema": 1, "construction": "disjoint_path_components",
         "directed": args.directed, "seed": args.seed, "pareto_alpha": args.alpha,
         "minimum_path_edges": args.min_edges, "maximum_path_edges": args.max_edges,
-        "path_edges": lengths, "path_heads": heads,
+        "path_edges": lengths, "path_heads": heads,"path_length_bands":list(bands),
         "original_graph": str(src), "original_vertices": original_vertices,
         "original_edges": original_edges, "derived_vertices": vertex,
         "derived_edges": edge,
@@ -156,9 +161,9 @@ def stats(values):
                 "min": min(values), "max": max(values), "mean": sum(values) / len(values)}
 
 
-def write_workload(path, identity, rows, note):
+def write_workload(path, identity, rows, note, capacity=64):
     with path.open("w", newline="") as f:
-        f.write(f"# graph_identity={identity}\n# capacity=64\n# {note}\n")
+        f.write(f"# graph_identity={identity}\n# capacity={capacity}\n# {note}\n")
         f.write("# id,source,score,offset,feature_key,algorithm,reference_rounds\n")
         csv.writer(f).writerows((r["id"], r["source"], r.get("score", 0),
                                  r.get("offset", 0), r.get("feature_key", 0), r["algorithm"],
@@ -187,14 +192,24 @@ def workloads(args):
                   "algorithm": algorithm, "reference_rounds": lengths[i] + 1,
                   "label": "long", "provenance": f"synthetic_path:{i}"}
                  for i in range(args.long_count)]
-        random.Random(seed + 100).shuffle(rows)
+        if args.interleave_groups:
+            short=[row for row in rows if row["label"]=="short"]
+            long=[row for row in rows if row["label"]=="long"]
+            random.Random(seed+100).shuffle(short);random.Random(seed+101).shuffle(long);rows=[]
+            short_per_group=args.group_width*3//4;long_per_group=args.group_width-short_per_group
+            if len(short)%short_per_group or len(long)%long_per_group:
+                raise ValueError("short/long counts do not form complete 3:1 query groups")
+            for group in range(len(short)//short_per_group):
+                rows+=short[group*short_per_group:(group+1)*short_per_group]
+                rows+=long[group*long_per_group:(group+1)*long_per_group]
+        else:random.Random(seed + 100).shuffle(rows)
         all_rows[name] = rows
         sources[name] = {"query_path": str(query_path.resolve()),
                          "query_sha256": digest(query_path),
                          "completion_path": str(completion_path.resolve()),
                          "completion_sha256": digest(completion_path)}
         write_workload(out / f"{name}_strong_tail.csv", args.identity, rows,
-                       f"strong tail; seed={seed}; {args.long_count}/1024 disconnected-path queries")
+                       f"strong tail; seed={seed}; {args.long_count}/1024 disconnected-path queries",args.capacity)
 
     mixed = []
     per_algorithm_long = args.long_count // 2
@@ -205,7 +220,7 @@ def workloads(args):
     random.Random(args.seed + 200).shuffle(mixed)
     all_rows["mixed"] = mixed
     write_workload(out / "mixed_strong_tail.csv", args.identity, mixed,
-                   f"algorithm-internal strong tail; seed={args.seed+200}; 512 BFS + 512 SSSP")
+                   f"algorithm-internal strong tail; seed={args.seed+200}; 512 BFS + 512 SSSP",args.capacity)
 
     report = {"schema": 1, "acceptance": {
         "long_median_over_short_median_minimum": 2.0,
@@ -236,7 +251,7 @@ def workloads(args):
         writer = csv.DictWriter(f, fieldnames=fields); writer.writeheader(); writer.writerows(audit_rows)
     (out / "distribution_report.json").write_text(json.dumps(report, indent=2) + "\n")
     (out / "manifest.json").write_text(json.dumps({
-        "N": 1024, "M": 64, "long_count_homogeneous": args.long_count,
+        "N": 1024, "M": args.capacity, "long_count_homogeneous": args.long_count,
         "long_count_per_algorithm_mixed": per_algorithm_long, "seed": args.seed,
         "graph_identity": args.identity,
         "files_sha256": {p.name: digest(p) for p in out.glob("*.csv")}}, indent=2) + "\n")
@@ -365,6 +380,7 @@ def main():
     p.add_argument("--graph", type=Path, required=True); p.add_argument("--output", type=Path, required=True)
     p.add_argument("--directed", action="store_true"); p.add_argument("--paths", type=int, default=64)
     p.add_argument("--min-edges", type=int, default=64); p.add_argument("--max-edges", type=int, default=256)
+    p.add_argument("--bands",default="",help="Optional comma-separated exact path-edge bands")
     p.add_argument("--alpha", type=float, default=1.5); p.add_argument("--seed", type=int, default=20260929)
     p.set_defaults(func=augment)
     p = sub.add_parser("workloads")
@@ -372,7 +388,9 @@ def main():
     p.add_argument("--bfs-queries", type=Path, required=True); p.add_argument("--bfs-completion", type=Path, required=True)
     p.add_argument("--sssp-queries", type=Path, required=True); p.add_argument("--sssp-completion", type=Path, required=True)
     p.add_argument("--output", type=Path, required=True); p.add_argument("--long-count", type=int, default=64)
-    p.add_argument("--seed", type=int, default=20260929); p.set_defaults(func=workloads)
+    p.add_argument("--seed", type=int, default=20260929);p.add_argument("--capacity",type=int,default=64)
+    p.add_argument("--group-width",type=int,default=32);p.add_argument("--interleave-groups",action="store_true")
+    p.set_defaults(func=workloads)
     p = sub.add_parser("verify")
     p.add_argument("--workloads", type=Path, required=True); p.add_argument("--completions", type=Path, required=True)
     p.set_defaults(func=verify)

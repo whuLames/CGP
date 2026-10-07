@@ -10,6 +10,7 @@
 #include <cmath>
 #include <fstream>
 #include <iomanip>
+#include <iterator>
 #include <limits>
 #include <numeric>
 #include <memory>
@@ -71,6 +72,28 @@ KernelDescription describe(KernelId id) {
   base=int(KernelId::PushPartitionBase);
   if(raw>=base && raw<base+push_partition_count){auto p=push_partition(raw-base);return {"partition_push",p.group_size,p.warps_per_block,p.blocks_per_vertex,false};}
   return {"unknown"};
+}
+std::string canonical_kernel_token(KernelId id) {
+  if(id==KernelId::SharedPush)return "push-shared";
+  if(id==KernelId::AdaptivePush)return "push-adaptive";
+  if(const char* token=dense_pull_token(id))return token;
+  const int index=int(id)-int(KernelId::PushPartitionBase);
+  if(index>=0 && index<push_partition_count){
+    const auto p=push_partition(index);
+    return "push-q"+std::to_string(p.group_size)+(p.blocks_per_vertex==1?
+      "-w"+std::to_string(p.warps_per_block):"-b"+std::to_string(p.blocks_per_vertex));
+  }
+  return "kernel-"+std::to_string(int(id));
+}
+std::vector<KernelId> core_oracle_candidates(bool reverse) {
+  std::vector<KernelId> result;
+  result.reserve(push_partition_count+2+dense_pull_candidate_count);
+  for(int i=0;i<push_partition_count;++i)result.push_back(push_partition_id(i));
+  result.push_back(KernelId::SharedPush);
+  result.push_back(KernelId::AdaptivePush);
+  result.insert(result.end(),std::begin(dense_pull_candidates),std::end(dense_pull_candidates));
+  if(reverse)std::reverse(result.begin(),result.end());
+  return result;
 }
 template<class T> class Device {
  public:
@@ -152,6 +175,14 @@ void validate(const HostGraph& g,const Options& o,const std::vector<Query>& quer
   if(o.selector==Options::Selector::Replay && o.replay.empty())throw std::invalid_argument("empty replay selector");
   if(o.pull_kernel!=KernelId::DensePull && !is_dense_pull_kernel(o.pull_kernel))
     throw std::invalid_argument("pull_kernel is not a dense Pull candidate");
+  if(o.round_oracle_profile){
+    if(o.round_oracle_output_path.empty())throw std::invalid_argument("round oracle output path is empty");
+    if(o.frontier_build!=FrontierBuildMode::Fused || !o.frontier_mask64)
+      throw std::invalid_argument("round oracle profiling requires fused mask64 frontier construction");
+    const uint32_t p=physical_slots(o,o.capacity);
+    if(p<32 || p>256 || p%32)
+      throw std::invalid_argument("round oracle profiling requires a physical capacity in [32,256] divisible by 32");
+  }else if(!o.round_oracle_output_path.empty())throw std::invalid_argument("round oracle output requires profiling");
 }
 }
 uint64_t AllocationPlan::total() const { uint64_t sum=0;for(auto [_,v]:bytes)sum=add(sum,v);return sum; }
@@ -183,9 +214,10 @@ AllocationPlan allocation_plan(const HostGraph& g,const Options& o,uint32_t q) {
     mul((q+o.group_width-1)/o.group_width,sizeof(uint32_t)+2*sizeof(uint64_t)):0;
   a.bytes["scalars"]=2*4+3*8+4;
   a.bytes["stable_temp"]=o.frontier==FrontierMode::Stable?stable_temp_bytes(g.vertices):0;
-  a.bytes["adaptive_categories"]=o.push_mapping==Options::PushMapping::Adaptive?mul(v,1):0;
-  a.bytes["adaptive_buckets"]=o.push_mapping==Options::PushMapping::Adaptive?mul(v,4):0;
-  a.bytes["adaptive_counters"]=o.push_mapping==Options::PushMapping::Adaptive?
+  const bool need_adaptive=o.push_mapping==Options::PushMapping::Adaptive || o.round_oracle_profile;
+  a.bytes["adaptive_categories"]=need_adaptive?mul(v,1):0;
+  a.bytes["adaptive_buckets"]=need_adaptive?mul(v,4):0;
+  a.bytes["adaptive_counters"]=need_adaptive?
     adaptive_push_bucket_count*2*sizeof(uint32_t):0;
   return a;
 }
@@ -269,10 +301,11 @@ RunStats run(const HostGraph& g,std::vector<Query> queries,const Options& o,cons
   Device<uint32_t> group_frontier_vertices(o.group_iteration_mapping?group_count:0,"group frontier vertices");
   Device<uint64_t> group_vertex_pairs(o.group_iteration_mapping?group_count:0,"group vertex pairs");
   Device<uint64_t> group_edge_pairs(o.group_iteration_mapping?group_count:0,"group edge pairs");
-  Device<uint8_t> adaptive_categories(o.push_mapping==Options::PushMapping::Adaptive?g.vertices:0,"adaptive categories");
-  Device<uint32_t> adaptive_buckets(o.push_mapping==Options::PushMapping::Adaptive?g.vertices:0,"adaptive buckets");
-  Device<uint32_t> adaptive_counts(o.push_mapping==Options::PushMapping::Adaptive?adaptive_push_bucket_count:0,"adaptive counts");
-  Device<uint32_t> adaptive_cursors(o.push_mapping==Options::PushMapping::Adaptive?adaptive_push_bucket_count:0,"adaptive cursors");
+  const bool need_adaptive=o.push_mapping==Options::PushMapping::Adaptive || o.round_oracle_profile;
+  Device<uint8_t> adaptive_categories(need_adaptive?g.vertices:0,"adaptive categories");
+  Device<uint32_t> adaptive_buckets(need_adaptive?g.vertices:0,"adaptive buckets");
+  Device<uint32_t> adaptive_counts(need_adaptive?adaptive_push_bucket_count:0,"adaptive counts");
+  Device<uint32_t> adaptive_cursors(need_adaptive?adaptive_push_bucket_count:0,"adaptive cursors");
   Device<int> error(1,"error");
   Device<uint64_t> fingerprint_sum(q,"fingerprint sum"),fingerprint_xor(q,"fingerprint xor");
   Device<unsigned char> temp(o.frontier==FrontierMode::Stable?stable_temp_bytes(g.vertices):0,"stable_temp");
@@ -282,6 +315,9 @@ RunStats run(const HostGraph& g,std::vector<Query> queries,const Options& o,cons
   const bool update_driven_frontier=o.frontier_build!=FrontierBuildMode::Scan;
   Event fused_prepare_start(update_driven_frontier);
   Event fused_prepare_end(update_driven_frontier);
+  Event oracle_total_start(o.round_oracle_profile),oracle_copy_end(o.round_oracle_profile);
+  Event oracle_prepare_end(o.round_oracle_profile),oracle_kernel_end(o.round_oracle_profile);
+  Event oracle_finish_end(o.round_oracle_profile);
   float* old=value0.get();float* next=value1.get();uint64_t* current_mask=mask0.get();uint64_t* next_mask=mask1.get();
   uint32_t* current_list=list0.get();uint32_t* next_list=list1.get();uint32_t* current_count=count0.get();uint32_t* next_count=count1.get();
   uint64_t* current_pair=pair0.get();uint64_t* next_pair=pair1.get();
@@ -304,6 +340,20 @@ RunStats run(const HostGraph& g,std::vector<Query> queries,const Options& o,cons
     round_metrics.open(o.round_metrics_path,std::ios::trunc);
     if(!round_metrics)throw std::runtime_error("cannot write round metrics: "+o.round_metrics_path);
     round_metrics<<"batch,round,live_queries,kernel_id,kernel_token,kernel_family,pull_mapping,pull_storage,pull_query_width,pull_reduction,pull_fused,group_size,warps_per_block,blocks_per_vertex,check,kernel_gpu_ms,adaptive_preparation_ms,adaptive_w1_vertices,adaptive_w2_vertices,adaptive_w4_vertices,adaptive_b2_vertices,adaptive_b4_vertices,frontier_vertices,vertex_pairs,edge_pairs,density,mean_active_queries,mean_degree,mean_edge_pairs,selector_ms,predicted_log_cost,predicted_relative_cost,iteration_model_version,group_mapping_launches,group_mapping_divergent,group_mappings\n";
+  }
+  std::ofstream oracle_metrics;
+  if(o.round_oracle_profile){
+    auto parent=std::filesystem::path(o.round_oracle_output_path).parent_path();
+    if(!parent.empty())std::filesystem::create_directories(parent);
+    oracle_metrics.open(o.round_oracle_output_path,std::ios::trunc);
+    if(!oracle_metrics)throw std::runtime_error("cannot write round oracle metrics: "+o.round_oracle_output_path);
+    oracle_metrics<<"batch,round,candidate_order,candidate_index,live_queries,production_kernel_id,production_kernel_token,"
+      "production_direction,iteration_model_version,predicted_log_cost,predicted_relative_cost,auto_pull_token,"
+      "kernel_id,kernel_token,kernel_family,"
+      "pull_mapping,pull_storage,pull_query_width,pull_reduction,pull_fused,group_size,warps_per_block,"
+      "blocks_per_vertex,frontier_vertices,vertex_pairs,edge_pairs,density,mean_active_queries,mean_degree,"
+      "mean_edge_pairs,adaptive_preparation_ms,copy_gpu_ms,prepare_gpu_ms,kernel_gpu_ms,finish_gpu_ms,"
+      "pipeline_gpu_ms,pipeline_wall_ms,next_frontier_vertices,next_vertex_pairs,validation_match\n";
   }
   bool checkpoint_saved=false;
   auto execution_start=Clock::now();
@@ -393,8 +443,9 @@ RunStats run(const HostGraph& g,std::vector<Query> queries,const Options& o,cons
       uint64_t pairs=0,vertex_pairs=0;
       uint32_t host_adaptive_counts[adaptive_push_bucket_count]={0,0,0,0,0};
       double round_adaptive_preparation_ms=0;
-      const bool adaptive_features=o.push_mapping==Options::PushMapping::Adaptive &&
+      const bool production_adaptive_features=o.push_mapping==Options::PushMapping::Adaptive &&
         o.selector!=Options::Selector::Pull && o.selector!=Options::Selector::Replay;
+      const bool adaptive_features=production_adaptive_features || o.round_oracle_profile;
       const bool iteration_features=o.push_mapping==Options::PushMapping::Iteration &&
         o.selector!=Options::Selector::Pull && o.selector!=Options::Selector::Replay;
       uint32_t frontier_vertices=UINT32_MAX;
@@ -418,11 +469,13 @@ RunStats run(const HostGraph& g,std::vector<Query> queries,const Options& o,cons
       }
       check(cudaMemcpyAsync(&pairs,edge_pairs.get(),8,cudaMemcpyDeviceToHost,stream),"edge pairs");
       check(cudaMemcpyAsync(&vertex_pairs,current_pair,8,cudaMemcpyDeviceToHost,stream),"vertex pairs");
-      if(iteration_features)check(cudaMemcpyAsync(&frontier_vertices,current_count,4,cudaMemcpyDeviceToHost,stream),"iteration frontier count");
+      if(iteration_features || o.round_oracle_profile)
+        check(cudaMemcpyAsync(&frontier_vertices,current_count,4,cudaMemcpyDeviceToHost,stream),"iteration frontier count");
       if(adaptive_features)check(cudaMemcpyAsync(host_adaptive_counts,adaptive_counts.get(),sizeof(host_adaptive_counts),cudaMemcpyDeviceToHost,stream),"adaptive counts");
       check(cudaStreamSynchronize(stream),"features");
       const double feature_elapsed=elapsed(t);stats.feature_ms+=feature_elapsed;
-      if(adaptive_features){stats.adaptive_preparation_ms+=feature_elapsed;round_adaptive_preparation_ms+=feature_elapsed;}
+      double oracle_adaptive_preparation_ms=adaptive_features?feature_elapsed:0;
+      if(production_adaptive_features){stats.adaptive_preparation_ms+=feature_elapsed;round_adaptive_preparation_ms+=feature_elapsed;}
       double rho=g.edges()?double(pairs)/(double(g.edges())*active):0;
       t=Clock::now();
       KernelId chosen=selector.choose({pairs,active,rho,g.edges()!=0,vertex_pairs,
@@ -453,17 +506,22 @@ RunStats run(const HostGraph& g,std::vector<Query> queries,const Options& o,cons
         }
       }
       const double round_selector_ms=elapsed(t);stats.selector_ms+=round_selector_ms;
-      if(chosen==KernelId::AdaptivePush){
+      if(chosen==KernelId::AdaptivePush || o.round_oracle_profile){
         auto feature_start=Clock::now();
         scatter_adaptive_buckets(current_list,current_count,adaptive_categories.get(),adaptive_buckets.get(),
                                  adaptive_cursors.get(),g.vertices,host_adaptive_counts,stream);
         check(cudaStreamSynchronize(stream),"adaptive bucket scatter");
         const double scatter_ms=elapsed(feature_start);
-        stats.feature_ms+=scatter_ms;stats.adaptive_preparation_ms+=scatter_ms;
-        round_adaptive_preparation_ms+=scatter_ms;
+        oracle_adaptive_preparation_ms+=scatter_ms;
+        if(chosen==KernelId::AdaptivePush){
+          stats.feature_ms+=scatter_ms;stats.adaptive_preparation_ms+=scatter_ms;
+          round_adaptive_preparation_ms+=scatter_ms;
+        }
       }
       uint32_t launch_frontier_size=UINT32_MAX;
-      if(int(chosen)>=int(KernelId::PushPartitionBase) &&
+      if(o.round_oracle_profile){
+        launch_frontier_size=frontier_vertices;
+      }else if(int(chosen)>=int(KernelId::PushPartitionBase) &&
          int(chosen)<int(KernelId::PushPartitionBase)+push_partition_count){
         if(iteration_features)launch_frontier_size=frontier_vertices;
         else {
@@ -483,6 +541,83 @@ RunStats run(const HostGraph& g,std::vector<Query> queries,const Options& o,cons
                       current_mask,current_list,current_count,live.get(),q,words,o.algorithm,stream,error.get(),launch_frontier_size,
                       homogeneous_algorithm?nullptr:slot_algorithms.get()};
       context.algorithm=round_algorithm;
+      if(o.round_oracle_profile){
+        const auto oracle_round_start=Clock::now();
+        const auto candidates=core_oracle_candidates(o.round_oracle_reverse);
+        std::vector<uint64_t> reference_sums,reference_xors,reference_active_words;
+        uint32_t reference_count=0;uint64_t reference_pairs=0;
+        for(size_t candidate_position=0;candidate_position<candidates.size();++candidate_position){
+          const KernelId candidate=candidates[candidate_position];
+          const auto pipeline_start=Clock::now();
+          check(cudaEventRecord(oracle_total_start.get(),stream),"oracle total start");
+          check(cudaMemcpyAsync(next,old,cells*sizeof(float),cudaMemcpyDeviceToDevice,stream),"oracle value copy");
+          check(cudaMemsetAsync(error.get(),0,4,stream),"oracle error reset");
+          check(cudaEventRecord(oracle_copy_end.get(),stream),"oracle copy end");
+          FrontierContext oracle_fc{{old,g.vertices,p,o.group_width,storage_layout},
+            {next,g.vertices,p,o.group_width,storage_layout},next_mask,flags.get(),next_list,next_count,next_pair,
+            slot_counts.get(),live.get(),q,words,o.algorithm,o.frontier,temp.get(),
+            o.frontier==FrontierMode::Stable?stable_temp_bytes(g.vertices):0,stream,slot_algorithms.get()};
+          prepare_fused_frontier(oracle_fc);
+          check(cudaEventRecord(oracle_prepare_end.get(),stream),"oracle prepare end");
+          context.frontier_output={next_mask,flags.get(),next_list,next_count,next_pair,slot_counts.get(),false,true};
+          if(candidate==KernelId::AdaptivePush)
+            adaptive_push(context,adaptive_buckets.get(),host_adaptive_counts);
+          else launch(candidate,context);
+          check(cudaEventRecord(oracle_kernel_end.get(),stream),"oracle kernel end");
+          finish_fused_frontier(oracle_fc);
+          check(cudaEventRecord(oracle_finish_end.get(),stream),"oracle finish end");
+          check(cudaStreamSynchronize(stream),"round oracle candidate");
+          const double pipeline_wall_ms=elapsed(pipeline_start);
+          float copy_gpu_ms=0,prepare_gpu_ms=0,kernel_gpu_ms=0,finish_gpu_ms=0,pipeline_gpu_ms=0;
+          check(cudaEventElapsedTime(&copy_gpu_ms,oracle_total_start.get(),oracle_copy_end.get()),"oracle copy elapsed");
+          check(cudaEventElapsedTime(&prepare_gpu_ms,oracle_copy_end.get(),oracle_prepare_end.get()),"oracle prepare elapsed");
+          check(cudaEventElapsedTime(&kernel_gpu_ms,oracle_prepare_end.get(),oracle_kernel_end.get()),"oracle kernel elapsed");
+          check(cudaEventElapsedTime(&finish_gpu_ms,oracle_kernel_end.get(),oracle_finish_end.get()),"oracle finish elapsed");
+          check(cudaEventElapsedTime(&pipeline_gpu_ms,oracle_total_start.get(),oracle_finish_end.get()),"oracle pipeline elapsed");
+
+          std::vector<uint64_t> sums(q),xors(q),active_words(words);
+          uint32_t output_count=0;uint64_t output_pairs=0;int oracle_error=0;
+          fingerprint_values({next,g.vertices,p,o.group_width,storage_layout},0,q,
+                             fingerprint_sum.get(),fingerprint_xor.get(),stream);
+          check(cudaMemcpyAsync(sums.data(),fingerprint_sum.get(),q*sizeof(uint64_t),cudaMemcpyDeviceToHost,stream),"oracle fingerprint sums");
+          check(cudaMemcpyAsync(xors.data(),fingerprint_xor.get(),q*sizeof(uint64_t),cudaMemcpyDeviceToHost,stream),"oracle fingerprint xors");
+          check(cudaMemcpyAsync(active_words.data(),slot_counts.get(),words*sizeof(uint64_t),cudaMemcpyDeviceToHost,stream),"oracle active words");
+          check(cudaMemcpyAsync(&output_count,next_count,sizeof(output_count),cudaMemcpyDeviceToHost,stream),"oracle frontier count");
+          check(cudaMemcpyAsync(&output_pairs,next_pair,sizeof(output_pairs),cudaMemcpyDeviceToHost,stream),"oracle frontier pairs");
+          check(cudaMemcpyAsync(&oracle_error,error.get(),sizeof(oracle_error),cudaMemcpyDeviceToHost,stream),"oracle precision flag");
+          check(cudaStreamSynchronize(stream),"round oracle validation");
+          bool match=oracle_error==0;
+          if(candidate_position==0){
+            reference_sums=sums;reference_xors=xors;reference_active_words=active_words;
+            reference_count=output_count;reference_pairs=output_pairs;
+          }else match=match && sums==reference_sums && xors==reference_xors &&
+            active_words==reference_active_words && output_count==reference_count && output_pairs==reference_pairs;
+
+          const auto d=describe(candidate);
+          oracle_metrics<<(stats.batches-1)<<','<<global_round<<','<<(o.round_oracle_reverse?"reverse":"forward")<<','
+            <<candidate_position<<','<<active<<','<<int(chosen)<<','<<canonical_kernel_token(chosen)<<','
+            <<(is_pull_kernel(chosen)?"pull":"push")<<',';
+          if(o.push_mapping==Options::PushMapping::Iteration)oracle_metrics<<iteration_model_version();
+          oracle_metrics<<',';
+          if(selector.used_iteration_model())oracle_metrics<<selector.iteration_prediction().log_cost<<','
+            <<selector.iteration_prediction().relative_cost;
+          else oracle_metrics<<"nan,nan";
+          oracle_metrics<<','<<canonical_kernel_token(default_pull_kernel(p,g.vertices,g.edges()))<<','
+            <<int(candidate)<<','<<canonical_kernel_token(candidate)<<','<<d.family<<','
+            <<d.pull_mapping<<','<<d.pull_storage<<','<<d.pull_query_width<<','<<d.pull_reduction<<','<<int(d.pull_fused)<<','
+            <<d.group_size<<','<<d.warps_per_block<<','<<d.blocks_per_vertex<<','<<frontier_vertices<<','<<vertex_pairs<<','
+            <<pairs<<','<<rho<<','<<(frontier_vertices?double(vertex_pairs)/frontier_vertices:0)<<','
+            <<(vertex_pairs?double(pairs)/vertex_pairs:0)<<','<<(frontier_vertices?double(pairs)/frontier_vertices:0)<<','
+            <<(candidate==KernelId::AdaptivePush?oracle_adaptive_preparation_ms:0)<<','<<copy_gpu_ms<<','<<prepare_gpu_ms<<','
+            <<kernel_gpu_ms<<','<<finish_gpu_ms<<','<<pipeline_gpu_ms<<','<<pipeline_wall_ms<<','<<output_count<<','
+            <<output_pairs<<','<<int(match)<<'\n';
+          if(!oracle_metrics)throw std::runtime_error("round oracle metrics write failed: "+o.round_oracle_output_path);
+          if(!match)throw std::runtime_error("round oracle candidate mismatch at batch="+
+            std::to_string(stats.batches-1)+" round="+std::to_string(global_round)+" candidate="+
+            canonical_kernel_token(candidate));
+        }
+        stats.oracle_profile_ms+=elapsed(oracle_round_start);
+      }
       if(probe)probe(context,stats.batches-1,global_round);
       t=Clock::now();check(cudaMemcpyAsync(next,old,cells*sizeof(float),cudaMemcpyDeviceToDevice,stream),"value copy");
       check(cudaMemsetAsync(error.get(),0,4,stream),"error reset");

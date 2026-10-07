@@ -85,10 +85,10 @@ def sources_with_edges(path: Path):
     return sorted(seen)
 
 
-def write_queries(path, identity, rows, note):
+def write_queries(path, identity, rows, note, capacity=64):
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="") as f:
-        f.write(f"# graph_identity={identity}\n# capacity=64\n# {note}\n")
+        f.write(f"# graph_identity={identity}\n# capacity={capacity}\n# {note}\n")
         f.write("# id,source,score,offset,feature_key,algorithm,reference_rounds\n")
         w = csv.writer(f)
         for row in rows:
@@ -99,7 +99,7 @@ def sample(args):
     eligible = sources_with_edges(args.graph)
     if len(eligible) < 5120:
         raise ValueError(f"need at least 5120 positive-outdegree vertices, found {len(eligible)}")
-    ordinary = random.Random(42).sample(eligible, 1024)
+    ordinary = random.Random(args.ordinary_seed).sample(eligible, 1024)
     excluded = set(ordinary)
     candidate_population = [v for v in eligible if v not in excluded]
     candidates = random.Random(43).sample(candidate_population, 4096)
@@ -108,21 +108,22 @@ def sample(args):
     calibration = random.Random(45).sample(calibration_population, 1024)
     out = args.output
     write_queries(out / "bfs.csv", args.identity,
-                  [(i, s, 0, 0, 0, BFS, 0) for i, s in enumerate(ordinary)], "seed=42; uniform without replacement")
+                  [(i, s, 0, 0, 0, BFS, 0) for i, s in enumerate(ordinary)],
+                  f"seed={args.ordinary_seed}; uniform without replacement",args.capacity)
     write_queries(out / "sssp.csv", args.identity,
-                  [(100000 + i, s, 0, 0, 0, SSSP, 0) for i, s in enumerate(ordinary)], "same sources/order as bfs.csv")
+                  [(100000 + i, s, 0, 0, 0, SSSP, 0) for i, s in enumerate(ordinary)], "same sources/order as bfs.csv",args.capacity)
     for name, algorithm, base in (("bfs_candidates.csv", BFS, 200000), ("sssp_candidates.csv", SSSP, 300000)):
         write_queries(out / name, args.identity,
                       [(base + i, s, 0, 0, 0, algorithm, 0) for i, s in enumerate(candidates)],
-                      "seed=43; excludes ordinary sources; measure with M=64")
+                      f"seed=43; excludes ordinary sources; measure with M={args.capacity}",args.capacity)
     write_queries(out / "calibration_bfs.csv", args.identity,
                   [(400000 + i, s, 0, 0, 0, BFS, 0) for i, s in enumerate(calibration)],
-                  "seed=45; excludes ordinary and Mixed-tail candidate pools; mapping calibration only")
+                  "seed=45; excludes ordinary and Mixed-tail candidate pools; mapping calibration only",args.capacity)
     write_queries(out / "calibration_sssp.csv", args.identity,
                   [(500000 + i, s, 0, 0, 0, SSSP, 0) for i, s in enumerate(calibration)],
-                  "same calibration sources/order as calibration_bfs.csv")
+                  "same calibration sources/order as calibration_bfs.csv",args.capacity)
     (out / "manifest.json").write_text(json.dumps({
-        "N": 1024, "M": 64, "ordinary_seed": 42, "candidate_seed": 43,
+        "N": 1024, "M": args.capacity, "ordinary_seed": args.ordinary_seed, "candidate_seed": 43,
         "mixed_shuffle_seed": 44, "calibration_seed": 45, "graph_identity": args.identity,
         "positive_outdegree_vertices": len(eligible), "candidate_count_per_algorithm": 4096,
     }, indent=2) + "\n")
@@ -267,7 +268,8 @@ def main():
     sub = parser.add_subparsers(required=True)
     p = sub.add_parser("sample")
     p.add_argument("--graph", type=Path, required=True); p.add_argument("--identity", required=True)
-    p.add_argument("--output", type=Path, required=True); p.set_defaults(func=sample)
+    p.add_argument("--output", type=Path, required=True);p.add_argument("--capacity",type=int,default=64)
+    p.add_argument("--ordinary-seed",type=int,default=42);p.set_defaults(func=sample)
     p = sub.add_parser("mixed")
     p.add_argument("--identity", required=True); p.add_argument("--output", type=Path, required=True)
     p.add_argument("--bfs-queries", type=Path, required=True); p.add_argument("--bfs-completion", type=Path, required=True)

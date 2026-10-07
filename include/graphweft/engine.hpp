@@ -58,6 +58,12 @@ struct Options {
   bool profile_kernel = false;
   // One CSV row per executed round. Setting this also enables profile_kernel.
   std::string round_metrics_path;
+  // Profile the core Push/Pull candidate set against an identical input state
+  // before the production kernel advances each round.  Probe work is never
+  // committed to the logical execution.
+  bool round_oracle_profile = false;
+  bool round_oracle_reverse = false;
+  std::string round_oracle_output_path;
   enum class Selector { Threshold, Push, Pull, Replay } selector = Selector::Threshold;
   std::vector<KernelId> replay;
   // Used only after a non-Replay selector has chosen Pull. DensePull means
@@ -105,7 +111,7 @@ struct RunStats {
   uint64_t refill_deferred_incompatible_groups = 0;
   uint64_t group_mapping_rounds = 0, group_mapping_divergent_rounds = 0, group_mapping_launches = 0;
   uint64_t final_drain_rounds = 0;
-  double planning_ms = 0, prediction_ms = 0, initialization_ms = 0, recycle_ms = 0, copy_ms = 0, kernel_ms = 0, kernel_gpu_ms = 0, frontier_ms = 0, compare_ms = 0, feature_ms = 0, adaptive_preparation_ms = 0, selector_ms = 0, transfer_ms = 0, round_ms = 0, execution_ms = 0, task_wall_ms = 0, total_ms = 0;
+  double planning_ms = 0, prediction_ms = 0, initialization_ms = 0, recycle_ms = 0, copy_ms = 0, kernel_ms = 0, kernel_gpu_ms = 0, frontier_ms = 0, compare_ms = 0, feature_ms = 0, adaptive_preparation_ms = 0, selector_ms = 0, transfer_ms = 0, round_ms = 0, oracle_profile_ms = 0, execution_ms = 0, task_wall_ms = 0, total_ms = 0;
   double workload_ms = 0;
   std::vector<CompletionRecord> completions;
 };
