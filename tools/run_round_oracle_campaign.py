@@ -195,10 +195,17 @@ def main():
     args.output.mkdir(parents=True, exist_ok=True)
     paused=args.output/"PAUSED_INSUFFICIENT_SPACE.json"
     if paused.exists() and free_bytes(args.output)>=int(args.reserve_gib*GIB):paused.unlink()
-    atomic_json(args.output / "campaign.json", {"schema": 1, "manifest": str(args.manifest),
+    campaign_path=args.output/"campaign.json";previous={}
+    if campaign_path.exists():
+        try:previous=json.loads(campaign_path.read_text())
+        except json.JSONDecodeError:previous={}
+    requested=list(previous.get("jobs",[]))
+    for job in args.job:
+        if job not in requested:requested.append(job)
+    atomic_json(campaign_path, {"schema": 1, "manifest": str(args.manifest),
         "manifest_sha256": sha256(args.manifest), "git_commit": subprocess.check_output(
             ["git", "rev-parse", "HEAD"], cwd=PROJECT, text=True).strip(),
-        "started_utc": datetime.now(timezone.utc).isoformat(), "jobs": args.job})
+        "started_utc": previous.get("started_utc",datetime.now(timezone.utc).isoformat()), "jobs": requested})
     for specification in args.job:
         if not run_case(args, manifest, parse_job(specification)):
             return 2
