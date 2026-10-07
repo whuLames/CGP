@@ -17,7 +17,7 @@ def run(command,log):
     if result.returncode:raise RuntimeError(f"failed command; see {log}: {command}")
 
 
-def inspect(cli,graph,capacity,device,log):
+def inspect(cli,graph,capacity,device,log,target_budget_bytes=None):
     command=[str(cli),f"--graph={graph}","--legacy_int_weights","--n=0",f"--q={capacity}",
              "--layout=grouped","--group_width=32","--frontier_build=fused",f"--device={device}","--log_level=warn"]
     result=subprocess.run(command,cwd=PROJECT,text=True,capture_output=True)
@@ -26,7 +26,8 @@ def inspect(cli,graph,capacity,device,log):
     identity=re.search(r"graph=([0-9a-f]+)",result.stdout);total=re.search(r"memory.total=(\d+)",result.stdout)
     budget=re.search(r"budget=(\d+)",result.stdout)
     if not identity or not total or not budget:raise RuntimeError("incomplete graph inspection output")
-    return identity.group(1),int(total.group(1))<=int(budget.group(1))
+    effective_budget=int(budget.group(1)) if target_budget_bytes is None else target_budget_bytes
+    return identity.group(1),int(total.group(1))<=effective_budget
 
 
 def capacity_copy(source,target,capacity):
@@ -50,6 +51,8 @@ def main():
     parser.add_argument("--cli",type=Path,default=PROJECT/"build/graphweft_cli")
     parser.add_argument("--sampler",type=Path,default=PROJECT/"build/graphweft_sample_csr_workloads")
     parser.add_argument("--device",type=int,default=0);parser.add_argument("--seed",type=int,default=20261007)
+    parser.add_argument("--target-budget-bytes",type=int,
+                        help="evaluate M=128/256 fits against the target worker budget instead of the preparation GPU")
     args=parser.parse_args();args.graph=args.graph.resolve();args.output=args.output.resolve();args.cli=args.cli.resolve();args.sampler=args.sampler.resolve()
     args.output.mkdir(parents=True,exist_ok=True)
     if shutil.disk_usage(args.output).free<30*GIB:
@@ -58,9 +61,9 @@ def main():
         (args.output/"PAUSED_INSUFFICIENT_SPACE.json").write_text(json.dumps(state,indent=2)+"\n")
         print("*** WORKLOAD PREPARATION PAUSED: less than 30 GiB free ***");raise SystemExit(2)
     logs=args.output/"logs";logs.mkdir(parents=True,exist_ok=True)
-    identity,fit128=inspect(args.cli,args.graph,128,args.device,logs/"inspect_m128.log")
+    identity,fit128=inspect(args.cli,args.graph,128,args.device,logs/"inspect_m128.log",args.target_budget_bytes)
     if not fit128:raise RuntimeError("base graph does not pass the M=128 memory gate")
-    _,fit256=inspect(args.cli,args.graph,256,args.device,logs/"inspect_m256.log")
+    _,fit256=inspect(args.cli,args.graph,256,args.device,logs/"inspect_m256.log",args.target_budget_bytes)
     sampled=args.output/"sampled_m128"
     if not all((sampled/name).is_file() for name in ("sssp.csv","sssp_candidates.csv","sssp_calibration.csv")):
         if sampled.exists():shutil.rmtree(sampled)
@@ -78,9 +81,9 @@ def main():
         if derived.exists():shutil.rmtree(derived)
         run(["python3",str(PROJECT/"tools/prepare_strong_tail_workloads.py"),"augment",f"--graph={args.graph}",
              f"--output={derived}","--paths=256","--bands=256,512,1024,2048",f"--seed={args.seed}"],logs/"augment.log")
-    derived_identity,derived_fit128=inspect(args.cli,derived,128,args.device,logs/"inspect_derived_m128.log")
+    derived_identity,derived_fit128=inspect(args.cli,derived,128,args.device,logs/"inspect_derived_m128.log",args.target_budget_bytes)
     if not derived_fit128:raise RuntimeError("derived graph does not pass the M=128 memory gate")
-    _,derived_fit256=inspect(args.cli,derived,256,args.device,logs/"inspect_derived_m256.log")
+    _,derived_fit256=inspect(args.cli,derived,256,args.device,logs/"inspect_derived_m256.log",args.target_budget_bytes)
     long128=args.output/"long_tail_m128"
     if not (long128/"sssp_long_tail.csv").is_file():
         if long128.exists():shutil.rmtree(long128)

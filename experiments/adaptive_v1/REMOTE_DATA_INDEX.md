@@ -48,3 +48,11 @@ One `watch_ready_campaign.py` process per GPU claims receipts with an atomic ren
 As of the initial 2026-10-07 launch, `tech-ip`, `delicious-ti`, and `socfb-A-anon` passed conversion on `v100-a`; `soc-flickr-growth`, `soc-livejournal`, and `socfb-B-anon` passed on `v100-b`. Preparation continues sequentially per host before the GPU campaign is resumed so conversion traffic cannot contaminate formal measurements.
 
 `soc-sinaweibo` was imported directly from the pre-existing local symmetric CSR into `v100-b`; no transfer archive was created. Its sparse ID space expands the CSR row count to 58,655,849 despite the source page reporting 21M nodes. The measured allocation estimates are 62.95 GiB at M=128 and 120.63 GiB at M=256, so it is retained under `datasets/` but marked campaign-ineligible until IDs are compacted.
+
+## Accelerated build queue (2026-10-07)
+
+- All four V100 workers retain a historical-graph fallback queue, but newly prepared large graphs use a numeric READY prefix and run first.
+- `graph500-scale23-ef16-adj` is preparing both M=128 and M=256 workloads on the data host using the V100 target memory budget; it is assigned to `v100-a / 0`.
+- `uk-2002` was rebuilt from all 51 archive fragments: V=18,520,486, raw E=298,113,762, symmetric CSR E=529,444,615. It fits M=128 only and is queued at high priority on `v100-a / 1`.
+- The data host continuously processes `rgg-n-2-24-s0`, `delaunay-n24`, and `nlpkkt160`. Converted CSR bundles are streamed immediately to their assigned V100; workloads that exceed the RTX 3060 preparation budget are generated on the destination V100 before measurement.
+- Relay workers and dataset construction run in background processes. A completed conversion does not wait for the remainder of the build queue before transfer or execution.
