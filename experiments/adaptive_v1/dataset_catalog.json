@@ -23,7 +23,7 @@
     {"name":"wb-edu","role":"real","family":"web","vertices":9469213,"edges":57156537,"url":"https://nrvis.com/download/data/misc/wb-edu.zip","indexing":"auto"},
     {"name":"livejournal-heter","role":"real","family":"heterogeneous social","vertices":12692837,"edges":161017006,"url":"https://nrvis.com/download/data/heter/livejournal.zip","indexing":"auto"},
     {"name":"uk-2002","role":"real","family":"web","vertices":18484117,"edges":298113762,"url":"https://nrvis.com/download/data/misc/uk-2002.zip","indexing":"auto"},
-    {"name":"soc-sinaweibo","role":"real","family":"social","vertices":21000000,"edges":261000000,"url":"https://nrvis.com/download/data/massive/soc-sinaweibo.zip","indexing":"auto"},
+    {"name":"soc-sinaweibo","role":"real","family":"social","vertices":21000000,"edges":261000000,"url":"https://nrvis.com/download/data/massive/soc-sinaweibo.zip","indexing":"auto","screening":{"status":"rejected","source_page":"https://networkrepository.com/soc-sinaweibo.php","checked_utc":"2026-10-07","reported_vertices":21000000,"reported_edges":261000000,"estimated_undirected_edges":522642142,"actual_sparse_id_vertices":58655849,"reason":"existing symmetrized CSR needs 62.95 GiB at M=128 and 120.63 GiB at M=256; retain as imported data but exclude until ID compaction"}},
     {"name":"wikipedia-growth","role":"real","family":"temporal web","url":"https://nrvis.com/download/data/misc/wikipedia-growth.zip","indexing":"auto"},
     {"name":"wikipedia-link-de","role":"real","family":"encyclopedia web","url":"https://nrvis.com/download/data/misc/wikipedia_link_de.zip","indexing":"auto"},
     {"name":"wikipedia-link-fr","role":"real","family":"encyclopedia web","url":"https://nrvis.com/download/data/misc/wikipedia_link_fr.zip","indexing":"auto"},
