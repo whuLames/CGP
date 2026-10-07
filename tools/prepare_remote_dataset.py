@@ -124,7 +124,8 @@ def main():
     record={"status":"running","entry":entry,"started_utc":datetime.now(timezone.utc).isoformat()}
     atomic_json(complete,record)
     try:
-        if not run_monitored(["curl","-fL","--retry","5","--continue-at","-","--output",str(archive),entry["url"]],
+        if not run_monitored(["curl","-fL","--retry","20","--retry-all-errors","--retry-delay","5",
+                              "--continue-at","-","--output",str(archive),entry["url"]],
                              root,temporary/"download.log"):raise SystemExit(2)
         member=choose_member(archive)
         if not extract_member(archive,member,edge_text,root):
