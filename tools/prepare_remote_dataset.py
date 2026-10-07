@@ -48,16 +48,18 @@ def run_monitored(command,root,log,low=25*GIB):
     return True
 
 
-def extract_member(archive,member,target_path,root,low=25*GIB):
-    with zipfile.ZipFile(archive) as bundle,bundle.open(member) as source,target_path.open("wb") as target:
-        while True:
-            block=source.read(8<<20)
-            if not block:break
-            target.write(block)
-            if shutil.disk_usage(root).free<low:
-                pause(root,"runtime free space below 25 GiB",
-                      {"archive":str(archive),"member":member.filename})
-                return False
+def extract_members(archive,members,target_path,root,low=25*GIB):
+    with zipfile.ZipFile(archive) as bundle,target_path.open("wb") as target:
+        for member in members:
+            with bundle.open(member) as source:
+                while True:
+                    block=source.read(8<<20)
+                    if not block:break
+                    target.write(block)
+                    if shutil.disk_usage(root).free<low:
+                        pause(root,"runtime free space below 25 GiB",
+                              {"archive":str(archive),"member":member.filename})
+                        return False
     return True
 
 
@@ -127,13 +129,33 @@ def main():
         if not run_monitored(["curl","-fL","--retry","20","--retry-all-errors","--retry-delay","5",
                               "--continue-at","-","--output",str(archive),entry["url"]],
                              root,temporary/"download.log"):raise SystemExit(2)
-        member=choose_member(archive)
-        if not extract_member(archive,member,edge_text,root):
+        extraction=entry.get("archive_extraction","normal");working_archive=archive;repaired=None
+        if extraction=="zip_ff_concat_same_name":
+            member_name=entry.get("archive_member")
+            if not member_name:raise RuntimeError("repaired ZIP extraction requires archive_member")
+            repaired=temporary/(args.name+".repaired.zip");repaired.unlink(missing_ok=True)
+            if not run_monitored(["zip","-FF",str(archive),"--out",str(repaired)],root,
+                                 temporary/"repair.log"):raise SystemExit(2)
+            working_archive=repaired
+            with zipfile.ZipFile(working_archive) as bundle:
+                members=[item for item in bundle.infolist() if item.filename==member_name]
+            if len(members)<2:raise RuntimeError("repaired ZIP did not expose multiple expected fragments")
+            member_label=f"{member_name} ({len(members)} concatenated fragments)"
+        elif extraction=="normal":
+            member=choose_member(archive);members=[member];member_label=member.filename
+        else:raise RuntimeError(f"unknown archive_extraction mode: {extraction}")
+        if not extract_members(working_archive,members,edge_text,root):
             raise SystemExit(2)
         indexing=entry.get("indexing","auto");vertices=str(entry.get("vertices",0));seed=str(catalog.get("weight_seed",20261007))
         if not run_monitored([str(args.converter),str(edge_text),str(dataset),indexing,vertices,seed],
                              root,temporary/"convert.log"):raise SystemExit(2)
         conversion=json.loads((dataset/"conversion_manifest.json").read_text())
+        reported_edges=int(entry["screening"]["reported_edges"])
+        if conversion["raw_edges"]<int(reported_edges*.9):
+            raise RuntimeError(f"conversion saw only {conversion['raw_edges']} raw edges; expected about {reported_edges}")
+        minimum=int(catalog.get("screening_policy",{}).get("minimum_estimated_undirected_edges",100_000_000))
+        if conversion["symmetric_edges"]<minimum:
+            raise RuntimeError(f"converted graph has only {conversion['symmetric_edges']} symmetric edges")
         files={name:sha256(dataset/name) for name in ("csr_vlist.bin","csr_elist.bin","csr_weightlist.bin")}
         identities=[]
         for other in (root/"status").glob("*.json"):
@@ -144,13 +166,14 @@ def main():
         budget=int(.8*32*GIB)
         allocation={str(capacity):allocation_bytes(conversion["vertices"],conversion["symmetric_edges"],capacity)
                     for capacity in (128,256)}
-        record.update({"status":"success","dataset":args.name,"archive_member":member.filename,
+        record.update({"status":"success","dataset":args.name,"archive_member":member_label,
                        "archive_sha256":sha256(archive),"conversion":conversion,"files_sha256":files,
                        "duplicate_of":identities,"allocation_bytes":allocation,
                        "fits_v100_32g_80pct":{key:value<=budget for key,value in allocation.items()},
                        "completed_utc":datetime.now(timezone.utc).isoformat()})
         atomic_json(complete,record)
         archive.unlink();edge_text.unlink()
+        if repaired is not None:repaired.unlink()
         print(json.dumps(record,indent=2))
     except Exception as error:
         record.update({"status":"failed","dataset":args.name,"error":repr(error),
