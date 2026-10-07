@@ -39,6 +39,12 @@ The campaign is sharded as follows. These assignments are stable across resume; 
 
 Per-dataset preparation state and canonical hashes are in `/data/graphweft-adaptive-v1/status/`. Per-GPU campaign state is in `pipeline/gpu0.json` and `pipeline/gpu1.json`; detailed logs are in `pipeline/`. Generated graphs and workload bundles are in `datasets/` and `workloads/`, while raw and analyzed timing data remain in `results/` on the owning host. Temporary download archives and extracted edge lists are deleted after each successful conversion.
 
+## Streaming handoff
+
+Dataset preparation and V100 execution are asynchronous per dataset; there is no all-datasets barrier. The preparation host transfers `datasets/NAME`, `workloads/NAME`, and `status/NAME.json` completely, then runs `publish_ready_dataset.py` on the destination as the final atomic step. This writes a receipt under `inbox/gpuN/ready/` only after hashing every required CSR, workload, status, and campaign-manifest file.
+
+One `watch_ready_campaign.py` process per GPU claims receipts with an atomic rename, revalidates size and SHA-256, and launches the fixed campaign immediately. `run_adaptive_remote_pipeline.py` also holds `pipeline/gpuN.lock` for its entire lifetime, so manual and READY-triggered work cannot overlap on the same GPU. Receipts move to `done/` or `failed/`; a partially transferred dataset has no READY receipt and is invisible to compute workers.
+
 As of the initial 2026-10-07 launch, `tech-ip`, `delicious-ti`, and `socfb-A-anon` passed conversion on `v100-a`; `soc-flickr-growth`, `soc-livejournal`, and `socfb-B-anon` passed on `v100-b`. Preparation continues sequentially per host before the GPU campaign is resumed so conversion traffic cannot contaminate formal measurements.
 
 `soc-sinaweibo` was imported directly from the pre-existing local symmetric CSR into `v100-b`; no transfer archive was created. Its sparse ID space expands the CSR row count to 58,655,849 despite the source page reporting 21M nodes. The measured allocation estimates are 62.95 GiB at M=128 and 120.63 GiB at M=256, so it is retained under `datasets/` but marked campaign-ineligible until IDs are compacted.

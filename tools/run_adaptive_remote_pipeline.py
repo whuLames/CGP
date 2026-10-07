@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Continue prepared datasets through workloads and the complete GPU campaign."""
 import argparse
+import fcntl
 import json
 import subprocess
 import sys
@@ -52,6 +53,8 @@ def main():
     parser.add_argument("--device",type=int,required=True);parser.add_argument("--dataset",action="append",required=True)
     parser.add_argument("--wait-hours",type=float,default=168);args=parser.parse_args();root=args.root.resolve()
     pipeline=root/"pipeline";pipeline.mkdir(parents=True,exist_ok=True);state_path=pipeline/f"gpu{args.device}.json"
+    lease=(pipeline/f"gpu{args.device}.lock").open("a+")
+    fcntl.flock(lease,fcntl.LOCK_EX)
     state={"status":"running","device":args.device,"datasets":args.dataset,
            "started_utc":datetime.now(timezone.utc).isoformat(),"completed":[],"skipped":[]};atomic_json(state_path,state)
     deadline=time.time()+args.wait_hours*3600
