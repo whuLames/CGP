@@ -38,6 +38,12 @@ def capacity_copy(source,target,capacity):
     target.write_text("\n".join(lines)+"\n")
 
 
+def complete_csv(path,expected_rows):
+    if not path.is_file():return False
+    with path.open() as handle:
+        return sum(1 for line in handle if line.strip() and not line.startswith("#"))>=expected_rows+1
+
+
 def main():
     parser=argparse.ArgumentParser();parser.add_argument("--name",required=True)
     parser.add_argument("--graph",type=Path,required=True);parser.add_argument("--output",type=Path,required=True)
@@ -56,23 +62,28 @@ def main():
     if not fit128:raise RuntimeError("base graph does not pass the M=128 memory gate")
     _,fit256=inspect(args.cli,args.graph,256,args.device,logs/"inspect_m256.log")
     sampled=args.output/"sampled_m128"
-    if not sampled.exists():run([str(args.sampler),str(args.graph),str(sampled),identity,"128",str(args.seed)],logs/"sample.log")
+    if not all((sampled/name).is_file() for name in ("sssp.csv","sssp_candidates.csv","sssp_calibration.csv")):
+        if sampled.exists():shutil.rmtree(sampled)
+        run([str(args.sampler),str(args.graph),str(sampled),identity,"128",str(args.seed)],logs/"sample.log")
     completions=args.output/"candidate_completions.csv"
-    if not completions.exists():
+    if not complete_csv(completions,4096):
+        completions.unlink(missing_ok=True)
         run([str(args.cli),f"--graph={args.graph}","--legacy_int_weights",f"--queries={sampled/'sssp_candidates.csv'}",
              "--n=4096","--q=128","--layout=grouped","--group_width=32","--algorithm=sssp","--selector=threshold",
              "--push_mapping=iteration","--pull_kernel=auto","--frontier=unordered","--frontier_build=fused",
              "--frontier_mask64=true",f"--completion_output={completions}",f"--device={args.device}","--log_level=warn"],
             logs/"candidate_completion.log")
     derived=args.output/"derived_graph"
-    if not derived.exists():
+    if not all((derived/name).is_file() for name in ("csr_vlist.bin","csr_elist.bin","csr_weightlist.bin","augmentation_manifest.json")):
+        if derived.exists():shutil.rmtree(derived)
         run(["python3",str(PROJECT/"tools/prepare_strong_tail_workloads.py"),"augment",f"--graph={args.graph}",
              f"--output={derived}","--paths=256","--bands=256,512,1024,2048",f"--seed={args.seed}"],logs/"augment.log")
     derived_identity,derived_fit128=inspect(args.cli,derived,128,args.device,logs/"inspect_derived_m128.log")
     if not derived_fit128:raise RuntimeError("derived graph does not pass the M=128 memory gate")
     _,derived_fit256=inspect(args.cli,derived,256,args.device,logs/"inspect_derived_m256.log")
     long128=args.output/"long_tail_m128"
-    if not long128.exists():
+    if not (long128/"sssp_long_tail.csv").is_file():
+        if long128.exists():shutil.rmtree(long128)
         run(["python3",str(PROJECT/"tools/prepare_adaptive_sssp_workload.py"),
              f"--candidates={sampled/'sssp_candidates.csv'}",f"--completions={completions}",
              f"--augmentation={derived/'augmentation_manifest.json'}",f"--identity={derived_identity}",
