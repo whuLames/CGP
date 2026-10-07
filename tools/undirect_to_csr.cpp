@@ -60,7 +60,26 @@ int main(int argc,char** argv){
       --max_vertex;
     }
     uint64_t vertices=declared_vertices?declared_vertices:max_vertex+1;
-    if(vertices<=max_vertex || vertices>UINT32_MAX)throw std::runtime_error("invalid declared vertex count");
+    bool compacted=false;std::vector<uint32_t> external_ids;
+    const uint64_t external_id_span=max_vertex+1;
+    if(vertices<=max_vertex){
+      // Repository metadata normally reports the number of unique vertices, not
+      // an upper bound for external IDs.  Compact a sparse external ID space
+      // instead of rejecting an otherwise valid graph or allocating its holes.
+      constexpr uint64_t max_remap_bytes=8ULL<<30;
+      if(external_id_span>UINT32_MAX || external_id_span*sizeof(uint32_t)>max_remap_bytes)
+        throw std::runtime_error("external vertex ID span is too large for dense remapping");
+      std::vector<uint32_t> remap(size_t(external_id_span),UINT32_MAX);
+      for(const auto edge:edges){remap[source(edge)]=0;remap[target(edge)]=0;}
+      external_ids.reserve(size_t(declared_vertices));
+      for(uint64_t id=0;id<external_id_span;++id)if(remap[size_t(id)]!=UINT32_MAX){
+        remap[size_t(id)]=uint32_t(external_ids.size());
+        external_ids.push_back(uint32_t(id)+(one_based?1U:0U));
+      }
+      for(auto& edge:edges)edge=pack(remap[source(edge)],remap[target(edge)]);
+      vertices=external_ids.size();compacted=true;
+    }
+    if(!vertices || vertices>UINT32_MAX)throw std::runtime_error("invalid vertex count after ID handling");
     std::sort(edges.begin(),edges.end());edges.erase(std::unique(edges.begin(),edges.end()),edges.end());
     if(edges.size()>=uint64_t(INT32_MAX))throw std::runtime_error("symmetric edge count exceeds legacy int32 CSR limit");
     fs::create_directories(output);
@@ -78,13 +97,23 @@ int main(int argc,char** argv){
       rows.write(reinterpret_cast<const char*>(&offset),sizeof(offset));
     }
     if(cursor!=edges.size() || !rows || !cols || !weights)throw std::runtime_error("CSR write failed");
+    if(compacted){
+      std::ofstream mapping(output/"external_vertex_ids.bin",std::ios::binary);
+      mapping.write(reinterpret_cast<const char*>(external_ids.data()),
+                    std::streamsize(external_ids.size()*sizeof(uint32_t)));
+      if(!mapping)throw std::runtime_error("external vertex ID mapping write failed");
+    }
     std::ofstream manifest(output/"conversion_manifest.json");
     manifest<<"{\n  \"schema\": 1,\n  \"source\": \""<<fs::absolute(input).string()<<"\",\n"
       <<"  \"indexing\": \""<<(one_based?"one":"zero")<<"\",\n  \"raw_edges\": "<<raw_edges
+      <<",\n  \"declared_vertices\": "<<declared_vertices
+      <<",\n  \"external_id_span\": "<<external_id_span
+      <<",\n  \"external_ids_compacted\": "<<(compacted?"true":"false")
+      <<",\n  \"external_vertex_map\": "<<(compacted?"\"external_vertex_ids.bin\"":"null")
       <<",\n  \"vertices\": "<<vertices<<",\n  \"symmetric_edges\": "<<edges.size()
       <<",\n  \"weight_seed\": "<<seed<<",\n  \"weight_range\": [1, 64],\n"
       <<"  \"duplicates_removed\": "<<(2*raw_edges-edges.size())<<"\n}\n";
     std::cout<<"vertices="<<vertices<<" raw_edges="<<raw_edges<<" symmetric_edges="<<edges.size()
-      <<" indexing="<<(one_based?"one":"zero")<<'\n';
+      <<" indexing="<<(one_based?"one":"zero")<<" compacted="<<(compacted?"true":"false")<<'\n';
   }catch(const std::exception& error){std::cerr<<"undirect_to_csr: "<<error.what()<<'\n';return 1;}
 }
