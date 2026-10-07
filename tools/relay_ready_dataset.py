@@ -69,7 +69,8 @@ def main():
     relative = [f"datasets/{args.dataset}", f"workloads/{args.dataset}",
                 f"status/{args.dataset}.json"]
     quoted = " ".join(shlex.quote(value) for value in relative)
-    byte_count = int(remote(source, f"du -sb {quoted} | awk '{{s += $1}} END {{print s}}'").stdout)
+    byte_count = int(remote(source, f"cd {shlex.quote(args.source_root)} && "
+                                   f"du -sb {quoted} | awk '{{s += $1}} END {{print s}}'").stdout)
     free = int(remote(destination, f"df -B1 --output=avail {shlex.quote(args.destination_root)} | tail -1").stdout)
     if free - byte_count < 30 * GIB:
         raise RuntimeError(f"destination would fall below 30 GiB reserve: free={free}, bundle={byte_count}")
