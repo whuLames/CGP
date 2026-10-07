@@ -20,7 +20,9 @@ Credentials are deliberately not stored in this repository. Datasets are sharded
 
 ## Dataset policy
 
-The machine-readable candidate list is [`dataset_catalog.json`](dataset_catalog.json). It is intentionally broader than a frozen shortlist. Real graphs are admitted first after conversion, canonical-hash deduplication, and the `M=128` memory gate. The four structural controls cover power-law, random-geometric, planar, and numerical-matrix structure. RGG and Delaunay are geometric controls, not road-network datasets.
+The machine-readable candidate list is [`dataset_catalog.json`](dataset_catalog.json). A catalog entry is not download authorization. Before any new transfer, its `screening` object must record the original SNAP or Network Repository page, check time, webpage-reported V/E, estimated post-symmetry E, and an explicit `approved` decision. The downloader rejects unscreened entries.
+
+Primary graphs require estimated post-symmetry `E >= 100M` and must fit at least one of `M=128` or `M=256` under the 80% V100-32GB gate. Download, extraction, conversion, exact post-dedup size validation, and workload generation happen only after that inexpensive metadata check. Smaller graphs already present are controls and do not count toward the primary 12-real-graph target. The structural controls cover power-law, random-geometric, planar, and numerical-matrix structure. RGG and Delaunay are geometric controls, not road-network datasets.
 
 The seven pre-existing graphs (`cit-Patents`, `indochina`, `roadNet-CA`, `roadNet-TX`, `soc-LiveJournal1`, `soc-orkut`, `soc-twitter`) are historical anchors and do not count toward the new-dataset target.
 

@@ -78,6 +78,29 @@ def allocation_bytes(vertices,edges,capacity):
             ((capacity+31)//32)*32+vertices+4*vertices+40)
 
 
+def validate_screening(catalog,entry):
+    policy=catalog.get("screening_policy",{})
+    screening=entry.get("screening",{})
+    required=("status","source_page","checked_utc","reported_vertices","reported_edges",
+              "estimated_undirected_edges")
+    missing=[key for key in required if screening.get(key) in (None,"")]
+    if missing or screening.get("status")!="approved":
+        raise RuntimeError(f"dataset has not passed source-page screening: missing={missing}")
+    page=screening["source_page"]
+    allowed=tuple(policy.get("allowed_source_page_prefixes",()))
+    if not allowed or not page.startswith(allowed):
+        raise RuntimeError(f"source_page is not an approved original catalog page: {page}")
+    vertices=int(screening["reported_vertices"]);edges=int(screening["reported_edges"])
+    estimated=int(screening["estimated_undirected_edges"])
+    minimum=int(policy.get("minimum_estimated_undirected_edges",100_000_000))
+    if vertices<=0 or edges<=0 or estimated<minimum:
+        raise RuntimeError(f"source-page screening rejects V={vertices}, E={edges}, estimated_undirected={estimated}")
+    budget=int(float(policy.get("v100_memory_fraction",.8))*32*GIB)
+    capacities=policy.get("required_one_of_capacities",[128,256])
+    if not any(allocation_bytes(vertices,estimated,int(capacity))<=budget for capacity in capacities):
+        raise RuntimeError("source-page estimate does not fit either approved V100 capacity")
+
+
 def main():
     parser=argparse.ArgumentParser();parser.add_argument("--catalog",type=Path,required=True)
     parser.add_argument("--name",required=True);parser.add_argument("--root",type=Path,required=True)
@@ -90,6 +113,7 @@ def main():
     complete=status/f"{args.name}.json"
     if complete.exists() and json.loads(complete.read_text()).get("status")=="success":
         print("already complete",args.name);return
+    validate_screening(catalog,entry)
     expected_archive=int(entry.get("archive_bytes",0));expected_raw=int(entry.get("raw_bytes",expected_archive*5))
     expected_csr=entry.get("vertices",0)*4+entry.get("edges",0)*16
     projected=expected_archive+expected_raw+expected_csr+30*GIB

@@ -1,7 +1,17 @@
 {
   "schema": 1,
   "weight_seed": 20261007,
-  "selection_policy": "real-first; post-symmetry V100 M=128 allocation gate; canonical CSR hashes deduplicate aliases",
+  "selection_policy": "original-page screening first; estimated post-symmetry E>=100M and V100 M=128-or-256 fit before download; canonical CSR hashes deduplicate aliases",
+  "screening_policy": {
+    "minimum_estimated_undirected_edges": 100000000,
+    "required_one_of_capacities": [128, 256],
+    "v100_memory_fraction": 0.8,
+    "allowed_source_page_prefixes": [
+      "https://snap.stanford.edu/data/",
+      "https://networkrepository.com/"
+    ],
+    "note": "Every new download requires an approved screening object populated from the original dataset webpage. Unscreened catalog entries are intentionally blocked."
+  },
   "datasets": [
     {"name":"tech-ip","role":"real","family":"internet topology","vertices":2250498,"edges":21644714,"url":"https://nrvis.com/download/data/tech/tech-ip.zip","indexing":"auto"},
     {"name":"soc-flickr-growth","role":"real","family":"temporal social","vertices":2302925,"edges":33140017,"url":"https://nrvis.com/download/data/dynamic/soc-flickr-growth.zip","indexing":"auto"},
