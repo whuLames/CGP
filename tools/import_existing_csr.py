@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import struct
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -48,6 +49,10 @@ def main():
     parser.add_argument("--name", required=True)
     parser.add_argument("--source", required=True, type=Path)
     parser.add_argument("--root", required=True, type=Path)
+    parser.add_argument("--compact-ids", action="store_true",
+                        help="renumber non-isolated CSR rows into a contiguous [0,V) range")
+    parser.add_argument("--compactor", type=Path,
+                        default=Path(__file__).resolve().parents[1] / "build/graphweft_compact_csr_ids")
     args = parser.parse_args()
     source = args.source.resolve(); root = args.root.resolve()
     names = ("csr_vlist.bin", "csr_elist.bin", "csr_weightlist.bin")
@@ -68,15 +73,28 @@ def main():
     target = root / "datasets" / args.name
     if target.exists():
         raise RuntimeError(f"target already exists: {target}")
-    target.mkdir(parents=True)
-    methods = {name: link_or_copy(path, target / name) for name, path in zip(names, paths)}
+    if args.compact_ids:
+        result = subprocess.run([str(args.compactor.resolve()), str(source), str(target)], text=True)
+        if result.returncode:
+            raise RuntimeError("CSR ID compaction failed")
+        methods = {name: "compacted" for name in names}
+    else:
+        target.mkdir(parents=True)
+        methods = {name: link_or_copy(path, target / name) for name, path in zip(names, paths)}
+    paths = [target / name for name in names]
+    vertices = paths[0].stat().st_size // 4 - 1
+    edges = paths[1].stat().st_size // 4
     hashes = {name: digest(target / name) for name in names}
     allocation = {str(capacity): allocation_bytes(vertices, edges, capacity)
                   for capacity in (128, 256)}
     budget = int(.8 * 32 * GIB)
-    manifest = {"schema": 1, "construction": "trusted_legacy_csr_import",
+    generated = json.loads((target / "conversion_manifest.json").read_text()) if args.compact_ids else {}
+    manifest = {**generated, "schema": 1, "construction": "compact_existing_symmetric_csr" if args.compact_ids else "trusted_legacy_csr_import",
                 "source": str(source), "vertices": vertices, "symmetric_edges": edges,
                 "link_methods": methods, "files_sha256": hashes}
+    if args.compact_ids:
+        manifest["external_ids_compacted"] = True
+        manifest["external_vertex_map"] = "external_vertex_ids.bin"
     atomic_json(target / "conversion_manifest.json", manifest)
     status = {"status": "success", "dataset": args.name, "campaign_eligible": allocation["128"] <= budget,
               "conversion": manifest, "files_sha256": hashes, "allocation_bytes": allocation,

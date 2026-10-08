@@ -238,6 +238,11 @@ retirement wave。不要用 `recycle_ms / group_refills` 解释纯粹的单 grou
 生产物理 values 是 VM。对 `G=8/16/32`，`reset_slot_range()` 使用对应的
 coalesced VM group reset kernel。
 
+外部顶点 ID 必须在进入实验前映射为连续 `[0,V)`。对于已经是对称 CSR、但 row
+空间按稀疏外部 ID 展开的历史数据，使用 `graphweft_compact_csr_ids` 删除空洞并
+生成 `external_vertex_ids.bin`；不得把 `max_external_id + 1` 当作实际顶点数进行
+显存门槛判断。
+
 本分支没有修改 refill admission、SSSP wave refill、interference-aware refill
 或 bridge refill 的决策逻辑。
 
