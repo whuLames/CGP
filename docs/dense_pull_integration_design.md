@@ -241,6 +241,28 @@ coalesced VM group reset kernel。
 本分支没有修改 refill admission、SSSP wave refill、interference-aware refill
 或 bridge refill 的决策逻辑。
 
+### Adaptive campaign sampling policy
+
+后续数据采集分为两层，且 probe 从不提交状态，因此不会改变生产 Hybrid 的轨迹：
+
+1. 所有数据集的每个迭代轮次都执行 paired probe：已有 Iteration Push 模型预测的
+   Push partition，加固定的 `pull-dense-parallel-smem-q32`。无论生产 Hybrid 当轮
+   选择 Push 还是 Pull，两者都从完全相同的 old values、frontier、live slots 和
+   query mapping 开始执行，并比较输出 fingerprint/frontier。
+2. 代表性数据集执行 core probe：完整测试 30 个静态 Push、SharedPush、
+   AdaptivePush 和 21 个 Dense Pull，共 53 个候选。当前代表集为
+   `soc-orkut`、`uk-2002`、`graph500-scale23-ef16-adj` 和 `delaunay-n24`，分别覆盖
+   social、web、synthetic power-law 和 planar 结构。
+
+CLI 使用 `--round_oracle_profile=paired|core`。paired Pull 可通过
+`--round_oracle_pull_kernel=TOKEN` 显式调整；默认 token 是上述跨图表现较稳健的
+parallel SMEM Q32 候选。分析输出同时保留 best Push、best Pull、全局 winner、
+生产 Hybrid 的方向及方向 regret，用于判断 Push/Pull 阈值是否合理。
+
+远程 campaign 只运行 `none` 和 `eager_global` refill；后续实验不再运行
+`eager_group`。两类 profile 分别写入 `oracle_paired/` 和 `oracle/`，避免断点续跑时
+混合候选集合。一次完整 core 结果可以满足 paired 覆盖要求，反向则不成立。
+
 ## 11. 指标与可观测性
 
 `--profile_kernel` 使用 CUDA event 累加生产 graph kernel 的 GPU 时间。

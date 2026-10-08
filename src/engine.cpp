@@ -182,6 +182,8 @@ void validate(const HostGraph& g,const Options& o,const std::vector<Query>& quer
     const uint32_t p=physical_slots(o,o.capacity);
     if(p<32 || p>256 || p%32)
       throw std::invalid_argument("round oracle profiling requires a physical capacity in [32,256] divisible by 32");
+    if(o.round_oracle_paired && !is_dense_pull_kernel(o.round_oracle_pull_kernel))
+      throw std::invalid_argument("paired round oracle requires a dense Pull candidate");
   }else if(!o.round_oracle_output_path.empty())throw std::invalid_argument("round oracle output requires profiling");
 }
 }
@@ -214,7 +216,8 @@ AllocationPlan allocation_plan(const HostGraph& g,const Options& o,uint32_t q) {
     mul((q+o.group_width-1)/o.group_width,sizeof(uint32_t)+2*sizeof(uint64_t)):0;
   a.bytes["scalars"]=2*4+3*8+4;
   a.bytes["stable_temp"]=o.frontier==FrontierMode::Stable?stable_temp_bytes(g.vertices):0;
-  const bool need_adaptive=o.push_mapping==Options::PushMapping::Adaptive || o.round_oracle_profile;
+  const bool need_adaptive=o.push_mapping==Options::PushMapping::Adaptive ||
+    (o.round_oracle_profile && !o.round_oracle_paired);
   a.bytes["adaptive_categories"]=need_adaptive?mul(v,1):0;
   a.bytes["adaptive_buckets"]=need_adaptive?mul(v,4):0;
   a.bytes["adaptive_counters"]=need_adaptive?
@@ -301,7 +304,8 @@ RunStats run(const HostGraph& g,std::vector<Query> queries,const Options& o,cons
   Device<uint32_t> group_frontier_vertices(o.group_iteration_mapping?group_count:0,"group frontier vertices");
   Device<uint64_t> group_vertex_pairs(o.group_iteration_mapping?group_count:0,"group vertex pairs");
   Device<uint64_t> group_edge_pairs(o.group_iteration_mapping?group_count:0,"group edge pairs");
-  const bool need_adaptive=o.push_mapping==Options::PushMapping::Adaptive || o.round_oracle_profile;
+  const bool need_adaptive=o.push_mapping==Options::PushMapping::Adaptive ||
+    (o.round_oracle_profile && !o.round_oracle_paired);
   Device<uint8_t> adaptive_categories(need_adaptive?g.vertices:0,"adaptive categories");
   Device<uint32_t> adaptive_buckets(need_adaptive?g.vertices:0,"adaptive buckets");
   Device<uint32_t> adaptive_counts(need_adaptive?adaptive_push_bucket_count:0,"adaptive counts");
@@ -347,7 +351,7 @@ RunStats run(const HostGraph& g,std::vector<Query> queries,const Options& o,cons
     if(!parent.empty())std::filesystem::create_directories(parent);
     oracle_metrics.open(o.round_oracle_output_path,std::ios::trunc);
     if(!oracle_metrics)throw std::runtime_error("cannot write round oracle metrics: "+o.round_oracle_output_path);
-    oracle_metrics<<"batch,round,candidate_order,candidate_index,live_queries,production_kernel_id,production_kernel_token,"
+    oracle_metrics<<"batch,round,oracle_profile,candidate_order,candidate_index,live_queries,production_kernel_id,production_kernel_token,"
       "production_direction,iteration_model_version,predicted_log_cost,predicted_relative_cost,auto_pull_token,"
       "kernel_id,kernel_token,kernel_family,"
       "pull_mapping,pull_storage,pull_query_width,pull_reduction,pull_fused,group_size,warps_per_block,"
@@ -445,7 +449,8 @@ RunStats run(const HostGraph& g,std::vector<Query> queries,const Options& o,cons
       double round_adaptive_preparation_ms=0;
       const bool production_adaptive_features=o.push_mapping==Options::PushMapping::Adaptive &&
         o.selector!=Options::Selector::Pull && o.selector!=Options::Selector::Replay;
-      const bool adaptive_features=production_adaptive_features || o.round_oracle_profile;
+      const bool adaptive_features=production_adaptive_features ||
+        (o.round_oracle_profile && !o.round_oracle_paired);
       const bool iteration_features=o.push_mapping==Options::PushMapping::Iteration &&
         o.selector!=Options::Selector::Pull && o.selector!=Options::Selector::Replay;
       uint32_t frontier_vertices=UINT32_MAX;
@@ -506,7 +511,7 @@ RunStats run(const HostGraph& g,std::vector<Query> queries,const Options& o,cons
         }
       }
       const double round_selector_ms=elapsed(t);stats.selector_ms+=round_selector_ms;
-      if(chosen==KernelId::AdaptivePush || o.round_oracle_profile){
+      if(chosen==KernelId::AdaptivePush || (o.round_oracle_profile && !o.round_oracle_paired)){
         auto feature_start=Clock::now();
         scatter_adaptive_buckets(current_list,current_count,adaptive_categories.get(),adaptive_buckets.get(),
                                  adaptive_cursors.get(),g.vertices,host_adaptive_counts,stream);
@@ -543,7 +548,13 @@ RunStats run(const HostGraph& g,std::vector<Query> queries,const Options& o,cons
       context.algorithm=round_algorithm;
       if(o.round_oracle_profile){
         const auto oracle_round_start=Clock::now();
-        const auto candidates=core_oracle_candidates(o.round_oracle_reverse);
+        std::vector<KernelId> candidates;
+        if(o.round_oracle_paired){
+          const auto push=predict_iteration_push({pairs,active,rho,g.edges()!=0,vertex_pairs,
+            frontier_vertices,g.vertices,g.edges()});
+          candidates={push_partition_id(push.candidate),o.round_oracle_pull_kernel};
+          if(o.round_oracle_reverse)std::reverse(candidates.begin(),candidates.end());
+        }else candidates=core_oracle_candidates(o.round_oracle_reverse);
         std::vector<uint64_t> reference_sums,reference_xors,reference_active_words;
         uint32_t reference_count=0;uint64_t reference_pairs=0;
         for(size_t candidate_position=0;candidate_position<candidates.size();++candidate_position){
@@ -594,7 +605,8 @@ RunStats run(const HostGraph& g,std::vector<Query> queries,const Options& o,cons
             active_words==reference_active_words && output_count==reference_count && output_pairs==reference_pairs;
 
           const auto d=describe(candidate);
-          oracle_metrics<<(stats.batches-1)<<','<<global_round<<','<<(o.round_oracle_reverse?"reverse":"forward")<<','
+          oracle_metrics<<(stats.batches-1)<<','<<global_round<<','<<(o.round_oracle_paired?"paired":"core")<<','
+            <<(o.round_oracle_reverse?"reverse":"forward")<<','
             <<candidate_position<<','<<active<<','<<int(chosen)<<','<<canonical_kernel_token(chosen)<<','
             <<(is_pull_kernel(chosen)?"pull":"push")<<',';
           if(o.push_mapping==Options::PushMapping::Iteration)oracle_metrics<<iteration_model_version();

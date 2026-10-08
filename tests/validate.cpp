@@ -132,6 +132,12 @@ int main(){
     std::filesystem::remove(path);
     if(rows!=stats.rounds*uint64_t(push_partition_count+2+dense_pull_candidate_count))
       throw std::runtime_error("round oracle row count mismatch");
+    o.round_oracle_paired=true;
+    auto paired=run(directed,queries,o);
+    std::ifstream paired_input(path);rows=0;
+    while(std::getline(paired_input,line))if(rows || line.rfind("batch,round,",0)!=0)++rows;
+    paired_input.close();std::filesystem::remove(path);
+    if(rows!=paired.rounds*2)throw std::runtime_error("paired round oracle row count mismatch");
   }
   {
     bool rejected=false;

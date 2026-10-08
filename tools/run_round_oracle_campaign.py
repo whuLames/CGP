@@ -137,14 +137,27 @@ def run_case(args, manifest, job):
         raise ValueError(f"unknown workload {dataset_name}/{workload}")
     case = args.output / dataset_name / workload / f"m{capacity}" / refill
     case.mkdir(parents=True, exist_ok=True)
-    atomic_json(case / "config.json", {"dataset": dataset_name, "dataset_config": dataset,
+    config_path = case / "config.json"
+    completion_path = case / "COMPLETE.json"
+    if completion_path.exists() and config_path.exists():
+        try:
+            previous_profile = json.loads(config_path.read_text()).get("oracle_profile", "core")
+            # A completed core search strictly contains the paired probes.
+            if previous_profile == args.oracle_profile or (previous_profile == "core" and args.oracle_profile == "paired"):
+                print("skip compatible complete case", case, previous_profile, flush=True)
+                return True
+        except (OSError, json.JSONDecodeError):
+            pass
+    atomic_json(config_path, {"dataset": dataset_name, "dataset_config": dataset,
         "workload": workload, "N": 1024, "M": capacity, "Q": capacity, "G": 32,
         "refill": refill, "warmups": 1, "formal_repetitions": 2,
+        "oracle_profile": args.oracle_profile,
         "pull_threshold": args.pull_threshold, "device": device,
         "binary": str(args.cli), "binary_sha256": sha256(args.cli)})
     common = common_command(args, dataset, workload, capacity, refill)
 
-    variants = ("oracle", "adaptive", "iteration")
+    oracle_variant = "oracle" if args.oracle_profile == "core" else "oracle_paired"
+    variants = (oracle_variant, "adaptive", "iteration")
     for variant in variants:
         if refill == "eager_group" and variant == "adaptive":
             continue  # per-group Iteration mapping has no AdaptivePush equivalent
@@ -153,8 +166,8 @@ def run_case(args, manifest, job):
             label = "warmup" if repetition < 0 else f"rep{repetition}"
             run_dir = variant_root / label
             command = list(common)
-            if variant == "oracle":
-                command += ["--push_mapping=iteration", "--round_oracle_profile=core",
+            if variant == oracle_variant:
+                command += ["--push_mapping=iteration", f"--round_oracle_profile={args.oracle_profile}",
                             f"--round_oracle_order={'reverse' if repetition == 1 else 'forward'}"]
                 if refill == "eager_group": command.append("--group_iteration_mapping")
                 oracle = run_dir / "oracle.csv" if repetition >= 0 else Path("/dev/null")
@@ -173,7 +186,8 @@ def run_case(args, manifest, job):
             if not monitored_run(command, run_dir, args.output, device, outputs,
                                  int(args.reserve_gib*GIB),int(args.pause_gib*GIB)):
                 return False
-    atomic_json(case / "COMPLETE.json", {"status": "success", "completed_utc": datetime.now(timezone.utc).isoformat()})
+    atomic_json(completion_path, {"status": "success", "oracle_profile": args.oracle_profile,
+        "completed_utc": datetime.now(timezone.utc).isoformat()})
     return True
 
 
@@ -183,6 +197,7 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--cli", type=Path, default=PROJECT / "build/graphweft_cli")
     parser.add_argument("--pull-threshold", type=float, default=.2)
+    parser.add_argument("--oracle-profile",choices=("paired","core"),default="paired")
     parser.add_argument("--reserve-gib",type=float,default=30)
     parser.add_argument("--pause-gib",type=float,default=25)
     parser.add_argument("--job", action="append", required=True,

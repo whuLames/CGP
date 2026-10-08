@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 PROJECT=Path(__file__).resolve().parents[1]
+FULL_ORACLE_DATASETS={"soc-orkut","uk-2002","graph500-scale23-ef16-adj","delaunay-n24"}
 
 
 def atomic_json(path,value):
@@ -41,10 +42,10 @@ def wait_dataset(root,name,deadline,status_log):
 def jobs(fragment,name,device):
     fit=fragment["fits"];result=[f"{name}:ordinary_m128:128:none:{device}"]
     tail=name+"-longtail"
-    result += [f"{tail}:long_tail_m128:128:{policy}:{device}" for policy in ("none","eager_global","eager_group")]
+    result += [f"{tail}:long_tail_m128:128:{policy}:{device}" for policy in ("none","eager_global")]
     if fit["base_m256"]:result.append(f"{name}:ordinary_m256:256:none:{device}")
     if fit["derived_m256"]:result += [f"{tail}:long_tail_m256:256:{policy}:{device}"
-                                       for policy in ("none","eager_global","eager_group")]
+                                       for policy in ("none","eager_global")]
     return result
 
 
@@ -72,10 +73,11 @@ def main():
                 f"--graph={root/'datasets'/name}",f"--output={bundle}",f"--device={args.device}"],pipeline/f"{name}.log")
             if code:
                 state["skipped"].append({"dataset":name,"reason":"workload_preparation_failed","exit":code});atomic_json(state_path,state);continue
-        manifest=json.loads(fragment.read_text())
+        manifest=json.loads(fragment.read_text());oracle_profile="core" if name in FULL_ORACLE_DATASETS else "paired"
+        state["oracle_profile"]={"dataset":name,"mode":oracle_profile};atomic_json(state_path,state)
         for job in jobs(manifest,name,args.device):
             code=run([sys.executable,str(PROJECT/"tools/run_round_oracle_campaign.py"),f"--manifest={fragment}",
-                      f"--output={root/'results'}",f"--job={job}"],pipeline/f"{name}.log")
+                      f"--output={root/'results'}",f"--job={job}",f"--oracle-profile={oracle_profile}"],pipeline/f"{name}.log")
             if code==2:state["status"]="paused_insufficient_space";state["paused_job"]=job;atomic_json(state_path,state);return 2
             if code:state["status"]="failed";state["failed_job"]=job;state["exit"]=code;atomic_json(state_path,state);return code
         state["completed"].append(name);atomic_json(state_path,state)

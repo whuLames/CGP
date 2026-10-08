@@ -50,9 +50,10 @@ DEFINE_bool(copy_results_to_cpu,false,"Return per query results");
 DEFINE_bool(profile_compare,false,"Measure compare_kernel GPU time with CUDA events");
 DEFINE_bool(profile_kernel,false,"Measure production graph kernels with CUDA events");
 DEFINE_string(round_metrics,"","Write per-round kernel timing CSV (also enables --profile_kernel)");
-DEFINE_string(round_oracle_profile,"off","off or core (30 static Push + Shared/Adaptive Push + 21 Dense Pull)");
+DEFINE_string(round_oracle_profile,"off","off, paired (Iteration Push + one Pull), or core (all candidates)");
 DEFINE_string(round_oracle_output,"","Write matched-state per-candidate round timings as CSV");
 DEFINE_string(round_oracle_order,"forward","forward or reverse candidate order");
+DEFINE_string(round_oracle_pull_kernel,"pull-dense-parallel-smem-q32","Pull token used by paired round profiling");
 DEFINE_string(output,"","CSV result output path");
 DEFINE_string(binary_output,"","Write one query as raw float32 values for exact comparison");
 DEFINE_uint64(binary_query_id,0,"Logical query ID written by --binary_output");
@@ -136,12 +137,14 @@ int main(int argc,char** argv){
     o.copy_results_to_cpu=FLAGS_copy_results_to_cpu || !FLAGS_binary_output.empty();o.profile_compare=FLAGS_profile_compare;
     o.profile_kernel=FLAGS_profile_kernel;o.round_metrics_path=FLAGS_round_metrics;
     if(FLAGS_round_oracle_profile=="core")o.round_oracle_profile=true;
-    else if(FLAGS_round_oracle_profile!="off")throw std::invalid_argument("--round_oracle_profile must be off or core");
+    else if(FLAGS_round_oracle_profile=="paired")o.round_oracle_profile=o.round_oracle_paired=true;
+    else if(FLAGS_round_oracle_profile!="off")throw std::invalid_argument("--round_oracle_profile must be off, paired or core");
+    o.round_oracle_pull_kernel=gw::parse_dense_pull_token(FLAGS_round_oracle_pull_kernel);
     if(FLAGS_round_oracle_order=="reverse")o.round_oracle_reverse=true;
     else if(FLAGS_round_oracle_order!="forward")throw std::invalid_argument("--round_oracle_order must be forward or reverse");
     o.round_oracle_output_path=FLAGS_round_oracle_output;
     if(o.round_oracle_profile!=!o.round_oracle_output_path.empty())
-      throw std::invalid_argument("core round oracle profiling requires --round_oracle_output, and vice versa");
+      throw std::invalid_argument("round oracle profiling requires --round_oracle_output, and vice versa");
     o.checkpoint_path=FLAGS_checkpoint;o.checkpoint_round=FLAGS_checkpoint_round;o.plan_output_path=FLAGS_plan_output;
     o.completion_output_path=FLAGS_completion_output;o.schedule_events_path=FLAGS_schedule_events;
     if(FLAGS_selector=="push")o.selector=gw::Options::Selector::Push;

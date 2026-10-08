@@ -62,7 +62,11 @@ struct Options {
   // before the production kernel advances each round.  Probe work is never
   // committed to the logical execution.
   bool round_oracle_profile = false;
+  // Lightweight coverage mode: profile the Iteration-predicted Push mapping
+  // and one fixed production Pull kernel instead of the complete candidate set.
+  bool round_oracle_paired = false;
   bool round_oracle_reverse = false;
+  KernelId round_oracle_pull_kernel = KernelId::VmParallelSmemShuffleQ32;
   std::string round_oracle_output_path;
   enum class Selector { Threshold, Push, Pull, Replay } selector = Selector::Threshold;
   std::vector<KernelId> replay;

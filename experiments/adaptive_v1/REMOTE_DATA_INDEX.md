@@ -14,8 +14,14 @@ Credentials are deliberately not stored in this repository. Datasets are sharded
 - Branch: `experiment/dense-pull-integration`
 - Queries: `N=1024`; `M=Q=128`, plus `M=Q=256` when the exact V100 allocation gate passes; `G=32`.
 - Measurements: one complete warmup and two formal repetitions; the second Oracle repetition reverses candidate order.
-- Oracle set: 30 static Push kernels, SharedPush, AdaptivePush, and 21 Dense Pull kernels (53 total).
+- Per-round coverage on every graph: the Iteration model's selected Push partition and
+  `pull-dense-parallel-smem-q32` are measured from identical input state, regardless of
+  the direction chosen by production Hybrid.
+- Full Oracle set on representative graphs only: 30 static Push kernels, SharedPush,
+  AdaptivePush, and 21 Dense Pull kernels (53 total). The representatives are
+  `soc-orkut`, `uk-2002`, `graph500-scale23-ef16-adj`, and `delaunay-n24`.
 - Baselines: threshold Hybrid with `push_mapping=adaptive` and with `push_mapping=iteration`; Pull remains `auto`.
+- Refill policies: `none` and `eager_global`. `eager_group` is excluded from subsequent campaigns.
 - Storage safety: do not start an operation that would leave less than 30 GiB; pause at a safe output boundary below 25 GiB.
 
 ## Dataset policy
